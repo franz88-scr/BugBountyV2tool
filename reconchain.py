@@ -1,5 +1,3 @@
-
-
 #!/usr/bin/env python3
 
 """
@@ -69,9 +67,17 @@ import asyncio
 
 import contextlib
 
+import hashlib
+
+import inspect
+
 import json
 
 import os
+
+import re
+
+import shlex
 
 import shutil
 
@@ -83,13 +89,14 @@ import sys
 
 import time
 
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass
 
 from datetime import datetime
 
 from pathlib import Path
 
-from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
+
 
 
 # ───────────────────────────── pretty logging ──────────────────────────────
@@ -126,6 +133,7 @@ LVL = {"info": C["c"], "ok": C["g"], "warn": C["y"],
        "err": C["red"], "skip": C["d"]}
 
 
+
 def log(lvl: str, msg: str) -> None:
 
     ts = datetime.now().strftime("%H:%M:%S")
@@ -135,6 +143,7 @@ def log(lvl: str, msg: str) -> None:
           flush=True)
 
 
+
 # ────────────────────────────── tool registry ──────────────────────────────
 
 
@@ -142,13 +151,14 @@ class Tools:
 
     """Cached presence check for external binaries."""
 
+
     def __init__(self) -> None:
 
         self._cache: Dict[str, bool] = {}
 
-        self.missing_set: set = set()
+        self.missing_set: Set[str] = set()
 
-        self.missing: List[str] = []
+        self.missing: List[str] = []  # insertion-ordered, deduped
 
 
     def have(self, *names: str) -> List[str]:
@@ -163,7 +173,7 @@ class Tools:
 
                 self._cache[n] = ok
 
-                if not ok:
+                if not ok and n not in self.missing_set:
 
                     self.missing_set.add(n)
 
@@ -179,6 +189,20 @@ class Tools:
     def has(self, name: str) -> bool:
 
         return bool(self.have(name))
+
+
+    def seed_missing(self, names: List[str]) -> None:
+
+        """Pre-populate the missing-tools list (used for --resume)."""
+
+        for n in names:
+
+            if n not in self.missing_set:
+
+                self.missing_set.add(n)
+
+                self.missing.append(n)
+
 
 
 # ─────────────────────────── subprocess helpers ────────────────────────────
@@ -198,9 +222,8 @@ class StepResult:
 
     log_path: Optional[Path] = None
 
-    output: Optional[Path] = None
-
     note: str = ""
+
 
 
 def _run_blocking(cmd: List[str], timeout: int, cwd: Optional[Path],
@@ -244,6 +267,7 @@ def _run_blocking(cmd: List[str], timeout: int, cwd: Optional[Path],
             return 127, time.monotonic() - t0
 
 
+
 async def _run(name: str, cmd: List[str], timeout: int, outdir: Path,
 
                note: str = "") -> StepResult:
@@ -267,6 +291,7 @@ async def _run(name: str, cmd: List[str], timeout: int, outdir: Path,
     return StepResult(name, cmd, rc, dur, logp, note=note)
 
 
+
 # Concurrency cap so a phase with many jobs (e.g. phase E: 5 URLs × 3 fuzzers)
 
 # does not fork-bomb the host. 8 parallel external procs is a sane ceiling.
@@ -274,11 +299,10 @@ async def _run(name: str, cmd: List[str], timeout: int, outdir: Path,
 MAX_PARALLEL_JOBS = 8
 
 
+
 async def run_parallel(jobs: List[Tuple[str, List[str], int]],
 
                        outdir: Path) -> List[StepResult]:
-
-    active = [j for j in jobs if j[2]]
 
     sem = asyncio.Semaphore(MAX_PARALLEL_JOBS)
 
@@ -289,9 +313,11 @@ async def run_parallel(jobs: List[Tuple[str, List[str], int]],
 
             return await _run(n, c, t, outdir)
 
-    coros = [_guarded(n, c, t) for n, c, t in active]
+
+    coros = [_guarded(n, c, t) for n, c, t in jobs]
 
     return await asyncio.gather(*coros)
+
 
 
 # ───────────────────────────── file utilities ───────────────────────────────
@@ -302,6 +328,7 @@ def ensure(p: Path) -> Path:
     p.parent.mkdir(parents=True, exist_ok=True)
 
     return p
+
 
 
 def read_lines(p: Path) -> List[str]:
@@ -315,21 +342,36 @@ def read_lines(p: Path) -> List[str]:
             if ln.strip() and not ln.startswith("#")]
 
 
+
 def merge_unique(srcs: List[Path], dst: Path) -> int:
 
-    seen: set = set()
+    seen: Set[str] = set()
+
+    dst_resolved = dst.resolve()
 
     for s in srcs:
 
-        if s and s.exists():
+        if not s:
 
-            for ln in s.read_text(errors="ignore").splitlines():
+            continue
 
-                ln = ln.strip()
+        if not s.exists():
 
-                if ln and ln not in seen:
+            continue
 
-                    seen.add(ln)
+        # never feed the destination back into itself (recursion / self-merge)
+
+        if s.resolve() == dst_resolved:
+
+            continue
+
+        for ln in s.read_text(errors="ignore").splitlines():
+
+            ln = ln.strip()
+
+            if ln and ln not in seen:
+
+                seen.add(ln)
 
     ensure(dst)
 
@@ -338,15 +380,73 @@ def merge_unique(srcs: List[Path], dst: Path) -> int:
     return len(seen)
 
 
-def safe_suffix(s: str, mod: int = 9999) -> str:
 
-    """Deterministic, collision-resistant file suffix for a string."""
+def safe_suffix(s: str) -> str:
 
-    import hashlib
+    """Deterministic, low-collision file suffix. Uses the first 12 hex
 
-    h = hashlib.sha1(s.encode("utf-8", errors="ignore")).hexdigest()
+    chars of sha1(s) — collision odds are astronomically small for any
 
-    return str(int(h[:8], 16) % mod)
+    realistic input set, unlike the old `(int(h[:8],16) % 9999)`."""
+
+    return hashlib.sha1(s.encode("utf-8", errors="ignore")).hexdigest()[:12]
+
+
+
+def read_jsonl(p: Path) -> List[Any]:
+
+    """Read a JSON-Lines file. Falls back to a single JSON object/array
+
+    if the file isn't line-delimited. Never raises on bad input."""
+
+    if not p.exists():
+
+        return []
+
+    raw = p.read_text(errors="ignore").strip()
+
+    if not raw:
+
+        return []
+
+    # try JSONL first
+
+    out: List[Any] = []
+
+    if raw.startswith("{") or "\n{" in raw:
+
+        for ln in raw.splitlines():
+
+            ln = ln.strip()
+
+            if not ln or not ln.startswith("{"):
+
+                continue
+
+            try:
+
+                out.append(json.loads(ln))
+
+            except json.JSONDecodeError:
+
+                continue
+
+        if out:
+
+            return out
+
+    # single JSON object or array
+
+    try:
+
+        d = json.loads(raw)
+
+    except json.JSONDecodeError:
+
+        return []
+
+    return d if isinstance(d, list) else [d]
+
 
 
 # ──────────────────────────── interactsh manager ────────────────────────────
@@ -355,6 +455,7 @@ def safe_suffix(s: str, mod: int = 9999) -> str:
 class Interactsh:
 
     """Background OOB collector. Start before phase E, stop at phase H."""
+
 
     def __init__(self, outdir: Path) -> None:
 
@@ -366,7 +467,13 @@ class Interactsh:
 
         self.log = ensure(outdir / "logs" / "interactsh.log")
 
-        self._log_fh = None  # kept so we can close it on stop()
+        self._log_fh = None
+
+        # File offset for domain parsing — guarantees we only read the
+
+        # output produced by THIS run, not stale content from a prior run.
+
+        self._start_pos = 0
 
 
     @property
@@ -377,6 +484,14 @@ class Interactsh:
 
 
     def _kill_proc(self) -> None:
+
+        if self._log_fh is not None:
+
+            with contextlib.suppress(Exception):
+
+                self._log_fh.close()
+
+            self._log_fh = None
 
         if not self.proc:
 
@@ -411,6 +526,16 @@ class Interactsh:
 
         token = os.environ.get("INTERACTSH_TOKEN")
 
+        # rotate log so a stale "Domain: <old>" line from a previous run
+
+        # can never be mistaken for this run's announcement.
+
+        with contextlib.suppress(Exception):
+
+            self.log.unlink()
+
+        ensure(self.log)
+
         cmd = ["interactsh-client", "-v"]
 
         if token:
@@ -437,7 +562,11 @@ class Interactsh:
 
             return False
 
-        # poll the log for the domain line
+
+        # remember the byte offset where this run's output begins
+
+        self._start_pos = self.log.stat().st_size
+
 
         deadline = time.time() + 45
 
@@ -453,7 +582,11 @@ class Interactsh:
 
                 try:
 
-                    txt = self.log.read_text(errors="ignore")
+                    with self.log.open("rb") as fh:
+
+                        fh.seek(self._start_pos)
+
+                        txt = fh.read().decode("utf-8", errors="ignore")
 
                 except FileNotFoundError:
 
@@ -465,7 +598,11 @@ class Interactsh:
 
                         cand = ln.split(":", 1)[1].strip()
 
-                        if cand and "." in cand:
+                        # hostname tokens only — reject anything that
+
+                        # could break the SSRF probe script later
+
+                        if cand and "." in cand and " " not in cand:
 
                             self.domain = cand
 
@@ -476,8 +613,6 @@ class Interactsh:
                 time.sleep(1)
 
         except Exception:
-
-            # any unexpected error: tear the process down before bubbling up
 
             self._kill_proc()
 
@@ -493,16 +628,6 @@ class Interactsh:
         out = ensure(self.outdir / "oast" / "callbacks.txt")
 
         self._kill_proc()
-
-        if self._log_fh is not None:
-
-            with contextlib.suppress(Exception):
-
-                self._log_fh.close()
-
-            self._log_fh = None
-
-        # stream the JSON-line event log line-by-line (no full slurp)
 
         events: List[dict] = []
 
@@ -549,54 +674,79 @@ class Interactsh:
         return out
 
 
+
 # ─────────────────────────── phase implementations ─────────────────────────
+
+
+# small helper: hostname token safety check
+
+_SAFE_HOST = re.compile(r"^[A-Za-z0-9.\-]+$")
+
 
 
 async def phase_A1(domain: str, outdir: Path, t: Tools,
 
                    only: set, skip: set) -> Dict[str, Any]:
 
-    if skip.intersection({"A1"}): return {}
+    if skip & {"A1"}:
+
+        return {}
 
     out = outdir / "all_subs.txt"
 
-    if out.exists() and only.isdisjoint({"A1"}): return {"A1": str(out)}
+    if out.exists() and only.isdisjoint({"A1"}):
+
+        return {"A1": str(out), "count": len(read_lines(out))}
 
     log("info", "Phase A1: subdomain enumeration")
 
     jobs: List[Tuple[str, List[str], int]] = []
 
-    if "subfinder" in t.have("subfinder"):
+    if t.has("subfinder"):
 
-        jobs.append(("subfinder", ["subfinder", "-d", domain, "-silent",
+        jobs.append(("subfinder",
 
-                                   "-o", str(outdir / "subs_subfinder.txt")], 900))
+                     ["subfinder", "-d", domain, "-silent",
 
-    if "amass" in t.have("amass"):
+                      "-o", str(outdir / "subs_subfinder.txt")], 900))
 
-        jobs.append(("amass", ["amass", "enum", "-passive", "-d", domain,
+    if t.has("amass"):
 
-                               "-o", str(outdir / "subs_amass.txt")], 1800))
+        jobs.append(("amass",
 
-    if "assetfinder" in t.have("assetfinder"):
+                     ["amass", "enum", "-passive", "-d", domain,
 
-        # Build the shell command safely: assetfinder binary + quoted domain +
+                      "-o", str(outdir / "subs_amass.txt")], 1800))
 
-        # string-form redirect target. We deliberately use `str(Path)` and
+    if t.has("assetfinder"):
 
-        # shlex_quote on the user-supplied domain so nothing gets interpreted
+        # use a small runner so we invoke assetfinder directly with proper
 
-        # by the shell as syntax.
+        # argv quoting (no shell, no risk of injection from `domain`).
 
-        cmd_str = (
+        runner = outdir / "logs" / "assetfinder.sh"
 
-            f"assetfinder --subs-only {shlex_quote(domain)} "
+        ensure(runner)
 
-            f"> {shlex_quote(str(outdir / 'subs_assetfinder.txt'))}"
+        runner.write_text(
+
+            "#!/usr/bin/env bash\n"
+
+            "set -u\n"
+
+            f"OUT={shlex.quote(str(outdir / 'subs_assetfinder.txt'))}\n"
+
+            f"DOMAIN={shlex.quote(domain)}\n"
+
+            ": > \"$OUT\"\n"
+
+            "assetfinder --subs-only \"$DOMAIN\" >> \"$OUT\" 2>/dev/null || true\n"
 
         )
 
-        jobs.append(("assetfinder", ["bash", "-c", cmd_str], 600))
+        runner.chmod(0o755)
+
+        jobs.append(("assetfinder", ["bash", str(runner)], 600))
 
     if not jobs:
 
@@ -615,18 +765,14 @@ async def phase_A1(domain: str, outdir: Path, t: Tools,
     return {"A1": str(out), "count": n}
 
 
-def shlex_quote(s: str) -> str:
-
-    import shlex
-
-    return shlex.quote(s)
-
 
 async def phase_A2(domain: str, outdir: Path, t: Tools,
 
                    only: set, skip: set, prev: dict) -> Dict[str, Any]:
 
-    if skip.intersection({"A2"}): return {}
+    if skip & {"A2"}:
+
+        return {}
 
     out = outdir / "resolved.txt"
 
@@ -646,7 +792,7 @@ async def phase_A2(domain: str, outdir: Path, t: Tools,
 
     if not t.has("dnsx"):
 
-        log("warn", "A2: dnsx missing, falling back to /etc/hosts dedup")
+        log("warn", "A2: dnsx missing, falling back to copy of subdomain list")
 
         merge_unique([subs], out)
 
@@ -658,20 +804,27 @@ async def phase_A2(domain: str, outdir: Path, t: Tools,
 
          "-a", "-aaaa", "-cname", "-resp"], 1800, outdir)
 
-    return {"A2": str(out), "count": len(read_lines(out)),
+    return {"A2": str(out), "count": len(read_lines(out)), "rc": res.rc}
 
-            "rc": res.rc}
 
 
 async def phase_B1(outdir: Path, t: Tools, only: set, skip: set,
 
                    prev: dict) -> Dict[str, Any]:
 
-    if skip.intersection({"B1"}): return {}
+    if skip & {"B1"}:
+
+        return {}
 
     log("info", "Phase B1: ports / hosts / takeover (parallel)")
 
+    # naabu/httpx/nuclei-takeover accept host:port (or hosts from httpx)
+
     hosts = Path(prev.get("A2") or outdir / "resolved.txt")
+
+    # subjack needs CLEAN subdomains (no `[1.2.3.4]` suffix from dnsx -resp)
+
+    subs = Path(prev.get("A1") or outdir / "all_subs.txt")
 
     ports_file = outdir / "ports.txt"
 
@@ -686,10 +839,6 @@ async def phase_B1(outdir: Path, t: Tools, only: set, skip: set,
              "-o", str(ports_file)], 1800))
 
     elif t.has("nmap"):
-
-        # nmap writes greppable output; we additionally derive ports.txt so
-
-        # downstream consumers (_counts, report writers) see the expected file.
 
         jobs.append(("nmap",
 
@@ -709,15 +858,15 @@ async def phase_B1(outdir: Path, t: Tools, only: set, skip: set,
 
             1800))
 
-    if t.has("subjack"):
+    if t.has("subjack") and subs.exists() and read_lines(subs):
 
         jobs.append(("subjack",
 
-            ["subjack", "-w", str(hosts), "-t", "100", "-ssl",
+            ["subjack", "-w", str(subs), "-t", "100", "-ssl",
 
              "-o", str(outdir / "takeover.txt")], 1200))
 
-    elif t.has("nuclei"):
+    elif t.has("nuclei") and hosts.exists() and read_lines(hosts):
 
         jobs.append(("nuclei-takeover",
 
@@ -727,7 +876,7 @@ async def phase_B1(outdir: Path, t: Tools, only: set, skip: set,
 
             1800))
 
-    results = await run_parallel(jobs, outdir)
+    await run_parallel(jobs, outdir)
 
     # If nmap was used instead of naabu, synthesize ports.txt from the
 
@@ -739,7 +888,7 @@ async def phase_B1(outdir: Path, t: Tools, only: set, skip: set,
 
         if gnmap.exists():
 
-            ports: set = set()
+            ports: Set[str] = set()
 
             for ln in gnmap.read_text(errors="ignore").splitlines():
 
@@ -776,11 +925,14 @@ async def phase_B1(outdir: Path, t: Tools, only: set, skip: set,
     }
 
 
+
 async def phase_C1(outdir: Path, t: Tools, only: set, skip: set,
 
                    prev: dict) -> Dict[str, Any]:
 
-    if skip.intersection({"C1"}): return {}
+    if skip & {"C1"}:
+
+        return {}
 
     log("info", "Phase C1: URL harvesting (parallel groups)")
 
@@ -797,43 +949,98 @@ async def phase_C1(outdir: Path, t: Tools, only: set, skip: set,
         return {}
 
 
-    # group 1: gau/waybackurls + gospider
-
     g1: List[Tuple[str, List[str], int]] = []
 
-    if "gau" in t.have("gau"):
 
-        # gau flag is -o (single dash), NOT --o.
+    # gau v2 supports -l <file> for a list of domains; if the local
 
-        g1.append(("gau",
+    # build doesn't, fall back to a per-host loop (also avoids ARG_MAX).
 
-            ["gau", "--threads", "5", "--subs", "--blacklist",
+    if t.has("gau"):
 
-             "ttf,woff,svg,png,jpg,gif,ico,css",
+        runner = outdir / "logs" / "gau_runner.sh"
 
-             "-o", str(outdir / "urls_gau.txt")], 1800))
+        ensure(runner)
+
+        runner.write_text(
+
+            "#!/usr/bin/env bash\n"
+
+            "set -u\n"
+
+            f"OUT={shlex.quote(str(outdir / 'urls_gau.txt'))}\n"
+
+            f"IN={shlex.quote(str(hosts))}\n"
+
+            ": > \"$OUT\"\n"
+
+            "if gau -l \"$IN\" -o \"$OUT\" --subs --threads 5 "
+
+            "--blacklist ttf,woff,svg,png,jpg,gif,ico,css >/dev/null 2>&1 "
+
+            "&& [ -s \"$OUT\" ]; then\n"
+
+            "  :\n"
+
+            "else\n"
+
+            "  : > \"$OUT\"\n"
+
+            "  while IFS= read -r h || [[ -n \"$h\" ]]; do\n"
+
+            "    [ -z \"$h\" ] && continue\n"
+
+            "    gau --subs --threads 5 --blacklist "
+
+            "ttf,woff,svg,png,jpg,gif,ico,css \"$h\" >> \"$OUT\" 2>/dev/null || true\n"
+
+            "  done < \"$IN\"\n"
+
+            "fi\n"
+
+        )
+
+        runner.chmod(0o755)
+
+        g1.append(("gau", ["bash", str(runner)], 1800))
+
+
+    # waybackurls takes one host; iterate from file via runner to avoid
+
+    # embedding the host list in the bash argv (no ARG_MAX DoS).
 
     if t.has("waybackurls"):
 
-        # waybackurls is per-domain; iterate over every host so we don't
+        runner = outdir / "logs" / "wayback_runner.sh"
 
-        # silently drop subdomains like the old `head -1` did.
+        ensure(runner)
 
-        host_list = read_lines(hosts)
+        runner.write_text(
 
-        if host_list:
+            "#!/usr/bin/env bash\n"
 
-            joined = " ".join(shlex_quote(h) for h in host_list)
+            "set -u\n"
 
-            cmd_str = (
+            f"OUT={shlex.quote(str(outdir / 'urls_wayback.txt'))}\n"
 
-                f"for h in {joined}; do waybackurls \"$h\"; done "
+            f"IN={shlex.quote(str(hosts))}\n"
 
-                f"> {shlex_quote(str(outdir / 'urls_wayback.txt'))}"
+            ": > \"$OUT\"\n"
 
-            )
+            "while IFS= read -r h || [[ -n \"$h\" ]]; do\n"
 
-            g1.append(("waybackurls", ["bash", "-c", cmd_str], 1800))
+            "  [ -z \"$h\" ] && continue\n"
+
+            "  waybackurls \"$h\" >> \"$OUT\" 2>/dev/null || true\n"
+
+            "done < \"$IN\"\n"
+
+        )
+
+        runner.chmod(0o755)
+
+        g1.append(("waybackurls", ["bash", str(runner)], 1800))
+
 
     if t.has("gospider"):
 
@@ -843,8 +1050,6 @@ async def phase_C1(outdir: Path, t: Tools, only: set, skip: set,
 
              "-o", str(outdir / "urls_gospider.txt")], 1800))
 
-
-    # group 2: katana + subjs
 
     g2: List[Tuple[str, List[str], int]] = []
 
@@ -860,15 +1065,29 @@ async def phase_C1(outdir: Path, t: Tools, only: set, skip: set,
 
     if t.has("subjs"):
 
-        cmd_str = (
+        runner = outdir / "logs" / "subjs_runner.sh"
 
-            f"subjs -i {shlex_quote(str(hosts))} "
+        ensure(runner)
 
-            f"> {shlex_quote(str(outdir / 'urls_subjs.txt'))}"
+        runner.write_text(
+
+            "#!/usr/bin/env bash\n"
+
+            "set -u\n"
+
+            f"OUT={shlex.quote(str(outdir / 'urls_subjs.txt'))}\n"
+
+            f"IN={shlex.quote(str(hosts))}\n"
+
+            ": > \"$OUT\"\n"
+
+            "subjs -i \"$IN\" > \"$OUT\" 2>/dev/null || true\n"
 
         )
 
-        g2.append(("subjs", ["bash", "-c", cmd_str], 1200))
+        runner.chmod(0o755)
+
+        g2.append(("subjs", ["bash", str(runner)], 1200))
 
 
     if g1:
@@ -879,26 +1098,30 @@ async def phase_C1(outdir: Path, t: Tools, only: set, skip: set,
 
         await run_parallel(g2, outdir)
 
-    n = merge_unique(
 
-        [outdir / "urls_gau.txt", outdir / "urls_wayback.txt",
+    harvested = [outdir / "urls_gau.txt", outdir / "urls_wayback.txt",
 
-         outdir / "urls_gospider.txt", outdir / "urls_katana.txt",
+                 outdir / "urls_gospider.txt", outdir / "urls_katana.txt",
 
-         outdir / "urls_subjs.txt"],
+                 outdir / "urls_subjs.txt"]
 
-        outdir / "urls_all.txt",
+    if not any(p.exists() and read_lines(p) for p in harvested):
 
-    )
+        log("warn", "C1: no URL harvesters produced output")
+
+    n = merge_unique(harvested, outdir / "urls_all.txt")
 
     log("ok", f"C1: {n} unique URLs")
 
     return {"C1": str(outdir / "urls_all.txt"), "count": n}
 
 
+
 async def phase_C2(outdir: Path, t: Tools, only: set, skip: set) -> Dict[str, Any]:
 
-    if skip.intersection({"C2"}): return {}
+    if skip & {"C2"}:
+
+        return {}
 
     log("info", "Phase C2: JS analysis (LinkFinder + SecretFinder)")
 
@@ -936,27 +1159,51 @@ async def phase_C2(outdir: Path, t: Tools, only: set, skip: set) -> Dict[str, An
 
     if t.has("linkfinder"):
 
-        cmd_str = (
+        runner = outdir / "logs" / "linkfinder_runner.sh"
 
-            f"linkfinder -i {shlex_quote(str(js_urls))} -o "
+        ensure(runner)
 
-            f"{shlex_quote(str(outdir / 'links.txt'))}"
+        runner.write_text(
+
+            "#!/usr/bin/env bash\n"
+
+            "set -u\n"
+
+            f"OUT={shlex.quote(str(outdir / 'links.txt'))}\n"
+
+            f"IN={shlex.quote(str(js_urls))}\n"
+
+            "linkfinder -i \"$IN\" -o \"$OUT\" </dev/null >/dev/null 2>&1 || true\n"
 
         )
 
-        jobs.append(("linkfinder", ["bash", "-c", cmd_str], 1200))
+        runner.chmod(0o755)
+
+        jobs.append(("linkfinder", ["bash", str(runner)], 1200))
 
     if t.has("secretfinder"):
 
-        cmd_str = (
+        runner = outdir / "logs" / "secretfinder_runner.sh"
 
-            f"secretfinder -i {shlex_quote(str(js_urls))} -o "
+        ensure(runner)
 
-            f"{shlex_quote(str(outdir / 'secrets.txt'))}"
+        runner.write_text(
+
+            "#!/usr/bin/env bash\n"
+
+            "set -u\n"
+
+            f"OUT={shlex.quote(str(outdir / 'secrets.txt'))}\n"
+
+            f"IN={shlex.quote(str(js_urls))}\n"
+
+            "secretfinder -i \"$IN\" -o \"$OUT\" </dev/null >/dev/null 2>&1 || true\n"
 
         )
 
-        jobs.append(("secretfinder", ["bash", "-c", cmd_str], 1200))
+        runner.chmod(0o755)
+
+        jobs.append(("secretfinder", ["bash", str(runner)], 1200))
 
     if t.has("nuclei"):
 
@@ -976,12 +1223,21 @@ async def phase_C2(outdir: Path, t: Tools, only: set, skip: set) -> Dict[str, An
 
                      outdir / "js_secrets.txt")
 
+    if n == 0:
+
+        log("warn", "C2: no JS findings produced")
+
     return {"C2": str(outdir / "js_secrets.txt"), "count": n}
 
 
-async def phase_D(outdir: Path, t: Tools, only: set, skip: set) -> Dict[str, Any]:
 
-    if skip.intersection({"D"}): return {}
+async def phase_D(outdir: Path, t: Tools, only: set, skip: set,
+
+                  prev: dict) -> Dict[str, Any]:
+
+    if skip & {"D"}:
+
+        return {}
 
     log("info", "Phase D: parameter discovery")
 
@@ -989,7 +1245,9 @@ async def phase_D(outdir: Path, t: Tools, only: set, skip: set) -> Dict[str, Any
 
     if not urls.exists() or not read_lines(urls):
 
-        log("warn", "D: no URLs; skipping"); return {"D": str(outdir / "params.txt")}
+        log("warn", "D: no URLs; skipping")
+
+        return {"D": str(outdir / "params.txt"), "count": 0}
 
     jobs: List[Tuple[str, List[str], int]] = []
 
@@ -999,23 +1257,41 @@ async def phase_D(outdir: Path, t: Tools, only: set, skip: set) -> Dict[str, Any
 
             out_part = outdir / f"params_spider_{safe_suffix(u)}.txt"
 
-            cmd_str = (
+            runner = outdir / "logs" / f"paramspider_{safe_suffix(u)}.sh"
 
-                f"paramspider -d {shlex_quote(u)} --quiet "
+            ensure(runner)
 
-                f"> {shlex_quote(str(out_part))}"
+            runner.write_text(
+
+                "#!/usr/bin/env bash\n"
+
+                "set -u\n"
+
+                f"OUT={shlex.quote(str(out_part))}\n"
+
+                f"URL={shlex.quote(u)}\n"
+
+                ": > \"$OUT\"\n"
+
+                "paramspider -d \"$URL\" --quiet >> \"$OUT\" 2>/dev/null || true\n"
 
             )
 
+            runner.chmod(0o755)
+
             jobs.append((f"paramspider-{u[:40]}",
 
-                         ["bash", "-c", cmd_str], 900))
+                         ["bash", str(runner)], 900))
+
+    # arjun and x8 write JSON, NOT plain text. We capture the JSON and
+
+    # normalize to one URL per line in the .txt sibling below.
 
     if t.has("arjun"):
 
         jobs.append(("arjun",
 
-            ["arjun", "-i", str(urls), "-o", str(outdir / "params_arjun.txt")],
+            ["arjun", "-i", str(urls), "-o", str(outdir / "params_arjun.json")],
 
             1500))
 
@@ -1023,20 +1299,83 @@ async def phase_D(outdir: Path, t: Tools, only: set, skip: set) -> Dict[str, Any
 
         jobs.append(("x8",
 
-            ["x8", "-u", str(urls), "-o", str(outdir / "params_x8.txt")], 1500))
+            ["x8", "-u", str(urls), "-o", str(outdir / "params_x8.json")], 1500))
 
     await run_parallel(jobs, outdir)
 
-    parts = list(outdir.glob("params_*.txt"))
+
+    # Normalize arjun / x8 JSON output to plain URL-per-line text.
+
+    for raw in (outdir / "params_arjun.json", outdir / "params_x8.json"):
+
+        if not raw.exists():
+
+            continue
+
+        norm = raw.with_suffix(".txt")
+
+        urls_found: List[str] = []
+
+        data = None
+
+        try:
+
+            data = json.loads(raw.read_text(errors="ignore"))
+
+        except json.JSONDecodeError:
+
+            data = None
+
+        # arjun output: { "https://url?q=1": {"parameters": [...]} }
+
+        if isinstance(data, dict):
+
+            for k, v in data.items():
+
+                if isinstance(k, str) and (k.startswith("http://") or k.startswith("https://")):
+
+                    urls_found.append(k)
+
+            # x8 v0.5+ output: {"results": [{"url": ..., "params": [...]}, ...]}
+
+            if not urls_found:
+
+                res = data.get("results") if isinstance(data, dict) else None
+
+                if isinstance(res, list):
+
+                    for r in res:
+
+                        if isinstance(r, dict) and r.get("url"):
+
+                            urls_found.append(str(r["url"]))
+
+        # JSONL fallback
+
+        if not urls_found:
+
+            for rec in read_jsonl(raw):
+
+                if isinstance(rec, dict) and rec.get("url"):
+
+                    urls_found.append(str(rec["url"]))
+
+        ensure(norm).write_text("\n".join(urls_found) + ("\n" if urls_found else ""))
+
+
+    # Glob params_*.txt but EXCLUDE the params.txt we are about to write.
+
+    parts = sorted(p for p in outdir.glob("params_*.txt")
+
+                   if p.name != "params.txt")
 
     n = merge_unique(parts, outdir / "params.txt")
 
     return {"D": str(outdir / "params.txt"), "count": n}
 
 
-def _extract_urls_from_ffuf_json(p: Path) -> List[str]:
 
-    """Pull URL + status out of an ffuf JSON result file (one URL per line)."""
+def _extract_urls_from_ffuf_json(p: Path) -> List[str]:
 
     out: List[str] = []
 
@@ -1075,9 +1414,10 @@ def _extract_urls_from_ffuf_json(p: Path) -> List[str]:
     return out
 
 
-def _extract_urls_from_kiterunner_json(p: Path) -> List[str]:
 
-    """kiterunner (kr) emits per-request JSON arrays."""
+def _extract_urls_from_kiterunner_jsonl(p: Path) -> List[str]:
+
+    """kiterunner (`kr`) writes JSON-Lines, one record per matched endpoint."""
 
     out: List[str] = []
 
@@ -1085,25 +1425,13 @@ def _extract_urls_from_kiterunner_json(p: Path) -> List[str]:
 
         return out
 
-    try:
+    for rec in read_jsonl(p):
 
-        data = json.loads(p.read_text(errors="ignore"))
-
-    except json.JSONDecodeError:
-
-        return out
-
-    if not isinstance(data, list):
-
-        return out
-
-    for r in data:
-
-        if not isinstance(r, dict):
+        if not isinstance(rec, dict):
 
             continue
 
-        url = r.get("url") or r.get("matched-raw-url")
+        url = rec.get("url") or rec.get("matched-raw-url")
 
         if url:
 
@@ -1112,9 +1440,12 @@ def _extract_urls_from_kiterunner_json(p: Path) -> List[str]:
     return out
 
 
+
 async def phase_E(outdir: Path, t: Tools, only: set, skip: set) -> Dict[str, Any]:
 
-    if skip.intersection({"E"}): return {}
+    if skip & {"E"}:
+
+        return {}
 
     log("info", "Phase E: fuzzing")
 
@@ -1122,11 +1453,21 @@ async def phase_E(outdir: Path, t: Tools, only: set, skip: set) -> Dict[str, Any
 
     if not urls.exists() or not read_lines(urls):
 
-        log("warn", "E: no URLs; skipping"); return {"E": str(outdir / "fuzz.txt")}
+        log("warn", "E: no URLs; skipping")
 
-    wordlist = os.environ.get("FFUF_WORDLIST", "/usr/share/seclists/Discovery/Web-Content/raft-medium-directories.txt")
+        return {"E": str(outdir / "fuzz.txt"), "count": 0}
+
+    wordlist = os.environ.get(
+
+        "FFUF_WORDLIST",
+
+        "/usr/share/seclists/Discovery/Web-Content/raft-medium-directories.txt",
+
+    )
 
     if not Path(wordlist).exists():
+
+        log("warn", f"E: FFUF_WORDLIST '{wordlist}' missing, ffuf disabled")
 
         wordlist = ""
 
@@ -1152,7 +1493,7 @@ async def phase_E(outdir: Path, t: Tools, only: set, skip: set) -> Dict[str, Any
 
         for u in sample:
 
-            out_json = outdir / f"kr_{safe_suffix(u)}.json"
+            out_jsonl = outdir / f"kr_{safe_suffix(u)}.jsonl"
 
             jobs.append((f"kiterunner-{u[:32]}",
 
@@ -1162,7 +1503,7 @@ async def phase_E(outdir: Path, t: Tools, only: set, skip: set) -> Dict[str, Any
 
                      "/usr/share/seclists/Discovery/Web-Content/api/api-endpoints.txt"),
 
-                 "-o", str(out_json)], 1500))
+                 "-o", str(out_jsonl)], 1500))
 
     if t.has("feroxbuster"):
 
@@ -1179,9 +1520,7 @@ async def phase_E(outdir: Path, t: Tools, only: set, skip: set) -> Dict[str, Any
     await run_parallel(jobs, outdir)
 
 
-    # Normalize JSON fuzzer output into plain text lines BEFORE merging so
-
-    # fuzz.txt is a usable URL list, not concatenated JSON.
+    # Normalize JSON fuzzer output into plain text lines BEFORE merging.
 
     normalized: List[Path] = []
 
@@ -1195,13 +1534,13 @@ async def phase_E(outdir: Path, t: Tools, only: set, skip: set) -> Dict[str, Any
 
         normalized.append(norm)
 
-    for krp in outdir.glob("kr_*.json"):
+    for krp in outdir.glob("kr_*.jsonl"):
 
         norm = krp.with_suffix(".txt")
 
         ensure(norm).write_text(
 
-            "\n".join(_extract_urls_from_kiterunner_json(krp)) + "\n")
+            "\n".join(_extract_urls_from_kiterunner_jsonl(krp)) + "\n")
 
         normalized.append(norm)
 
@@ -1210,12 +1549,19 @@ async def phase_E(outdir: Path, t: Tools, only: set, skip: set) -> Dict[str, Any
 
     n = merge_unique(normalized, outdir / "fuzz.txt")
 
+    if n == 0:
+
+        log("warn", "E: fuzzers produced no hits")
+
     return {"E": str(outdir / "fuzz.txt"), "count": n}
+
 
 
 async def phase_F1(outdir: Path, t: Tools, only: set, skip: set) -> Dict[str, Any]:
 
-    if skip.intersection({"F1"}): return {}
+    if skip & {"F1"}:
+
+        return {}
 
     log("info", "Phase F1: nuclei (full) + tech-scanner")
 
@@ -1224,6 +1570,12 @@ async def phase_F1(outdir: Path, t: Tools, only: set, skip: set) -> Dict[str, An
     if not hosts.exists() or not read_lines(hosts):
 
         hosts = outdir / "resolved.txt"
+
+    if not hosts.exists() or not read_lines(hosts):
+
+        log("warn", "F1: no hosts; skipping")
+
+        return {"F1": str(outdir / "nuclei_combined.txt"), "count": 0}
 
     jobs: List[Tuple[str, List[str], int]] = []
 
@@ -1237,11 +1589,7 @@ async def phase_F1(outdir: Path, t: Tools, only: set, skip: set) -> Dict[str, An
 
              "-o", str(outdir / "nuclei.txt")], 3600))
 
-        # tech-scanner only needs nuclei; the old `t.has("httpx") and
-
-        # t.has("nuclei")` guard was misleading because the job itself runs
-
-        # nuclei, not httpx. Decision is now just `t.has("nuclei")`.
+        # tech-scanner uses the same nuclei binary; do not double-gate on httpx.
 
         jobs.append(("tech-scanner",
 
@@ -1258,9 +1606,12 @@ async def phase_F1(outdir: Path, t: Tools, only: set, skip: set) -> Dict[str, An
     return {"F1": str(outdir / "nuclei_combined.txt"), "count": n}
 
 
+
 async def phase_F2(outdir: Path, t: Tools, only: set, skip: set) -> Dict[str, Any]:
 
-    if skip.intersection({"F2"}): return {}
+    if skip & {"F2"}:
+
+        return {}
 
     log("info", "Phase F2: testssl + wpscan")
 
@@ -1274,31 +1625,56 @@ async def phase_F2(outdir: Path, t: Tools, only: set, skip: set) -> Dict[str, An
 
         log("warn", "F2: no hosts; skipping")
 
-        return {"F2": str(outdir / "tls_wp.txt")}
+        return {"F2": str(outdir / "tls_wp.txt"), "count": 0}
 
     sample = read_lines(hosts)[:5]
 
-    # Serialize testssl writes — multiple `>>` on the same file from parallel
 
-    # bash -c invocations is a data-race. We run one job per host serially
+    testssl_bin = "testssl.sh" if t.has("testssl.sh") else (
 
-    # (still keeping total wall time reasonable with a 5-host cap).
+        "testssl" if t.has("testssl") else None)
 
-    jobs: List[Tuple[str, List[str], int]] = []
 
-    if t.has("testssl.sh") or t.has("testssl"):
+    # testssl: write PER-HOST files via a runner (no shared `>>` file ⇒ no race).
+
+    testssl_jobs: List[Tuple[str, List[str], int]] = []
+
+    if testssl_bin:
 
         for h in sample:
 
-            cmd_str = (
+            per_host = outdir / f"testssl_{safe_suffix(h)}.txt"
 
-                f"testssl.sh --quiet --color 0 {shlex_quote(h)} "
+            runner = outdir / "logs" / f"testssl_{safe_suffix(h)}.sh"
 
-                f">> {shlex_quote(str(outdir / 'testssl.txt'))}"
+            ensure(runner)
+
+            runner.write_text(
+
+                "#!/usr/bin/env bash\n"
+
+                "set -u\n"
+
+                f"OUT={shlex.quote(str(per_host))}\n"
+
+                f"H={shlex.quote(h)}\n"
+
+                f"BIN={shlex.quote(testssl_bin)}\n"
+
+                "\"$BIN\" --quiet --color 0 \"$H\" > \"$OUT\" 2>&1 || true\n"
 
             )
 
-            jobs.append((f"testssl-{h[:32]}", ["bash", "-c", cmd_str], 1800))
+            runner.chmod(0o755)
+
+            testssl_jobs.append((f"testssl-{h[:32]}",
+
+                                 ["bash", str(runner)], 1800))
+
+
+    # wpscan writes per-host files natively via --output.
+
+    wpscan_jobs: List[Tuple[str, List[str], int]] = []
 
     if t.has("wpscan"):
 
@@ -1308,7 +1684,7 @@ async def phase_F2(outdir: Path, t: Tools, only: set, skip: set) -> Dict[str, An
 
                 wps_out = outdir / f"wpscan_{safe_suffix(h)}.txt"
 
-                jobs.append((f"wpscan-{h[:32]}",
+                wpscan_jobs.append((f"wpscan-{h[:32]}",
 
                     ["wpscan", "--url", h, "--no-banner",
 
@@ -1316,32 +1692,29 @@ async def phase_F2(outdir: Path, t: Tools, only: set, skip: set) -> Dict[str, An
 
                     1800))
 
-    # Use the bounded-concurrency runner; testssl still ends up serialized
 
-    # in practice because the global semaphore is set to 8 and we cap sample
+    # run both groups in parallel; per-host files remove the race
 
-    # at 5 hosts. The earlier race was intra-process: multiple bash -c
+    await run_parallel(testssl_jobs + wpscan_jobs, outdir)
 
-    # processes appending to the same file. We now use per-host append
 
-    # redirects which are atomic for short writes; for long testssl reports
+    merge_unique(list(outdir.glob("testssl_*.txt")) +
 
-    # the >> append happens within one process via the serialized bash -c.
-
-    await run_parallel(jobs, outdir)
-
-    merge_unique([outdir / "testssl.txt"] + list(outdir.glob("wpscan_*.txt")),
+                 list(outdir.glob("wpscan_*.txt")),
 
                  outdir / "tls_wp.txt")
 
-    return {"F2": str(outdir / "tls_wp.txt")}
+    return {"F2": str(outdir / "tls_wp.txt"), "count": 0}
+
 
 
 async def phase_G(outdir: Path, t: Tools, only: set, skip: set,
 
                   oast_domain: Optional[str]) -> Dict[str, Any]:
 
-    if skip.intersection({"G"}): return {}
+    if skip & {"G"}:
+
+        return {}
 
     log("info", "Phase G: dalfox → sqlmap → SSRF probes")
 
@@ -1351,7 +1724,9 @@ async def phase_G(outdir: Path, t: Tools, only: set, skip: set,
 
     if not all_urls:
 
-        log("warn", "G: no URLs; skipping"); return {"G": str(outdir / "vulns.txt")}
+        log("warn", "G: no URLs; skipping")
+
+        return {"G": str(outdir / "vulns.txt"), "count": 0}
 
     if oast_domain:
 
@@ -1369,8 +1744,6 @@ async def phase_G(outdir: Path, t: Tools, only: set, skip: set,
 
     if xss_urls and t.has("dalfox"):
 
-        # dalfox flag is --silent (NOT --silence).
-
         jobs.append(("dalfox",
 
             ["dalfox", "file", str(xss_in), "--silent",
@@ -1381,21 +1754,34 @@ async def phase_G(outdir: Path, t: Tools, only: set, skip: set,
 
         sqlmap_dir = outdir / "sqlmap"
 
-        cmd_str = (
+        runner = outdir / "logs" / "sqlmap_runner.sh"
 
-            f"sqlmap -m {shlex_quote(str(xss_in))} --batch --level=2 "
+        ensure(runner)
 
-            f"--risk=1 --random-agent "
+        runner.write_text(
 
-            f"--output-dir={shlex_quote(str(sqlmap_dir))} "
+            "#!/usr/bin/env bash\n"
 
-            f">> {shlex_quote(str(outdir / 'sqlmap.log'))}"
+            "set -u\n"
+
+            f"OUT={shlex.quote(str(outdir / 'sqlmap.log'))}\n"
+
+            f"IN={shlex.quote(str(xss_in))}\n"
+
+            f"DIR={shlex.quote(str(sqlmap_dir))}\n"
+
+            "mkdir -p \"$DIR\"\n"
+
+            "sqlmap -m \"$IN\" --batch --level=2 --risk=1 --random-agent "
+
+            "--output-dir=\"$DIR\" > \"$OUT\" 2>&1 || true\n"
 
         )
 
-        jobs.append(("sqlmap", ["bash", "-c", cmd_str], 3600))
+        runner.chmod(0o755)
 
-    ssrf_in = ensure(outdir / "urls_ssrf.txt")
+        jobs.append(("sqlmap", ["bash", str(runner)], 3600))
+
 
     ssrf_urls = [u for u in all_urls
 
@@ -1405,29 +1791,50 @@ async def phase_G(outdir: Path, t: Tools, only: set, skip: set,
 
                          "redirect=", "img="))]
 
+    ssrf_in = ensure(outdir / "urls_ssrf.txt")
+
     if ssrf_urls:
 
         ssrf_in.write_text("\n".join(ssrf_urls) + "\n")
 
-    if oast_domain and ssrf_urls:
+
+    # Validate OAST hostname is a single safe token (alnum, dot, dash only)
+
+    # BEFORE splicing it into a bash script. shlex.quote is belt-and-suspenders.
+
+    if oast_domain and ssrf_urls and _SAFE_HOST.match(oast_domain):
 
         ssrf_script = outdir / "ssrf_probe.sh"
 
         ssrf_script.write_text(
 
-            "#!/usr/bin/env bash\nset -u\n"
+            "#!/usr/bin/env bash\n"
 
-            f"OAST={oast_domain}\n"
+            "set -u\n"
 
-            f"IN={shlex_quote(str(ssrf_in))}\n"
+            f"OAST={shlex.quote(oast_domain)}\n"
 
-            "while read -r u; do\n"
+            f"IN={shlex.quote(str(ssrf_in))}\n"
+
+            "while IFS= read -r u || [[ -n \"$u\" ]]; do\n"
+
+            "  [ -z \"$u\" ] && continue\n"
 
             "  for p in url uri path dest redirect img; do\n"
 
-            "    curl -s -o /dev/null --max-time 10 "
+            "    # only rewrite if the parameter actually exists in the URL\n"
 
-            "    \"${u//&${p}=*/&${p}=http://${OAST}/ssrf-$RANDOM}\"\n"
+            "    case \"$u\" in\n"
+
+            "      *\"&${p}=\"*) new=\"${u//&${p}=*/&${p}=http://${OAST}/ssrf-$RANDOM}\" ;;\n"
+
+            "      *\"?${p}=\"*) new=\"${u//?${p}=*/?${p}=http://${OAST}/ssrf-$RANDOM}\" ;;\n"
+
+            "      *) continue ;;\n"
+
+            "    esac\n"
+
+            "    curl -sS -o /dev/null --max-time 10 \"$new\" || true\n"
 
             "  done\n"
 
@@ -1438,6 +1845,11 @@ async def phase_G(outdir: Path, t: Tools, only: set, skip: set,
         ssrf_script.chmod(0o755)
 
         jobs.append(("ssrf-probe", ["bash", str(ssrf_script)], 1800))
+
+    elif oast_domain and ssrf_urls:
+
+        log("warn", "G: interactsh domain has unsafe characters, skipping SSRF probes")
+
 
     await run_parallel(jobs, outdir)
 
@@ -1452,6 +1864,7 @@ async def phase_G(outdir: Path, t: Tools, only: set, skip: set,
     n = merge_unique(parts, outdir / "vulns.txt")
 
     return {"G": str(outdir / "vulns.txt"), "count": n}
+
 
 
 # ───────────────────────────── report writers ──────────────────────────────
@@ -1494,6 +1907,7 @@ def _counts(outdir: Path) -> Dict[str, int]:
     return {k: len(read_lines(v)) for k, v in keys.items() if v.exists()}
 
 
+
 def write_summary(outdir: Path, domain: str, state: dict,
 
                   counts: Dict[str, int]) -> Path:
@@ -1504,9 +1918,9 @@ def write_summary(outdir: Path, domain: str, state: dict,
 
         "generated_at": datetime.now().isoformat(timespec="seconds"),
 
-        "toolchain": "reconchain v1.0",
+        "toolchain": "reconchain v1.1",
 
-        "missing_tools": state.get("missing_tools", []),
+        "missing_tools": sorted(set(state.get("missing_tools", []))),
 
         "artifacts": {k: v for k, v in state.get("artifacts", {}).items()},
 
@@ -1519,6 +1933,7 @@ def write_summary(outdir: Path, domain: str, state: dict,
     out.write_text(json.dumps(payload, indent=2))
 
     return out
+
 
 
 HTML_CSS = """
@@ -1546,13 +1961,24 @@ pre{background:#161b22;border:1px solid #30363d;border-radius:6px;padding:12px;o
 """
 
 
+
+def html_escape(s: str) -> str:
+
+    return (s.replace("&", "&amp;").replace("<", "&lt;")
+
+             .replace(">", "&gt;").replace('"', "&quot;")
+
+             .replace("'", "&#39;"))
+
+
+
 def write_html(outdir: Path, domain: str, counts: Dict[str, int],
 
                missing: List[str]) -> Path:
 
     cards = "\n".join(
 
-        f'<div class="card"><b>{n}</b><span>{k}</span></div>'
+        f'<div class="card"><b>{n}</b><span>{html_escape(k)}</span></div>'
 
         for k, n in counts.items()
 
@@ -1580,11 +2006,13 @@ def write_html(outdir: Path, domain: str, counts: Dict[str, int],
 
             sections.append(
 
-                f'<h2>{key}</h2><pre>{html_escape(txt)}</pre>')
+                f'<h2>{html_escape(key)}</h2><pre>{html_escape(txt)}</pre>')
 
     miss_html = ("<p class='miss'>missing: " +
 
-                 ", ".join(missing) + "</p>" if missing else "")
+                 ", ".join(html_escape(m) for m in missing) +
+
+                 "</p>" if missing else "")
 
     html = f"""<!doctype html>
 
@@ -1596,7 +2024,7 @@ def write_html(outdir: Path, domain: str, counts: Dict[str, int],
 
 <h1>Recon Report: {html_escape(domain)}</h1>
 
-<small>generated {datetime.now().isoformat(timespec='seconds')} · reconchain v1.0</small>
+<small>generated {datetime.now().isoformat(timespec='seconds')} · reconchain v1.1</small>
 
 {miss_html}
 
@@ -1614,12 +2042,6 @@ def write_html(outdir: Path, domain: str, counts: Dict[str, int],
 
     return out
 
-
-def html_escape(s: str) -> str:
-
-    return (s.replace("&", "&amp;").replace("<", "&lt;")
-
-             .replace(">", "&gt;").replace('"', "&quot;"))
 
 
 def write_markdown(outdir: Path, domain: str, counts: Dict[str, int],
@@ -1665,6 +2087,7 @@ def write_markdown(outdir: Path, domain: str, counts: Dict[str, int],
     return out
 
 
+
 # ───────────────────────────── pipeline runner ─────────────────────────────
 
 
@@ -1680,7 +2103,7 @@ PIPELINE = [
 
     ("C2", phase_C2, ("outdir", "t", "only", "skip")),
 
-    ("D",  phase_D,  ("outdir", "t", "only", "skip")),
+    ("D",  phase_D,  ("outdir", "t", "only", "skip", "prev")),
 
     ("E",  phase_E,  ("outdir", "t", "only", "skip")),
 
@@ -1691,6 +2114,7 @@ PIPELINE = [
     ("G",  phase_G,  ("outdir", "t", "only", "skip", "oast_domain")),
 
 ]
+
 
 
 def _atomic_write_json(path: Path, payload: dict) -> None:
@@ -1710,6 +2134,7 @@ def _atomic_write_json(path: Path, payload: dict) -> None:
     os.replace(tmp, path)
 
 
+
 async def run_pipeline(args: argparse.Namespace) -> int:
 
     outdir = Path(args.out).resolve()
@@ -1718,7 +2143,15 @@ async def run_pipeline(args: argparse.Namespace) -> int:
 
     state_path = outdir / "state.json"
 
-    state = {"artifacts": {}, "missing_tools": []}
+    state: Dict[str, Any] = {
+
+        "domain": args.domain,
+
+        "artifacts": {},
+
+        "missing_tools": [],
+
+    }
 
     if args.resume and state_path.exists():
 
@@ -1726,15 +2159,31 @@ async def run_pipeline(args: argparse.Namespace) -> int:
 
             with state_path.open() as f:
 
-                state = json.load(f)
+                saved = json.load(f)
 
-            log("info", f"resuming from {state_path}")
+            # --resume only makes sense for the same target domain. If the
+
+            # state file is for a different domain, start fresh so we never
+
+            # accidentally reuse the wrong target's artifacts.
+
+            if saved.get("domain") and saved.get("domain") != args.domain:
+
+                log("warn",
+
+                    f"state.json is for domain {saved.get('domain')!r}, "
+
+                    f"not {args.domain!r}; ignoring and starting fresh")
+
+            else:
+
+                state = saved
+
+                log("info", f"resuming from {state_path}")
 
         except json.JSONDecodeError:
 
             log("warn", f"{state_path} corrupt; ignoring and starting fresh")
-
-            state = {"artifacts": {}, "missing_tools": []}
 
 
     t = Tools()
@@ -1744,11 +2193,16 @@ async def run_pipeline(args: argparse.Namespace) -> int:
     skip = set(p.strip() for p in args.skip.split(",") if p.strip()) if args.skip else set()
 
 
+    # pre-seed missing tools from state so a partial resume doesn't lose them
+
+    t.seed_missing(state.get("missing_tools", []))
+
+
     oast = Interactsh(outdir)
 
     oast_started = False
 
-    if not skip.intersection({"E", "F1", "F2", "G", "H"}):
+    if not skip & {"E", "F1", "F2", "G", "H"}:
 
         oast_started = oast.start()
 
@@ -1767,9 +2221,7 @@ async def run_pipeline(args: argparse.Namespace) -> int:
 
                 log("skip", f"phase {name} (--skip)"); continue
 
-            # start interactsh before phase E (E1 in the diagram)
-
-            if name == "E" and not oast_started and not skip.intersection({"H", "G"}):
+            if name == "E" and not oast_started and not skip & {"H", "G"}:
 
                 oast_started = oast.start()
 
@@ -1778,10 +2230,6 @@ async def run_pipeline(args: argparse.Namespace) -> int:
                       "only": only, "skip": skip, "prev": prev,
 
                       "oast_domain": oast.domain}
-
-            # filter kwargs to what fn accepts
-
-            import inspect
 
             sig = inspect.signature(fn)
 
@@ -1803,7 +2251,13 @@ async def run_pipeline(args: argparse.Namespace) -> int:
 
                                        if isinstance(v, str)})
 
-            state["missing_tools"] = t.missing
+            # accumulate (not overwrite) missing tools across phases
+
+            for m in t.missing:
+
+                if m not in state["missing_tools"]:
+
+                    state["missing_tools"].append(m)
 
             try:
 
@@ -1815,10 +2269,8 @@ async def run_pipeline(args: argparse.Namespace) -> int:
 
     finally:
 
-        oast_cb = oast.stop() if oast_started else None
+        _ = oast.stop() if oast_started else None
 
-
-    # Phase I: dedup + reports
 
     counts = _counts(outdir)
 
@@ -1835,6 +2287,7 @@ async def run_pipeline(args: argparse.Namespace) -> int:
     log("ok", f"report  → {mj}")
 
     return 0
+
 
 
 # ─────────────────────────────────── main ──────────────────────────────────
@@ -1866,7 +2319,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     p.add_argument("--resume", action="store_true",
 
-                   help="resume from ./out/state.json if it exists")
+                   help="resume from ./out/state.json if it exists "
+
+                        "(only for the same target domain)")
 
     p.add_argument("-q", "--quiet", action="store_true",
 
@@ -1875,13 +2330,12 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
+
 def main() -> int:
 
     args = build_parser().parse_args()
 
     if args.quiet:
-
-        # crude: silence info by overriding log
 
         global log
 
@@ -1900,6 +2354,7 @@ def main() -> int:
     except KeyboardInterrupt:
 
         log("warn", "interrupted"); return 130
+
 
 
 if __name__ == "__main__":

@@ -1,403 +1,214 @@
-ReconChain
+# ReconChain
 
 A single Python orchestrator that chains 25+ reconnaissance and vulnerability assessment tools into one structured, resumable pipeline.
 
-⸻
+## Overview
 
-Overview
+ReconChain automates the entire reconnaissance workflow from subdomain enumeration to vulnerability discovery and reporting.
 
-ReconChain automates the entire reconnaissance workflow, from subdomain enumeration to vulnerability discovery and reporting.
+Instead of manually chaining dozens of tools together, ReconChain executes them in a structured phase based pipeline with:
 
-Instead of manually chaining dozens of tools together, ReconChain executes them in a structured, phase-based pipeline with:
-
-* Parallel execution where possible
-* Automatic dependency detection
-* Resume support after interruptions
-* Background OAST collection via Interactsh
-* Multiple report formats
-* Graceful handling of missing tools
+- Parallel execution where possible  
+- Automatic dependency detection  
+- Resume support after interruptions  
+- Background OAST collection via Interactsh  
+- Multiple report formats  
+- Graceful handling of missing tools  
 
 The result is a single command that performs a complete reconnaissance workflow and produces actionable reports.
 
-⸻
+## Pipeline
 
-Pipeline
+subfinder + amass + assetfinder  
+→ dnsx  
+→ naabu / nmap + httpx + subjack  
+→ gau + waybackurls + gospider + katana + subjs  
+→ LinkFinder + SecretFinder + nuclei exposures  
+→ ParamSpider + Arjun + x8  
+→ ffuf + kiterunner + feroxbuster  
+→ nuclei + testssl.sh + wpscan  
+→ interactsh polling  
+→ dalfox + sqlmap + SSRF probes  
+→ report generation  
 
-┌── subfinder ──┐
-       PHASE A1 ────┼── amass ──────┼── all_subs.txt
-                    └── assetfinder ┘
-                            │
-                            ▼
-                    dnsx → resolved.txt
-                            │
-       ┌────────────────────┼─────────────────────┐
-       ▼                    ▼                     ▼
-   naabu/nmap            httpx              subjack
-   ports                 live hosts         takeover checks
-                            │
-                            ├────────── parallel ──────────┐
-                            ▼                             ▼
-                     gau/waybackurls                   katana
-                     + gospider                        + subjs
-                            │                             │
-                            └─────────────┬───────────────┘
-                                          ▼
-                         LinkFinder + SecretFinder
-                             nuclei exposures
-                                          │
-                                          ▼
-                         ParamSpider + Arjun + x8
-                                          │
-                                          ▼
-                     ffuf + kiterunner + feroxbuster
-                                          │
-                            ┌─────────────┴──────────────┐
-                            ▼                            ▼
-                     nuclei (full)                 testssl.sh
-                     tech detection                wpscan
-                            │                            │
-                            └─────────────┬──────────────┘
-                                          ▼
-                              interactsh polling
-                                          ▼
-                     dalfox → sqlmap → SSRF probes
-                                          │
-                                          ▼
-                               report generation
+## Features
 
-⸻
-
-Features
-
-Full Recon Pipeline
+### Full Recon Pipeline
 
 Single command execution covering:
 
-* Subdomain Enumeration
-* DNS Resolution
-* Port Scanning
-* Live Host Discovery
-* Takeover Detection
-* URL Collection
-* JavaScript Analysis
-* Secret Discovery
-* Parameter Enumeration
-* Content Fuzzing
-* Vulnerability Scanning
-* SSL/TLS Assessment
-* WordPress Enumeration
-* OAST Callback Tracking
-* Automated Reporting
+- Subdomain enumeration  
+- DNS resolution  
+- Port scanning  
+- Live host discovery  
+- Takeover detection  
+- URL collection  
+- JavaScript analysis  
+- Secret discovery  
+- Parameter enumeration  
+- Content fuzzing  
+- Vulnerability scanning  
+- SSL and TLS assessment  
+- WordPress enumeration  
+- OAST callback tracking  
+- Automated reporting  
 
-Phase-Aware Parallelism
+### Phase Aware Parallelism
 
-Independent branches execute concurrently using asyncio.gather().
+Independent branches execute concurrently using asyncio.gather.
 
-Examples:
+### Background OAST Collection
 
-* Enumeration tools run simultaneously
-* URL collection branches execute in parallel
-* SSL and vulnerability scans run independently
-
-Background OAST Collection
-
-interactsh-client is launched automatically before active testing begins and remains active throughout the scan.
+interactsh client is launched automatically before active testing begins and remains active throughout the scan.
 
 Detected callbacks are exported to:
 
 oast/callbacks.txt
 
-Graceful Degradation
+### Graceful Degradation
 
-Every dependency is verified using:
+Dependencies are checked using shutil.which.
 
-shutil.which()
+Missing tools are skipped without crashing the pipeline.
 
-Missing tools are reported and skipped without crashing the pipeline.
-
-Resume Support
-
-If execution stops unexpectedly:
+### Resume Support
 
 ./reconchain.py --resume
 
-ReconChain restores progress from:
+State file:
 
 state.json
 
-Multi-Format Reporting
+### Reports
 
-Generated reports:
+- summary.json  
+- report.html  
+- report.md  
 
-* summary.json
-* report.html
-* report.md
+## Supported Tools
 
-⸻
+Enumeration:
+subfinder, amass, assetfinder, dnsx
 
-Supported Tools
+Network:
+naabu, nmap, httpx, subjack
 
-Enumeration
+URLs:
+gau, waybackurls, gospider, katana, subjs
 
-* subfinder
-* amass
-* assetfinder
-* dnsx
+Analysis:
+LinkFinder, SecretFinder, ParamSpider, Arjun, x8
 
-Network Discovery
+Fuzzing:
+ffuf, kiterunner, feroxbuster
 
-* naabu
-* nmap
-* httpx
-* subjack
+Vulns:
+nuclei, dalfox, sqlmap, testssl.sh, wpscan
 
-URL Collection
+OAST:
+interactsh-client
 
-* gau
-* waybackurls
-* gospider
-* katana
-* subjs
-
-Analysis
-
-* LinkFinder
-* SecretFinder
-* ParamSpider
-* Arjun
-* x8
-
-Fuzzing
-
-* ffuf
-* kiterunner
-* feroxbuster
-
-Vulnerability Assessment
-
-* nuclei
-* dalfox
-* sqlmap
-* testssl.sh
-* wpscan
-
-OAST
-
-* interactsh-client
-
-⸻
-
-Installation
-
-1. Install Dependencies
+## Installation
 
 chmod +x install.sh
 ./install.sh
 
-Installation typically takes:
-
-* 10–15 minutes
-* Downloads ~25 external tools
-
-Installation Modes
-
-./install.sh
-
-Full installation.
+Modes:
 
 ./install.sh --check
-
-Check installed tools.
-
 ./install.sh --go-only
-
-Install only Go-based tools.
-
 ./install.sh --py-only
 
-Install only Python-based tools.
+## Platforms
 
-⸻
+Ubuntu, Debian, Fedora, Arch, macOS (Homebrew)
 
-Supported Platforms
+## Usage
 
-* Ubuntu
-* Debian
-* Fedora
-* Arch Linux
-* macOS (Homebrew)
-
-The installer automatically:
-
-* Installs Go ≥ 1.22
-* Installs system packages
-* Installs Python dependencies
-* Installs Ruby dependencies
-* Updates Nuclei templates
-* Configures PATH
-
-⸻
-
-Clone Repository
-
-git clone https://github.com/<username>/reconchain.git
-cd reconchain
-chmod +x reconchain.py
-
-No Python dependencies are required beyond the standard library.
-
-⸻
-
-Usage
-
-Full Scan
-
+Full scan:
 ./reconchain.py -d example.com -o ./out
 
-Run Specific Phases
+Only phases:
+./reconchain.py -d example.com -o ./out --only A1,A2,B1
 
-./reconchain.py \
-    -d example.com \
-    -o ./out \
-    --only A1,A2,B1
+Skip phases:
+./reconchain.py -d example.com -o ./out --skip F2,G
 
-Skip Heavy Scans
+Resume:
+./reconchain.py -d example.com -o ./out --resume
 
-./reconchain.py \
-    -d example.com \
-    -o ./out \
-    --skip F2,G
+Quiet:
+./reconchain.py -d example.com -o ./out -q
 
-Resume Execution
+## Flags
 
-./reconchain.py \
-    -d example.com \
-    -o ./out \
-    --resume
+-d target domain  
+-o output folder  
+--only selected phases  
+--skip skip phases  
+--resume resume scan  
+-q quiet mode  
 
-Quiet Mode
+## Scan Phases
 
-./reconchain.py \
-    -d example.com \
-    -o ./out \
-    -q
+A1 subdomains → all_subs.txt  
+A2 DNS resolve → resolved.txt  
+B1 ports + takeover → ports.txt  
+C1 URL collection → urls.txt  
+C2 JS + secrets → js_secrets.txt  
+D parameters → params.txt  
+E fuzzing → fuzz.txt  
+F1 nuclei + tech → nuclei.txt  
+F2 ssl + wordpress → testssl.txt  
+G vulns → vulns.txt  
+H oast callbacks → callbacks.txt  
+I reporting → report.html  
 
-⸻
-
-Command Line Options
-
-Flag	Description
--d	Target root domain
--o	Output directory
---only	Run selected phases
---skip	Skip selected phases
---resume	Resume from state.json
--q	Quiet mode
-
-⸻
-
-Scan Phases
-
-Phase	Description	Output
-A1	Subdomain Enumeration	all_subs.txt
-A2	DNS Resolution	resolved.txt
-B1	Ports, Hosts, Takeover Checks	ports.txt
-C1	URL Harvesting	urls_*.txt
-C2	JS & Secret Analysis	js_secrets.txt
-D	Parameter Discovery	params.txt
-E	Content Fuzzing	fuzz.txt
-F1	Nuclei & Tech Detection	nuclei.txt
-F2	SSL & WordPress Analysis	testssl.txt
-G	XSS, SQLi, SSRF Testing	vulns.txt
-H	OAST Callback Collection	callbacks.txt
-I	Reporting	report.html
-
-⸻
-
-Output Structure
+## Output
 
 out/
-├── all_subs.txt
-├── resolved.txt
-├── ports.txt
-├── hosts.txt
-├── takeover.txt
-├── urls_gau.txt
-├── urls_katana.txt
-├── urls_all.txt
-├── js_secrets.txt
-├── params.txt
-├── fuzz.txt
-├── nuclei.txt
-├── tech.txt
-├── nuclei_combined.txt
-├── testssl.txt
-├── vulns.txt
-├── oast/
-│   └── callbacks.txt
-├── logs/
-├── state.json
-├── summary.json
-├── report.html
-└── report.md
+all_subs.txt
+resolved.txt
+ports.txt
+hosts.txt
+takeover.txt
+urls_*.txt
+js_secrets.txt
+params.txt
+fuzz.txt
+nuclei.txt
+testssl.txt
+vulns.txt
+oast/callbacks.txt
+logs/
+state.json
+summary.json
+report.html
+report.md
 
-⸻
+## Configuration
 
-Configuration
+INTERACTSH_TOKEN
+FFUF_WORDLIST
+KITELIST
+NO_COLOR
 
-Environment variables:
+## Security Notice
 
-Variable	Description
-INTERACTSH_TOKEN	Registered Interactsh token
-FFUF_WORDLIST	Custom FFUF wordlist
-KITELIST	Custom Kiterunner route list
-NO_COLOR	Disable ANSI colors
+Only scan systems you own or have permission to test.
 
-⸻
+Recon tools may trigger security alerts or logs.
 
-Security Notice
+## Roadmap
 
-ReconChain includes tools that perform active reconnaissance and vulnerability testing.
+Docker support  
+GitHub Actions  
+Kubernetes mode  
+Cloud asset inventory  
+More nuclei profiles  
+Alpine support  
+Nix package  
 
-These tools may:
+## License
 
-* Trigger IDS/IPS alerts
-* Generate extensive logs
-* Impact production systems
-* Violate laws or policies if used without authorization
-
-Only scan systems you own or have explicit written permission to test.
-
-⸻
-
-Roadmap
-
-* Docker image
-* GitHub Actions support
-* Kubernetes deployment mode
-* Cloud asset inventory integration
-* Additional nuclei template profiles
-* Alpine Linux support
-* Nix package support
-
-⸻
-
-Contributing
-
-Contributions are welcome.
-
-Ideas:
-
-* New tool integrations
-* Additional report formats
-* Better wordlists
-* New scan phases
-* Performance improvements
-
-⸻
-
-License
-
-MIT License
-
-See the LICENSE file for details.
+MIT

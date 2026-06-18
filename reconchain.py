@@ -1338,6 +1338,7 @@ async def run_pipeline(args: argparse.Namespace) -> int:
     log("ok", f"summary → {sj}")
     log("ok", f"report  → {hj}")
     log("ok", f"report  → {mj}")
+    progress.close()
     return 0
 # ─────────────────────────────────── main ──────────────────────────────────
 def build_parser() -> argparse.ArgumentParser:

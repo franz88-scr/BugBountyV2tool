@@ -41,6 +41,7 @@ import signal
 import subprocess
 import sys
 import time
+from tqdm import tqdm
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path

@@ -1224,11 +1224,6 @@ def _csv_from_phases(value: object) -> PhaseSet:
     return set()
 
 async def run_pipeline(args: argparse.Namespace) -> int:
-    phases_to_run = [
-    name for name, _, _ in PIPELINE
-    if (not only or name in only) and name not in skip
-		]
-		progress = Progress(len(phases_to_run))
     outdir = Path(args.out).resolve()
     if outdir.exists() and not outdir.is_dir():
         raise ValueError(f"output path exists and is not a directory: {outdir}")
@@ -1294,6 +1289,7 @@ async def run_pipeline(args: argparse.Namespace) -> int:
     oast_started = False
     phases_to_run = [name for name, _, _ in PIPELINE
                      if (not only or name in only) and name not in skip]
+    progress = Progress(len(phases_to_run))
     active_needs_oast = any(name in {"E", "F1", "F2", "G"} for name in phases_to_run)
     if active_needs_oast and "H" not in skip:
         oast_started = oast.start()

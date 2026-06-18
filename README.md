@@ -112,6 +112,8 @@ interactsh-client
 
 Python package and development tooling:
 
+pip install tqdm
+
 python3 -m pip install -e '.[dev]'
 
 External recon tools:

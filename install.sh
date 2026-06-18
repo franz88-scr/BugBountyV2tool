@@ -172,7 +172,7 @@ ALL_TOOLS=(subfinder amass assetfinder dnsx naabu nmap httpx subjack nuclei
 
            gau waybackurls gospider katana subjs linkfinder secretfinder
 
-           paramspider arjun x8 ffuf kiterunner feroxbuster testssl.sh
+           paramspider arjun x8 ffuf kr feroxbuster testssl.sh
 
            wpscan dalfox sqlmap interactsh-client)
 
@@ -204,7 +204,7 @@ install_system() {
 
         ruby ruby-dev build-essential libcurl4-openssl-dev libssl-dev \
 
-        jq seclists 2>/dev/null || warn "some apt packages failed (non-fatal)"
+        jq seclists cargo 2>/dev/null || warn "some apt packages failed (non-fatal)"
 
       ;;
 
@@ -212,7 +212,7 @@ install_system() {
 
       sudo dnf install -y nmap python3 python3-pip git curl wget \
 
-        ruby ruby-devel gcc make openssl-devel jq
+        ruby ruby-devel gcc make openssl-devel jq cargo
 
       ;;
 
@@ -220,13 +220,13 @@ install_system() {
 
       sudo pacman -Sy --noconfirm nmap python python-pip git curl wget \
 
-        ruby jq base-devel
+        ruby jq base-devel rust
 
       ;;
 
     brew)
 
-      brew install nmap python git curl wget ruby jq go
+      brew install nmap python git curl wget ruby jq go rust
 
       ;;
 
@@ -270,8 +270,6 @@ GO_TOOLS=(
   "github.com/ffuf/ffuf/v2"
 
   "github.com/assetnote/kiterunner/cmd/kr"
-
-  "github.com/epi052/feroxbuster/v2"
 
   "github.com/hahwul/dalfox/v2"
 
@@ -409,9 +407,17 @@ EOF
 
     sudo git clone --depth 1 https://github.com/GerbenJavado/LinkFinder.git /opt/LinkFinder
 
+  fi
+
+  if [[ -f /opt/LinkFinder/linkfinder.py ]]; then
+
     sudo ln -sf /opt/LinkFinder/linkfinder.py /usr/local/bin/linkfinder
 
     ok "linkfinder"
+
+  else
+
+    warn "linkfinder install failed"
 
   fi
 
@@ -452,6 +458,35 @@ install_wpscan() {
     gem install wpscan --no-document || warn "wpscan install failed"
 
     ok "wpscan"
+
+  fi
+
+}
+
+
+# ───────────────────────────── feroxbuster (Rust) ─────────────────
+
+install_feroxbuster() {
+
+  if ! command -v feroxbuster >/dev/null 2>&1; then
+
+    log "Installing feroxbuster (Rust crate)…"
+
+    if ! command -v cargo >/dev/null 2>&1; then
+
+      warn "cargo not found; install Rust/cargo, then run: cargo install feroxbuster"
+
+      return
+
+    fi
+
+    cargo install feroxbuster || warn "feroxbuster install failed"
+
+  fi
+
+  if command -v feroxbuster >/dev/null 2>&1; then
+
+    ok "feroxbuster"
 
   fi
 
@@ -505,6 +540,8 @@ case "$MODE" in
     install_go_tools
 
     install_python_tools
+
+    install_feroxbuster
 
     install_wpscan
 

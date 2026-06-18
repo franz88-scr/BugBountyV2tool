@@ -47,11 +47,15 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 # ─────────────────────── hostname validation (chain glue) ────────────────────
 # Used by the A1 merge and the A2 parse to filter obvious garbage out of the
-# chain. Accepts FQDN-shaped strings: 1-253 chars, dot-separated labels of
-# [a-z0-9_-], no leading/trailing hyphen/underscore in labels.
+# chain. Accepts DNS hostnames: 1-253 chars, dot-separated labels of
+# [a-z0-9-], with no leading or trailing hyphen in labels.
 _HOSTNAME_RE = re.compile(
-    r"^(?=.{1,253}$)(?!-)[A-Za-z0-9_-]{1,63}(?:\.[A-Za-z0-9_-]{1,63})+(?:\.?)$"
+    r"^(?=.{1,253}$)(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+"
+    r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.?$"
 )
+VALID_PHASES = {"A1", "A2", "B1", "C1", "C2", "D", "E", "F1", "F2", "G", "H", "I"}
+PhaseSet = Set[str]
+
 def _is_valid_hostname(s: str) -> bool:
     """True if `s` looks like an FQDN-shaped hostname (has at least one dot)."""
     if not s:
@@ -65,6 +69,21 @@ def _is_under_domain(host: str, domain: str) -> bool:
     h = host.rstrip(".").lower()
     d = domain.rstrip(".").lower()
     return h == d or h.endswith("." + d)
+
+def _target_token(line: str) -> str:
+    """Return the first URL/host token from a tool output line."""
+    return line.strip().split()[0] if line.strip() else ""
+
+def _target_lines(path: Path) -> List[str]:
+    return [_target_token(line) for line in read_lines(path) if _target_token(line)]
+
+def _write_target_tokens(src: Path, dst: Path) -> int:
+    seen: Set[str] = set()
+    for token in _target_lines(src):
+        if token not in seen:
+            seen.add(token)
+    ensure(dst).write_text("\n".join(sorted(seen)) + ("\n" if seen else ""))
+    return len(seen)
 # ───────────────────────────── pretty logging ──────────────────────────────
 def _color() -> bool:
     return sys.stdout.isatty() and os.environ.get("NO_COLOR") is None
@@ -80,6 +99,12 @@ C = {
 }
 LVL = {"info": C["c"], "ok": C["g"], "warn": C["y"],
        "err": C["red"], "skip": C["d"]}
+def disable_color() -> None:
+    for key in C:
+        C[key] = ""
+    for key in LVL:
+        LVL[key] = ""
+
 def log(lvl: str, msg: str) -> None:
     ts = datetime.now().strftime("%H:%M:%S")
     print(f"{C['d']}{ts}{C['r']} {LVL[lvl]}[{lvl.upper():4}]{C['r']} {msg}",
@@ -125,20 +150,32 @@ def _run_blocking(cmd: List[str], timeout: int, cwd: Optional[Path],
     t0 = time.monotonic()
     log_path.parent.mkdir(parents=True, exist_ok=True)
     with log_path.open("wb") as logf:
+        proc: Optional[subprocess.Popen[bytes]] = None
         try:
-            proc = subprocess.run(
+            proc = subprocess.Popen(
                 cmd, cwd=str(cwd) if cwd else None,
                 stdout=logf, stderr=subprocess.STDOUT,
-                timeout=timeout, check=False,
+                start_new_session=True,
             )
+            proc.wait(timeout=timeout)
             return proc.returncode, time.monotonic() - t0
         except subprocess.TimeoutExpired:
+            if proc is not None and proc.poll() is None:
+                with contextlib.suppress(ProcessLookupError):
+                    os.killpg(proc.pid, signal.SIGTERM)
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    with contextlib.suppress(ProcessLookupError):
+                        os.killpg(proc.pid, signal.SIGKILL)
+                    with contextlib.suppress(Exception):
+                        proc.wait(timeout=5)
             with log_path.open("ab") as f:
-                f.write(f"\n[timeout after {timeout}s]\n")
+                f.write(f"\n[timeout after {timeout}s]\n".encode("utf-8"))
             return 124, time.monotonic() - t0
         except FileNotFoundError as e:
             with log_path.open("ab") as f:
-                f.write(f"\n[binary not found: {e}]\n")
+                f.write(f"\n[binary not found: {e}]\n".encode("utf-8"))
             return 127, time.monotonic() - t0
 async def _run(name: str, cmd: List[str], timeout: int, outdir: Path,
                note: str = "") -> StepResult:
@@ -157,7 +194,7 @@ MAX_PARALLEL_JOBS = 8
 async def run_parallel(jobs: List[Tuple[str, List[str], int]],
                        outdir: Path) -> List[StepResult]:
     sem = asyncio.Semaphore(MAX_PARALLEL_JOBS)
-    async def _guarded(n, c, t):
+    async def _guarded(n: str, c: List[str], t: int) -> StepResult:
         async with sem:
             return await _run(n, c, t, outdir)
     coros = [_guarded(n, c, t) for n, c, t in jobs]
@@ -346,7 +383,8 @@ class Interactsh:
 # small helper: hostname token safety check
 _SAFE_HOST = re.compile(r"^[A-Za-z0-9.\-]+$")
 async def phase_A1(domain: str, outdir: Path, t: Tools,
-                   only: set, skip: set, resume: bool = False) -> Dict[str, Any]:
+                   only: PhaseSet, skip: PhaseSet,
+                   resume: bool = False) -> Dict[str, Any]:
     if skip & {"A1"}:
         return {}
     out = outdir / "all_subs.txt"
@@ -406,7 +444,7 @@ async def phase_A1(domain: str, outdir: Path, t: Tools,
         log("warn", f"A1: partial — failed tools: {failures}")
     return ret
 async def phase_A2(domain: str, outdir: Path, t: Tools,
-                   only: set, skip: set, prev: dict,
+                   only: PhaseSet, skip: PhaseSet, prev: Dict[str, Any],
                    resume: bool = False) -> Dict[str, Any]:
     if skip & {"A2"}:
         return {}
@@ -467,8 +505,8 @@ async def phase_A2(domain: str, outdir: Path, t: Tools,
     log("info", f"A2: {len(seen)} unique hosts (from {n_records} "
         f"A/AAAA/CNAME records in resolved_full.txt)")
     return {"A2": str(out), "count": len(seen), "rc": res.rc}
-async def phase_B1(outdir: Path, t: Tools, only: set, skip: set,
-                   prev: dict) -> Dict[str, Any]:
+async def phase_B1(outdir: Path, t: Tools, only: PhaseSet, skip: PhaseSet,
+                   prev: Dict[str, Any]) -> Dict[str, Any]:
     if skip & {"B1"}:
         return {}
     log("info", "Phase B1: ports / hosts / takeover (parallel)")
@@ -478,25 +516,35 @@ async def phase_B1(outdir: Path, t: Tools, only: set, skip: set,
     subs = Path(prev.get("A1") or outdir / "all_subs.txt")
     ports_file = outdir / "ports.txt"
     jobs: List[Tuple[str, List[str], int]] = []
-    if t.has("naabu"):
+    have_hosts = hosts.exists() and bool(read_lines(hosts))
+    have_subs = subs.exists() and bool(read_lines(subs))
+    if not have_hosts and not have_subs:
+        log("warn", "B1: no host or subdomain input; skipping")
+        return {
+            "B1.ports": str(ports_file),
+            "B1.hosts": str(outdir / "hosts.txt"),
+            "B1.targets": str(outdir / "host_targets.txt"),
+            "B1.takeover": str(outdir / "takeover.txt"),
+        }
+    if have_hosts and t.has("naabu"):
         jobs.append(("naabu",
             ["naabu", "-silent", "-l", str(hosts),
              "-o", str(ports_file)], 1800))
-    elif t.has("nmap"):
+    elif have_hosts and t.has("nmap"):
         jobs.append(("nmap",
             ["nmap", "-iL", str(hosts), "-Pn", "-p-", "--open",
              "-oG", str(outdir / "ports.gnmap")], 3600))
-    if t.has("httpx"):
+    if have_hosts and t.has("httpx"):
         jobs.append(("httpx",
             ["httpx", "-silent", "-l", str(hosts),
              "-o", str(outdir / "hosts.txt"),
              "-title", "-tech-detect", "-status-code", "-follow-redirects"],
             1800))
-    if t.has("subjack") and subs.exists() and read_lines(subs):
+    if t.has("subjack") and have_subs:
         jobs.append(("subjack",
             ["subjack", "-w", str(subs), "-t", "100", "-ssl",
              "-o", str(outdir / "takeover.txt")], 1200))
-    elif t.has("nuclei") and hosts.exists() and read_lines(hosts):
+    elif have_hosts and t.has("nuclei"):
         jobs.append(("nuclei-takeover",
             ["nuclei", "-silent", "-l", str(hosts),
              "-t", "http/takeovers", "-o", str(outdir / "takeover.txt")],
@@ -518,19 +566,32 @@ async def phase_B1(outdir: Path, t: Tools, only: set, skip: set,
                     bits = entry.strip().split("/")
                     if len(bits) >= 3 and bits[1] == "open":
                         ports.add(f"{ip}:{bits[0]}")
-            ensure(ports_file).write_text(
+                ensure(ports_file).write_text(
                 "\n".join(sorted(ports)) + ("\n" if ports else ""))
+    raw_hosts = outdir / "hosts.txt"
+    targets = outdir / "host_targets.txt"
+    if raw_hosts.exists() and read_lines(raw_hosts):
+        _write_target_tokens(raw_hosts, targets)
+    elif have_hosts:
+        merge_unique([hosts], targets)
     return {
         "B1.ports":   str(ports_file),
-        "B1.hosts":   str(outdir / "hosts.txt"),
+        "B1.hosts":   str(raw_hosts),
+        "B1.targets": str(targets),
         "B1.takeover": str(outdir / "takeover.txt"),
     }
-async def phase_C1(outdir: Path, t: Tools, only: set, skip: set,
-                   prev: dict) -> Dict[str, Any]:
+async def phase_C1(outdir: Path, t: Tools, only: PhaseSet, skip: PhaseSet,
+                   prev: Dict[str, Any]) -> Dict[str, Any]:
     if skip & {"C1"}:
         return {}
     log("info", "Phase C1: URL harvesting (parallel groups)")
-    hosts = Path(prev.get("B1.hosts") or outdir / "hosts.txt")
+    hosts = Path(prev.get("B1.targets") or outdir / "host_targets.txt")
+    if not hosts.exists() or not read_lines(hosts):
+        hosts = Path(prev.get("B1.hosts") or outdir / "hosts.txt")
+    if hosts.exists() and read_lines(hosts) and hosts.name == "hosts.txt":
+        normalized = outdir / "host_targets.txt"
+        _write_target_tokens(hosts, normalized)
+        hosts = normalized
     if not hosts.exists() or not read_lines(hosts):
         hosts = Path(prev.get("A2") or outdir / "resolved.txt")
     if not hosts.exists() or not read_lines(hosts):
@@ -616,7 +677,8 @@ async def phase_C1(outdir: Path, t: Tools, only: set, skip: set,
     n = merge_unique(harvested, outdir / "urls_all.txt")
     log("ok", f"C1: {n} unique URLs")
     return {"C1": str(outdir / "urls_all.txt"), "count": n}
-async def phase_C2(outdir: Path, t: Tools, only: set, skip: set) -> Dict[str, Any]:
+async def phase_C2(outdir: Path, t: Tools, only: PhaseSet,
+                   skip: PhaseSet) -> Dict[str, Any]:
     if skip & {"C2"}:
         return {}
     log("info", "Phase C2: JS analysis (LinkFinder + SecretFinder)")
@@ -634,6 +696,7 @@ async def phase_C2(outdir: Path, t: Tools, only: set, skip: set) -> Dict[str, An
             ensure(js_urls).write_text("\n".join(keep) + "\n")
     if not js_urls.exists() or not read_lines(js_urls):
         log("warn", "C2: no JS URLs found; skipping")
+        ensure(outdir / "js_secrets.txt").write_text("")
         return {"C2": str(outdir / "js_secrets.txt"), "count": 0}
     jobs: List[Tuple[str, List[str], int]] = []
     if t.has("linkfinder"):
@@ -672,8 +735,8 @@ async def phase_C2(outdir: Path, t: Tools, only: set, skip: set) -> Dict[str, An
     if n == 0:
         log("warn", "C2: no JS findings produced")
     return {"C2": str(outdir / "js_secrets.txt"), "count": n}
-async def phase_D(outdir: Path, t: Tools, only: set, skip: set,
-                  prev: dict) -> Dict[str, Any]:
+async def phase_D(outdir: Path, t: Tools, only: PhaseSet, skip: PhaseSet,
+                  prev: Dict[str, Any]) -> Dict[str, Any]:
     if skip & {"D"}:
         return {}
     log("info", "Phase D: parameter discovery")
@@ -773,7 +836,8 @@ def _extract_urls_from_kiterunner_jsonl(p: Path) -> List[str]:
         if url:
             out.append(str(url))
     return out
-async def phase_E(outdir: Path, t: Tools, only: set, skip: set) -> Dict[str, Any]:
+async def phase_E(outdir: Path, t: Tools, only: PhaseSet,
+                  skip: PhaseSet) -> Dict[str, Any]:
     if skip & {"E"}:
         return {}
     log("info", "Phase E: fuzzing")
@@ -797,7 +861,7 @@ async def phase_E(outdir: Path, t: Tools, only: set, skip: set) -> Dict[str, Any
                 ["ffuf", "-silent", "-u", u.rstrip("/") + "/FUZZ",
                  "-w", wordlist, "-mc", "200,301,302,403",
                  "-o", str(out_json)], 1500))
-    if t.has("kiterunner"):
+    if t.has("kr"):
         for u in sample:
             out_jsonl = outdir / f"kr_{safe_suffix(u)}.jsonl"
             jobs.append((f"kiterunner-{u[:32]}",
@@ -829,11 +893,16 @@ async def phase_E(outdir: Path, t: Tools, only: set, skip: set) -> Dict[str, Any
     if n == 0:
         log("warn", "E: fuzzers produced no hits")
     return {"E": str(outdir / "fuzz.txt"), "count": n}
-async def phase_F1(outdir: Path, t: Tools, only: set, skip: set) -> Dict[str, Any]:
+async def phase_F1(outdir: Path, t: Tools, only: PhaseSet,
+                   skip: PhaseSet) -> Dict[str, Any]:
     if skip & {"F1"}:
         return {}
     log("info", "Phase F1: nuclei (full) + tech-scanner")
-    hosts = outdir / "hosts.txt"
+    hosts = outdir / "host_targets.txt"
+    if not hosts.exists() or not read_lines(hosts):
+        raw_hosts = outdir / "hosts.txt"
+        if raw_hosts.exists() and read_lines(raw_hosts):
+            _write_target_tokens(raw_hosts, hosts)
     if not hosts.exists() or not read_lines(hosts):
         hosts = outdir / "resolved.txt"
     if not hosts.exists() or not read_lines(hosts):
@@ -853,11 +922,16 @@ async def phase_F1(outdir: Path, t: Tools, only: set, skip: set) -> Dict[str, An
     n = merge_unique([outdir / "nuclei.txt", outdir / "tech.txt"],
                      outdir / "nuclei_combined.txt")
     return {"F1": str(outdir / "nuclei_combined.txt"), "count": n}
-async def phase_F2(outdir: Path, t: Tools, only: set, skip: set) -> Dict[str, Any]:
+async def phase_F2(outdir: Path, t: Tools, only: PhaseSet,
+                   skip: PhaseSet) -> Dict[str, Any]:
     if skip & {"F2"}:
         return {}
     log("info", "Phase F2: testssl + wpscan")
-    hosts = outdir / "hosts.txt"
+    hosts = outdir / "host_targets.txt"
+    if not hosts.exists() or not read_lines(hosts):
+        raw_hosts = outdir / "hosts.txt"
+        if raw_hosts.exists() and read_lines(raw_hosts):
+            _write_target_tokens(raw_hosts, hosts)
     if not hosts.exists() or not read_lines(hosts):
         hosts = outdir / "resolved.txt"
     if not hosts.exists() or not read_lines(hosts):
@@ -888,7 +962,7 @@ async def phase_F2(outdir: Path, t: Tools, only: set, skip: set) -> Dict[str, An
     wpscan_jobs: List[Tuple[str, List[str], int]] = []
     if t.has("wpscan"):
         for h in sample:
-            if "http" in h:
+            if h.startswith(("http://", "https://")):
                 wps_out = outdir / f"wpscan_{safe_suffix(h)}.txt"
                 wpscan_jobs.append((f"wpscan-{h[:32]}",
                     ["wpscan", "--url", h, "--no-banner",
@@ -896,11 +970,11 @@ async def phase_F2(outdir: Path, t: Tools, only: set, skip: set) -> Dict[str, An
                     1800))
     # run both groups in parallel; per-host files remove the race
     await run_parallel(testssl_jobs + wpscan_jobs, outdir)
-    merge_unique(list(outdir.glob("testssl_*.txt")) +
-                 list(outdir.glob("wpscan_*.txt")),
-                 outdir / "tls_wp.txt")
-    return {"F2": str(outdir / "tls_wp.txt"), "count": 0}
-async def phase_G(outdir: Path, t: Tools, only: set, skip: set,
+    n = merge_unique(list(outdir.glob("testssl_*.txt")) +
+                     list(outdir.glob("wpscan_*.txt")),
+                     outdir / "tls_wp.txt")
+    return {"F2": str(outdir / "tls_wp.txt"), "count": n}
+async def phase_G(outdir: Path, t: Tools, only: PhaseSet, skip: PhaseSet,
                   oast_domain: Optional[str]) -> Dict[str, Any]:
     if skip & {"G"}:
         return {}
@@ -1106,8 +1180,37 @@ def _atomic_write_json(path: Path, payload: dict) -> None:
     with tmp.open("w") as f:
         json.dump(payload, f, indent=2, default=str)
     os.replace(tmp, path)
+
+def _parse_phase_csv(value: str) -> PhaseSet:
+    phases = {p.strip().upper() for p in value.split(",") if p.strip()}
+    invalid = sorted(phases - VALID_PHASES)
+    if invalid:
+        raise argparse.ArgumentTypeError(
+            f"unknown phase(s): {', '.join(invalid)}; valid phases: "
+            f"{', '.join(sorted(VALID_PHASES))}"
+        )
+    return phases
+
+def _domain_arg(value: str) -> str:
+    domain = value.rstrip(".").lower()
+    if not _is_valid_hostname(domain):
+        raise argparse.ArgumentTypeError(
+            "domain must be a valid DNS name with at least one dot, "
+            "for example example.com"
+        )
+    return domain
+
+def _csv_from_phases(value: object) -> PhaseSet:
+    if isinstance(value, set):
+        return {str(v).upper() for v in value}
+    if isinstance(value, str):
+        return _parse_phase_csv(value)
+    return set()
+
 async def run_pipeline(args: argparse.Namespace) -> int:
     outdir = Path(args.out).resolve()
+    if outdir.exists() and not outdir.is_dir():
+        raise ValueError(f"output path exists and is not a directory: {outdir}")
     outdir.mkdir(parents=True, exist_ok=True)
     state_path = outdir / "state.json"
     state: Dict[str, Any] = {
@@ -1158,13 +1261,20 @@ async def run_pipeline(args: argparse.Namespace) -> int:
     # rebase stored artifact paths (see BUG-6).
     state["outdir"] = str(outdir)
     t = Tools()
-    only = set(p.strip() for p in args.only.split(",") if p.strip()) if args.only else set()
-    skip = set(p.strip() for p in args.skip.split(",") if p.strip()) if args.skip else set()
+    only = _csv_from_phases(args.only)
+    skip = _csv_from_phases(args.skip)
+    if only and skip:
+        overlap = sorted(only & skip)
+        if overlap:
+            raise ValueError(f"phase(s) cannot be both --only and --skip: {', '.join(overlap)}")
     # pre-seed missing tools from state so a partial resume doesn't lose them
     t.seed_missing(state.get("missing_tools", []))
     oast = Interactsh(outdir)
     oast_started = False
-    if not skip & {"E", "F1", "F2", "G", "H"}:
+    phases_to_run = [name for name, _, _ in PIPELINE
+                     if (not only or name in only) and name not in skip]
+    active_needs_oast = any(name in {"E", "F1", "F2", "G"} for name in phases_to_run)
+    if active_needs_oast and "H" not in skip:
         oast_started = oast.start()
     try:
         prev: Dict[str, Any] = dict(state.get("artifacts", {}))
@@ -1172,7 +1282,8 @@ async def run_pipeline(args: argparse.Namespace) -> int:
             if only and name not in only:
                 continue
             if name in skip:
-                log("skip", f"phase {name} (--skip)"); continue
+                log("skip", f"phase {name} (--skip)")
+                continue
             if name == "E" and not oast_started and not skip & {"H", "G"}:
                 oast_started = oast.start()
             kwargs = {"domain": args.domain, "outdir": outdir, "t": t,
@@ -1220,22 +1331,31 @@ def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="reconchain",
         description="Chain recon tools into a single orchestrated pipeline.")
-    p.add_argument("-d", "--domain", required=True,
+    p.add_argument("-d", "--domain", required=True, type=_domain_arg,
                    help="target root domain, e.g. example.com")
     p.add_argument("-o", "--out", default="./out",
                    help="output directory (default: ./out)")
-    p.add_argument("--only", default="",
+    p.add_argument("--only", default=set(), type=_parse_phase_csv,
                    help="comma-separated phases to run, e.g. A1,A2,B1")
-    p.add_argument("--skip", default="",
+    p.add_argument("--skip", default=set(), type=_parse_phase_csv,
                    help="comma-separated phases to skip, e.g. F2,G")
     p.add_argument("--resume", action="store_true",
                    help="resume from ./out/state.json if it exists "
                         "(only for the same target domain)")
     p.add_argument("-q", "--quiet", action="store_true",
                    help="suppress info-level logs")
+    p.add_argument("--no-color", action="store_true",
+                   help="disable ANSI color output")
     return p
 def main() -> int:
     args = build_parser().parse_args()
+    if args.no_color:
+        disable_color()
+    if args.only and args.skip and (args.only & args.skip):
+        build_parser().error(
+            "phase(s) cannot be both --only and --skip: "
+            + ", ".join(sorted(args.only & args.skip))
+        )
     if args.quiet:
         global log
         def log(lvl, msg):  # type: ignore
@@ -1244,7 +1364,11 @@ def main() -> int:
                 print(f"{ts} [{lvl.upper():4}] {msg}", flush=True)
     try:
         return asyncio.run(run_pipeline(args))
+    except ValueError as e:
+        log("err", str(e))
+        return 2
     except KeyboardInterrupt:
-        log("warn", "interrupted"); return 130
+        log("warn", "interrupted")
+        return 130
 if __name__ == "__main__":
     sys.exit(main())

@@ -100,7 +100,7 @@ Analysis:
 LinkFinder, SecretFinder, ParamSpider, Arjun, x8
 
 Fuzzing:
-ffuf, kiterunner, feroxbuster
+ffuf, kiterunner (`kr`), feroxbuster
 
 Vulns:
 nuclei, dalfox, sqlmap, testssl.sh, wpscan
@@ -109,6 +109,12 @@ OAST:
 interactsh-client
 
 ## Installation
+
+Python package and development tooling:
+
+python3 -m pip install -e '.[dev]'
+
+External recon tools:
 
 chmod +x install.sh
 ./install.sh
@@ -148,6 +154,7 @@ Quiet:
 --skip skip phases  
 --resume resume scan  
 -q quiet mode  
+-h show help
 
 ## Scan Phases
 
@@ -192,6 +199,8 @@ INTERACTSH_TOKEN
 FFUF_WORDLIST
 KITELIST
 NO_COLOR
+
+`KITELIST` points to the kiterunner wordlist used by the `kr` binary.
 
 ## Security Notice
 

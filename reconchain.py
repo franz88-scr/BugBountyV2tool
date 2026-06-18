@@ -1219,6 +1219,7 @@ def _csv_from_phases(value: object) -> PhaseSet:
     return set()
 
 async def run_pipeline(args: argparse.Namespace) -> int:
+    progress = Progress(len(PIPELINE))
     outdir = Path(args.out).resolve()
     if outdir.exists() and not outdir.is_dir():
         raise ValueError(f"output path exists and is not a directory: {outdir}")

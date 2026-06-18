@@ -192,6 +192,16 @@ async def _run(name: str, cmd: List[str], timeout: int, outdir: Path,
 # Concurrency cap so a phase with many jobs (e.g. phase E: 5 URLs × 3 fuzzers)
 # does not fork-bomb the host. 8 parallel external procs is a sane ceiling.
 MAX_PARALLEL_JOBS = 8
+class Progress:
+    def __init__(self, total: int):
+        self.bar = tqdm(total=total, desc="Pipeline", position=0)
+
+    def next(self, name: str):
+        self.bar.set_description(f"Phase {name}")
+        self.bar.update(1)
+
+    def close(self):
+        self.bar.close()
 async def run_parallel(jobs: List[Tuple[str, List[str], int]],
                        outdir: Path) -> List[StepResult]:
     sem = asyncio.Semaphore(MAX_PARALLEL_JOBS)

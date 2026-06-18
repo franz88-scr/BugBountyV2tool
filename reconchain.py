@@ -203,7 +203,8 @@ class Progress:
     def close(self):
         self.bar.close()
 async def run_parallel(jobs: List[Tuple[str, List[str], int]],
-                       outdir: Path) -> List[StepResult]:
+    outdir: Path,
+    desc: str = "jobs") -> List[StepResult]:
     sem = asyncio.Semaphore(MAX_PARALLEL_JOBS)
     async def _guarded(n: str, c: List[str], t: int) -> StepResult:
         async with sem:

@@ -108,7 +108,7 @@ def disable_color() -> None:
 
 def log(lvl: str, msg: str) -> None:
     ts = datetime.now().strftime("%H:%M:%S")
-    tqdm.tqdm.write(
+    tqdm.write(
         f"{C['d']}{ts}{C['r']} {LVL[lvl]}[{lvl.upper():4}]{C['r']} {msg}"
     )
 # ────────────────────────────── tool registry ──────────────────────────────
@@ -1302,7 +1302,7 @@ async def run_pipeline(args: argparse.Namespace) -> int:
             if name in skip:
                 log("skip", f"phase {name} (--skip)")
                 continue
-						progress.next(name)
+				    progress.next(name)
             if name == "E" and not oast_started and not skip & {"H", "G"}:
                 oast_started = oast.start()
             kwargs = {"domain": args.domain, "outdir": outdir, "t": t,

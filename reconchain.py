@@ -660,7 +660,7 @@ async def phase_C1(outdir: Path, t: Tools, only: PhaseSet, skip: PhaseSet,
         g1.append(("waybackurls", ["bash", str(runner)], 1800))
     if t.has("gospider"):
         g1.append(("gospider",
-            ["gospider", "-q", "-s", str(hosts),
+            ["gospider", "-q", "-S", str(hosts),
              "-o", str(outdir / "urls_gospider.txt")], 1800))
     g2: List[Tuple[str, List[str], int]] = []
     if t.has("katana"):

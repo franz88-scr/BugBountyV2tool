@@ -1291,6 +1291,7 @@ async def run_pipeline(args: argparse.Namespace) -> int:
     try:
         prev: Dict[str, Any] = dict(state.get("artifacts", {}))
         for name, fn, params in PIPELINE:
+            progress.next(name)
             if only and name not in only:
                 continue
             if name in skip:

@@ -44,7 +44,27 @@ import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
+# ─────────────────────── hostname validation (chain glue) ────────────────────
+# Used by the A1 merge and the A2 parse to filter obvious garbage out of the
+# chain. Accepts FQDN-shaped strings: 1-253 chars, dot-separated labels of
+# [a-z0-9_-], no leading/trailing hyphen/underscore in labels.
+_HOSTNAME_RE = re.compile(
+    r"^(?=.{1,253}$)(?!-)[A-Za-z0-9_-]{1,63}(?:\.[A-Za-z0-9_-]{1,63})+(?:\.?)$"
+)
+def _is_valid_hostname(s: str) -> bool:
+    """True if `s` looks like an FQDN-shaped hostname (has at least one dot)."""
+    if not s:
+        return False
+    s = s.rstrip(".").lower()
+    if "." not in s or any(c.isspace() or c in "[]()<>{}" for c in s):
+        return False
+    return bool(_HOSTNAME_RE.match(s))
+def _is_under_domain(host: str, domain: str) -> bool:
+    """True if `host` is `domain` itself or a subdomain of `domain`."""
+    h = host.rstrip(".").lower()
+    d = domain.rstrip(".").lower()
+    return h == d or h.endswith("." + d)
 # ───────────────────────────── pretty logging ──────────────────────────────
 def _color() -> bool:
     return sys.stdout.isatty() and os.environ.get("NO_COLOR") is None
@@ -147,11 +167,20 @@ def ensure(p: Path) -> Path:
     p.parent.mkdir(parents=True, exist_ok=True)
     return p
 def read_lines(p: Path) -> List[str]:
+    """Return non-blank, non-`#`-prefixed lines. Used for *counting* and as
+    a permissive existence check. For driving tool input, prefer passing
+    the file path directly (tools handle their own comments)."""
     if not p.exists():
         return []
     return [ln.strip() for ln in p.read_text(errors="ignore").splitlines()
             if ln.strip() and not ln.startswith("#")]
-def merge_unique(srcs: List[Path], dst: Path) -> int:
+def count_nonblank(p: Path) -> int:
+    """Count of non-blank lines (does NOT drop `#`-prefixed lines)."""
+    if not p.exists():
+        return 0
+    return sum(1 for ln in p.read_text(errors="ignore").splitlines() if ln.strip())
+def merge_unique(srcs: List[Path], dst: Path,
+                 validator: Optional[Callable[[str], bool]] = None) -> int:
     seen: Set[str] = set()
     dst_resolved = dst.resolve()
     for s in srcs:
@@ -164,7 +193,11 @@ def merge_unique(srcs: List[Path], dst: Path) -> int:
             continue
         for ln in s.read_text(errors="ignore").splitlines():
             ln = ln.strip()
-            if ln and ln not in seen:
+            if not ln or ln.startswith("#"):
+                continue
+            if validator is not None and not validator(ln):
+                continue
+            if ln not in seen:
                 seen.add(ln)
     ensure(dst)
     dst.write_text("\n".join(sorted(seen)) + ("\n" if seen else ""))
@@ -313,12 +346,16 @@ class Interactsh:
 # small helper: hostname token safety check
 _SAFE_HOST = re.compile(r"^[A-Za-z0-9.\-]+$")
 async def phase_A1(domain: str, outdir: Path, t: Tools,
-                   only: set, skip: set) -> Dict[str, Any]:
+                   only: set, skip: set, resume: bool = False) -> Dict[str, Any]:
     if skip & {"A1"}:
         return {}
     out = outdir / "all_subs.txt"
-    if out.exists() and only.isdisjoint({"A1"}):
-        return {"A1": str(out), "count": len(read_lines(out))}
+    # Skip when output already exists, EITHER because --resume is set OR
+    # because the user didn't pin A1 with --only. The previous condition
+    # (`only.isdisjoint({"A1"})`) silently disabled resume for any
+    # --only invocation, forcing a re-run even though the file was good.
+    if out.exists() and (resume or only.isdisjoint({"A1"})):
+        return {"A1": str(out), "count": count_nonblank(out)}
     log("info", "Phase A1: subdomain enumeration")
     jobs: List[Tuple[str, List[str], int]] = []
     if t.has("subfinder"):
@@ -346,21 +383,43 @@ async def phase_A1(domain: str, outdir: Path, t: Tools,
         jobs.append(("assetfinder", ["bash", str(runner)], 600))
     if not jobs:
         log("warn", "A1: no subdomain tools available")
-    await run_parallel(jobs, outdir)
+    results = await run_parallel(jobs, outdir)
+    # Surface partial tool failures in summary.json (BUG-5). rc==0 and
+    # skipped are not failures; anything else (timeouts, crash, signal)
+    # is recorded so the user knows the merged output may be partial.
+    failures = {r.name: r.rc for r in results
+                if r.rc not in (0, None) and r.note != "skipped"}
+    # Merge + drop anything that isn't a hostname under `-d`. subfinder
+    # frequently emits bare tokens (e.g. registered-domain-only entries
+    # from CT logs) which would otherwise flow into A2 / naabu / httpx
+    # as "hosts" and waste hours of scan time on unresolvable garbage.
+    def _under_domain(s: str) -> bool:
+        return _is_valid_hostname(s) and _is_under_domain(s, domain)
     n = merge_unique([outdir / "subs_subfinder.txt",
                       outdir / "subs_amass.txt",
-                      outdir / "subs_assetfinder.txt"], out)
+                      outdir / "subs_assetfinder.txt"], out,
+                     validator=_under_domain)
     log("ok", f"A1: {n} unique subdomains → {out}")
-    return {"A1": str(out), "count": n}
+    ret: Dict[str, Any] = {"A1": str(out), "count": n}
+    if failures:
+        ret["failures"] = failures
+        log("warn", f"A1: partial — failed tools: {failures}")
+    return ret
 async def phase_A2(domain: str, outdir: Path, t: Tools,
-                   only: set, skip: set, prev: dict) -> Dict[str, Any]:
+                   only: set, skip: set, prev: dict,
+                   resume: bool = False) -> Dict[str, Any]:
     if skip & {"A2"}:
         return {}
     out = outdir / "resolved.txt"
-    if out.exists() and only.isdisjoint({"A2"}):
-        return {"A2": str(out), "count": len(read_lines(out))}
+    # Same fix as A1: --resume must take precedence over --only for the
+    # "skip if exists" decision.
+    if out.exists() and (resume or only.isdisjoint({"A2"})):
+        return {"A2": str(out), "count": count_nonblank(out)}
     subs = Path(prev.get("A1") or outdir / "all_subs.txt")
-    if not subs.exists() or not read_lines(subs):
+    # Existence check is "file is non-empty"; we do NOT use read_lines()
+    # here because it drops `#`-prefixed lines, which would make A2 skip
+    # on a file that contains only valid subdomains below a `#` header.
+    if not subs.exists() or subs.stat().st_size == 0:
         log("warn", "A2: no input subdomains; skipping")
         return {"A2": str(out), "count": 0}
     log("info", "Phase A2: dnsx resolution")
@@ -393,9 +452,14 @@ async def phase_A2(domain: str, outdir: Path, t: Tools,
             continue
         # First whitespace-delimited token is the host we resolved;
         # this drops both the ` [A] [1.2.3.4]` and ` [CNAME] [target]`
-        # suffixes.
-        host = ln.split()[0]
-        if host and host not in seen:
+        # suffixes. Validate it actually looks like a hostname before
+        # adding it — a truncated / malformed dnsx line (e.g. a write
+        # interrupted mid-flush) would otherwise leak bracket fragments
+        # like `[A]` as "hosts" and poison every downstream phase.
+        host = ln.split()[0].rstrip(".")
+        if not _is_valid_hostname(host):
+            continue
+        if host not in seen:
             seen.add(host)
     ensure(out)
     out.write_text("\n".join(sorted(seen)) + ("\n" if seen else ""))
@@ -931,7 +995,10 @@ def _counts(outdir: Path) -> Dict[str, int]:
         "vulns":       outdir / "vulns.txt",
         "oast":        outdir / "oast" / "callbacks.txt",
     }
-    return {k: len(read_lines(v)) for k, v in keys.items() if v.exists()}
+    # Use count_nonblank() instead of len(read_lines()) so `#`-prefixed
+    # entries (e.g. a subfinder banner) aren't silently dropped from
+    # the report. We still skip files that don't exist.
+    return {k: count_nonblank(v) for k, v in keys.items() if v.exists()}
 def write_summary(outdir: Path, domain: str, state: dict,
                   counts: Dict[str, int]) -> Path:
     payload = {
@@ -939,6 +1006,7 @@ def write_summary(outdir: Path, domain: str, state: dict,
         "generated_at": datetime.now().isoformat(timespec="seconds"),
         "toolchain": "reconchain v1.1",
         "missing_tools": sorted(set(state.get("missing_tools", []))),
+        "tool_failures": dict(state.get("tool_failures", {})),
         "artifacts": {k: v for k, v in state.get("artifacts", {}).items()},
         "counts": counts,
     }
@@ -1019,8 +1087,8 @@ def write_markdown(outdir: Path, domain: str, counts: Dict[str, int],
     return out
 # ───────────────────────────── pipeline runner ─────────────────────────────
 PIPELINE = [
-    ("A1", phase_A1, ("domain", "outdir", "t", "only", "skip")),
-    ("A2", phase_A2, ("domain", "outdir", "t", "only", "skip", "prev")),
+    ("A1", phase_A1, ("domain", "outdir", "t", "only", "skip", "resume")),
+    ("A2", phase_A2, ("domain", "outdir", "t", "only", "skip", "prev", "resume")),
     ("B1", phase_B1, ("outdir", "t", "only", "skip", "prev")),
     ("C1", phase_C1, ("outdir", "t", "only", "skip", "prev")),
     ("C2", phase_C2, ("outdir", "t", "only", "skip")),
@@ -1046,6 +1114,7 @@ async def run_pipeline(args: argparse.Namespace) -> int:
         "domain": args.domain,
         "artifacts": {},
         "missing_tools": [],
+        "tool_failures": {},
     }
     if args.resume and state_path.exists():
         try:
@@ -1059,10 +1128,35 @@ async def run_pipeline(args: argparse.Namespace) -> int:
                     f"state.json is for domain {saved.get('domain')!r}, "
                     f"not {args.domain!r}; ignoring and starting fresh")
             else:
+                # Resolve stored artifact paths against THIS outdir. The
+                # state file may have been written from a previous run
+                # whose absolute paths no longer apply (BUG-6); relative
+                # paths from the stored outdir are rebased onto outdir.
+                prev_outdir_s = saved.get("outdir")
+                prev_outdir = Path(prev_outdir_s) if prev_outdir_s else None
+                rebased: Dict[str, Any] = {}
+                for k, v in (saved.get("artifacts") or {}).items():
+                    if not isinstance(v, str):
+                        continue
+                    p = Path(v)
+                    if p.is_absolute() and prev_outdir is not None:
+                        try:
+                            p = p.relative_to(prev_outdir)
+                        except ValueError:
+                            pass  # path wasn't under the old outdir; keep as-is
+                        rebased[k] = str(outdir / p)
+                    elif p.is_absolute():
+                        rebased[k] = v
+                    else:
+                        rebased[k] = str(outdir / p)
+                saved["artifacts"] = rebased
                 state = saved
                 log("info", f"resuming from {state_path}")
         except json.JSONDecodeError:
             log("warn", f"{state_path} corrupt; ignoring and starting fresh")
+    # Always record the outdir we actually used so future resumes can
+    # rebase stored artifact paths (see BUG-6).
+    state["outdir"] = str(outdir)
     t = Tools()
     only = set(p.strip() for p in args.only.split(",") if p.strip()) if args.only else set()
     skip = set(p.strip() for p in args.skip.split(",") if p.strip()) if args.skip else set()
@@ -1083,7 +1177,8 @@ async def run_pipeline(args: argparse.Namespace) -> int:
                 oast_started = oast.start()
             kwargs = {"domain": args.domain, "outdir": outdir, "t": t,
                       "only": only, "skip": skip, "prev": prev,
-                      "oast_domain": oast.domain}
+                      "oast_domain": oast.domain,
+                      "resume": bool(args.resume)}
             sig = inspect.signature(fn)
             call = {k: v for k, v in kwargs.items() if k in sig.parameters}
             try:
@@ -1098,6 +1193,14 @@ async def run_pipeline(args: argparse.Namespace) -> int:
             for m in t.missing:
                 if m not in state["missing_tools"]:
                     state["missing_tools"].append(m)
+            # surface partial tool failures (BUG-5). Phase functions can
+            # return "failures": {"subfinder": 124, ...} for non-zero
+            # exits / timeouts; the run itself didn't crash but the
+            # artifact is partial. Showed in summary.json.
+            new_failures = (result or {}).get("failures") or {}
+            if isinstance(new_failures, dict):
+                state.setdefault("tool_failures", {}).update(
+                    {k: int(v) for k, v in new_failures.items()})
             try:
                 _atomic_write_json(state_path, state)
             except Exception as e:

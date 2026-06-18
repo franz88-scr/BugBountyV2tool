@@ -108,8 +108,9 @@ def disable_color() -> None:
 
 def log(lvl: str, msg: str) -> None:
     ts = datetime.now().strftime("%H:%M:%S")
-    print(f"{C['d']}{ts}{C['r']} {LVL[lvl]}[{lvl.upper():4}]{C['r']} {msg}",
-          flush=True)
+    tqdm.tqdm.write(
+        f"{C['d']}{ts}{C['r']} {LVL[lvl]}[{lvl.upper():4}]{C['r']} {msg}"
+    )
 # ────────────────────────────── tool registry ──────────────────────────────
 class Tools:
     """Cached presence check for external binaries."""
@@ -1223,7 +1224,11 @@ def _csv_from_phases(value: object) -> PhaseSet:
     return set()
 
 async def run_pipeline(args: argparse.Namespace) -> int:
-    progress = Progress(len(PIPELINE))
+    phases_to_run = [
+    name for name, _, _ in PIPELINE
+    if (not only or name in only) and name not in skip
+		]
+		progress = Progress(len(phases_to_run))
     outdir = Path(args.out).resolve()
     if outdir.exists() and not outdir.is_dir():
         raise ValueError(f"output path exists and is not a directory: {outdir}")
@@ -1295,12 +1300,13 @@ async def run_pipeline(args: argparse.Namespace) -> int:
     try:
         prev: Dict[str, Any] = dict(state.get("artifacts", {}))
         for name, fn, params in PIPELINE:
-            progress.next(name)
+            
             if only and name not in only:
                 continue
             if name in skip:
                 log("skip", f"phase {name} (--skip)")
                 continue
+						progress.next(name)
             if name == "E" and not oast_started and not skip & {"H", "G"}:
                 oast_started = oast.start()
             kwargs = {"domain": args.domain, "outdir": outdir, "t": t,

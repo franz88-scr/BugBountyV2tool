@@ -206,9 +206,12 @@ async def run_parallel(jobs: List[Tuple[str, List[str], int]],
     outdir: Path,
     desc: str = "jobs") -> List[StepResult]:
     sem = asyncio.Semaphore(MAX_PARALLEL_JOBS)
+    pbar = tqdm(total=len(jobs), desc=desc, leave=False)
     async def _guarded(n: str, c: List[str], t: int) -> StepResult:
         async with sem:
-            return await _run(n, c, t, outdir)
+            res = await _run(n, c, t, outdir)
+            pbar.update(1)
+            return res
     coros = [_guarded(n, c, t) for n, c, t in jobs]
     return await asyncio.gather(*coros)
 # ───────────────────────────── file utilities ───────────────────────────────

@@ -457,9 +457,28 @@ async def phase_A1(domain: str, outdir: Path, t: Tools,
                      ["subfinder", "-d", domain, "-silent",
                       "-o", str(outdir / "subs_subfinder.txt")], 900))
     if t.has("amass"):
-        jobs.append(("amass",
-                     ["amass", "enum", "-passive", "-d", domain,
-                      "-o", str(outdir / "subs_amass.txt")], 1800))
+        # amass v4: passive is the default (the old `-passive` flag is
+        # deprecated) and `enum` emits *relationship* records on stdout, e.g.
+        #   `sub.example.com (FQDN) --> a_record --> 1.2.3.4 (IPAddress)`
+        # (the `-o` file holds the same raw terminal text, NOT a clean list).
+        # Feeding those lines straight into the merge made every line fail the
+        # hostname validator, so amass silently contributed zero subdomains.
+        # Run via a runner that extracts the `<name> (FQDN)` tokens; the A1
+        # merge's _under_domain validator then keeps only in-scope hosts.
+        runner = outdir / "logs" / "amass.sh"
+        ensure(runner)
+        runner.write_text(
+            "#!/usr/bin/env bash\n"
+            "set -u\n"
+            f"OUT={shlex.quote(str(outdir / 'subs_amass.txt'))}\n"
+            f"DOMAIN={shlex.quote(domain)}\n"
+            ": > \"$OUT\"\n"
+            "amass enum -d \"$DOMAIN\" -nocolor 2>/dev/null "
+            "| grep --line-buffered -oE '[A-Za-z0-9._-]+ \\(FQDN\\)' "
+            "| sed 's/ (FQDN)$//' >> \"$OUT\" || true\n"
+        )
+        runner.chmod(0o755)
+        jobs.append(("amass", ["bash", str(runner)], 1800))
     if t.has("assetfinder"):
         # use a small runner so we invoke assetfinder directly with proper
         # argv quoting (no shell, no risk of injection from `domain`).

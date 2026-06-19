@@ -220,6 +220,13 @@ async def _run(name: str, cmd: List[str], timeout: int, outdir: Path,
 # Concurrency cap so a phase with many jobs (e.g. phase E: 5 URLs × 3 fuzzers)
 # does not fork-bomb the host. 8 parallel external procs is a sane ceiling.
 MAX_PARALLEL_JOBS = 8
+# Process-wide job semaphore. When several independent phases run concurrently
+# (see STAGES), they all draw from this single semaphore so the total number of
+# live external processes stays bounded by MAX_PARALLEL_JOBS regardless of how
+# many phases are in flight. Created on the running loop in run_pipeline; falls
+# back to a fresh per-call semaphore when unset (e.g. a phase called directly
+# from a test).
+_JOB_SEM: Optional[asyncio.Semaphore] = None
 class Progress:
     def __init__(self, total: int):
         self.bar = tqdm(total=total, desc="Pipeline", position=0)
@@ -233,7 +240,7 @@ class Progress:
 async def run_parallel(jobs: List[Tuple[str, List[str], int]],
     outdir: Path,
     desc: str = "jobs") -> List[StepResult]:
-    sem = asyncio.Semaphore(MAX_PARALLEL_JOBS)
+    sem = _JOB_SEM if _JOB_SEM is not None else asyncio.Semaphore(MAX_PARALLEL_JOBS)
     pbar = tqdm(total=len(jobs), desc=desc, leave=False)
     async def _guarded(n: str, c: List[str], t: int) -> StepResult:
         async with sem:
@@ -1218,6 +1225,19 @@ PIPELINE = [
     ("F2", phase_F2, ("outdir", "t", "only", "skip")),
     ("G",  phase_G,  ("outdir", "t", "only", "skip", "oast_domain")),
 ]
+# Dependency-ordered execution stages. Phases in the same stage are independent
+# of one another (they only read artifacts produced by *earlier* stages, never
+# each other's output), so they run concurrently. A1→A2→B1→C1 form the linear
+# spine; once URLs (C1) and live hosts (B1) exist, the analysis/scan phases
+# C2/D/E/F1/F2/G all fan out in parallel. The process-wide _JOB_SEM keeps the
+# total external-process count bounded across the whole fan-out.
+STAGES: List[List[str]] = [
+    ["A1"],
+    ["A2"],
+    ["B1"],
+    ["C1"],
+    ["C2", "D", "E", "F1", "F2", "G"],
+]
 def _atomic_write_json(path: Path, payload: dict) -> None:
     """Write JSON atomically: temp file + rename, so a mid-write crash
     can't leave a half-written state.json that breaks --resume."""
@@ -1315,58 +1335,76 @@ async def run_pipeline(args: argparse.Namespace) -> int:
             raise ValueError(f"phase(s) cannot be both --only and --skip: {', '.join(overlap)}")
     # pre-seed missing tools from state so a partial resume doesn't lose them
     t.seed_missing(state.get("missing_tools", []))
+    # Bind the process-wide job semaphore to THIS event loop so every phase's
+    # run_parallel() shares one budget of live external processes.
+    global _JOB_SEM
+    _JOB_SEM = asyncio.Semaphore(MAX_PARALLEL_JOBS)
     oast = Interactsh(outdir)
     oast_started = False
-    phases_to_run = [name for name, _, _ in PIPELINE
-                     if (not only or name in only) and name not in skip]
+    phase_map = {name: fn for name, fn, _ in PIPELINE}
+    def _selected(name: str) -> bool:
+        return (not only or name in only) and name not in skip
+    phases_to_run = [name for name, _, _ in PIPELINE if _selected(name)]
     progress = Progress(len(phases_to_run))
     active_needs_oast = any(name in {"E", "F1", "F2", "G"} for name in phases_to_run)
     if active_needs_oast and "H" not in skip:
         oast_started = oast.start()
+
+    def _apply(name: str, result: Dict[str, Any]) -> None:
+        """Fold a finished phase's result into prev/state. Runs in the single
+        event-loop thread (synchronous, no await), so it is race-free even when
+        phases in a stage complete concurrently."""
+        prev.update(result or {})
+        state["artifacts"].update({k: v for k, v in (result or {}).items()
+                                   if isinstance(v, str)})
+        # accumulate (not overwrite) missing tools across phases
+        for m in t.missing:
+            if m not in state["missing_tools"]:
+                state["missing_tools"].append(m)
+        # surface partial tool failures (BUG-5): non-zero exits / timeouts the
+        # run survived but whose artifact is partial. Shown in summary.json.
+        new_failures = (result or {}).get("failures") or {}
+        if isinstance(new_failures, dict):
+            state.setdefault("tool_failures", {}).update(
+                {k: int(v) for k, v in new_failures.items()})
+
+    async def _run_phase(name: str) -> Dict[str, Any]:
+        fn = phase_map[name]
+        kwargs = {"domain": args.domain, "outdir": outdir, "t": t,
+                  "only": only, "skip": skip, "prev": prev,
+                  "oast_domain": oast.domain,
+                  "resume": bool(args.resume)}
+        sig = inspect.signature(fn)
+        call = {k: v for k, v in kwargs.items() if k in sig.parameters}
+        try:
+            result = await fn(**call)
+        except Exception as e:
+            log("err", f"phase {name} crashed: {e}")
+            result = {}
+        progress.next(name)
+        return result or {}
+
     try:
         prev: Dict[str, Any] = dict(state.get("artifacts", {}))
-        for name, fn, params in PIPELINE:
-            
-            if only and name not in only:
+        for stage in STAGES:
+            run_now = [name for name in stage if _selected(name)]
+            for name in stage:
+                if not _selected(name) and name in skip:
+                    log("skip", f"phase {name} (--skip)")
+            if not run_now:
                 continue
-            if name in skip:
-                log("skip", f"phase {name} (--skip)")
-                continue
-            progress.next(name)
-            if name == "E" and not oast_started and not skip & {"H", "G"}:
-                oast_started = oast.start()
-            kwargs = {"domain": args.domain, "outdir": outdir, "t": t,
-                      "only": only, "skip": skip, "prev": prev,
-                      "oast_domain": oast.domain,
-                      "resume": bool(args.resume)}
-            sig = inspect.signature(fn)
-            call = {k: v for k, v in kwargs.items() if k in sig.parameters}
-            try:
-                result = await fn(**call)
-            except Exception as e:
-                log("err", f"phase {name} crashed: {e}")
-                result = {}
-            prev.update(result or {})
-            state["artifacts"].update({k: v for k, v in (result or {}).items()
-                                       if isinstance(v, str)})
-            # accumulate (not overwrite) missing tools across phases
-            for m in t.missing:
-                if m not in state["missing_tools"]:
-                    state["missing_tools"].append(m)
-            # surface partial tool failures (BUG-5). Phase functions can
-            # return "failures": {"subfinder": 124, ...} for non-zero
-            # exits / timeouts; the run itself didn't crash but the
-            # artifact is partial. Showed in summary.json.
-            new_failures = (result or {}).get("failures") or {}
-            if isinstance(new_failures, dict):
-                state.setdefault("tool_failures", {}).update(
-                    {k: int(v) for k, v in new_failures.items()})
+            # Independent phases in a stage run concurrently; they only read
+            # artifacts from earlier stages, so a shared `prev` snapshot is safe.
+            results = await asyncio.gather(*(_run_phase(n) for n in run_now))
+            for name, result in zip(run_now, results):
+                _apply(name, result)
             try:
                 _atomic_write_json(state_path, state)
             except Exception as e:
                 log("warn", f"state.json write failed: {e}")
     finally:
         _ = oast.stop() if oast_started else None
+        _JOB_SEM = None
     counts = _counts(outdir)
     sj = write_summary(outdir, args.domain, state, counts)
     hj = write_html(outdir, args.domain, counts, t.missing)

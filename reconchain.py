@@ -22,6 +22,7 @@ Usage
   reconchain.py -d example.com --only A1,A2,B1
   reconchain.py -d example.com --skip F2,G
   reconchain.py -d example.com --resume           # reuse ./out/state.json
+  reconchain.py -d example.com --fast             # fast: A1→A2→B1→C1→report
   reconchain.py -d example.com --no-color -q
 Stdlib only. Any missing tool is reported and its phase is skipped (non-fatal
 unless the step is marked required).
@@ -82,6 +83,7 @@ _HOSTNAME_RE = re.compile(
 )
 __version__ = "1.2.0"
 VALID_PHASES = {"A1", "A2", "B1", "C1", "C2", "D", "E", "F1", "F2", "G", "H", "I"}
+FAST_PHASES = {"A1", "A2", "B1", "C1", "I"}
 PhaseSet = Set[str]
 
 def _is_valid_hostname(s: str) -> bool:
@@ -218,8 +220,9 @@ async def _run(name: str, cmd: List[str], timeout: int, outdir: Path,
     log(lvl, f"{name} → rc={rc} in {dur:.1f}s")
     return StepResult(name, cmd, rc, dur, logp, note=note)
 # Concurrency cap so a phase with many jobs (e.g. phase E: 5 URLs × 3 fuzzers)
-# does not fork-bomb the host. 8 parallel external procs is a sane ceiling.
-MAX_PARALLEL_JOBS = 8
+# does not fork-bomb the host. 16 parallel external procs is a good default;
+# pass -j/--jobs to override.
+MAX_PARALLEL_JOBS = 16
 # Process-wide job semaphore. When several independent phases run concurrently
 # (see STAGES), they all draw from this single semaphore so the total number of
 # live external processes stays bounded by MAX_PARALLEL_JOBS regardless of how
@@ -607,8 +610,8 @@ async def phase_B1(outdir: Path, t: Tools, only: PhaseSet, skip: PhaseSet,
              "-o", str(ports_file)], 1800))
     elif have_hosts and t.has("nmap"):
         jobs.append(("nmap",
-            ["nmap", "-iL", str(hosts), "-Pn", "-p-", "--open",
-             "-oG", str(outdir / "ports.gnmap")], 3600))
+             ["nmap", "-iL", str(hosts), "-Pn", "-p-", "--open",
+              "-oG", str(outdir / "ports.gnmap")], 1800))
     if have_hosts and t.has("httpx"):
         jobs.append(("httpx",
             ["httpx", "-silent", "-l", str(hosts),
@@ -998,9 +1001,9 @@ async def phase_F1(outdir: Path, t: Tools, only: PhaseSet,
     jobs: List[Tuple[str, List[str], int]] = []
     if t.has("nuclei"):
         jobs.append(("nuclei-full",
-            ["nuclei", "-silent", "-l", str(hosts),
-             "-severity", "low,medium,high,critical",
-             "-o", str(outdir / "nuclei.txt")], 3600))
+             ["nuclei", "-silent", "-l", str(hosts),
+              "-severity", "low,medium,high,critical",
+              "-o", str(outdir / "nuclei.txt")], 1800))
         # tech-scanner uses the same nuclei binary; do not double-gate on httpx.
         jobs.append(("tech-scanner",
             ["nuclei", "-silent", "-l", str(hosts),
@@ -1093,7 +1096,7 @@ async def phase_G(outdir: Path, t: Tools, only: PhaseSet, skip: PhaseSet,
             f"IN={shlex.quote(str(xss_in))}\n"
             f"DIR={shlex.quote(str(sqlmap_dir))}\n"
             "mkdir -p \"$DIR\"\n"
-            "sqlmap -m \"$IN\" --batch --level=2 --risk=1 --random-agent "
+            "sqlmap -m \"$IN\" --batch --level=1 --risk=1 --random-agent "
             "--output-dir=\"$DIR\" > \"$OUT\" 2>&1 || true\n"
         )
         runner.chmod(0o755)
@@ -1363,6 +1366,11 @@ async def run_pipeline(args: argparse.Namespace) -> int:
     t = Tools()
     only = _csv_from_phases(args.only)
     skip = _csv_from_phases(args.skip)
+    if args.fast and not only:
+        only = FAST_PHASES
+        log("info", f"fast mode — phases: {', '.join(sorted(only))}")
+    elif args.fast and only:
+        log("info", "--fast is implied by --only; running selected phases only")
     if only and skip:
         overlap = sorted(only & skip)
         if overlap:
@@ -1372,7 +1380,10 @@ async def run_pipeline(args: argparse.Namespace) -> int:
     # Bind the process-wide job semaphore to THIS event loop so every phase's
     # run_parallel() shares one budget of live external processes.
     global _JOB_SEM
-    _JOB_SEM = asyncio.Semaphore(MAX_PARALLEL_JOBS)
+    jobs = max(1, args.jobs)
+    if jobs != MAX_PARALLEL_JOBS:
+        log("info", f"parallel jobs set to {jobs}")
+    _JOB_SEM = asyncio.Semaphore(jobs)
     oast = Interactsh(outdir)
     oast_started = False
     phase_map = {name: fn for name, fn, _ in PIPELINE}
@@ -1461,6 +1472,11 @@ def build_parser() -> argparse.ArgumentParser:
                    help="comma-separated phases to run, e.g. A1,A2,B1")
     p.add_argument("--skip", default=set(), type=_parse_phase_csv,
                    help="comma-separated phases to skip, e.g. F2,G")
+    p.add_argument("-j", "--jobs", type=int, default=MAX_PARALLEL_JOBS,
+                   help=f"max parallel external processes (default: {MAX_PARALLEL_JOBS})")
+    p.add_argument("--fast", action="store_true",
+                   help="fast mode: only run essential recon phases "
+                        "(A1, A2, B1, C1, I), skipping vuln scanning")
     p.add_argument("--resume", action="store_true",
                    help="resume from ./out/state.json if it exists "
                         "(only for the same target domain)")

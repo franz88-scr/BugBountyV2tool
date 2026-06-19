@@ -19,9 +19,13 @@ classifiers = [
 dependencies = []
 
 [project.optional-dependencies]
+progress = [
+  "tqdm>=4.66",
+]
 dev = [
   "pytest>=8",
   "ruff>=0.5",
+  "tqdm>=4.66",
 ]
 
 [project.scripts]

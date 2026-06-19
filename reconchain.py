@@ -41,11 +41,37 @@ import signal
 import subprocess
 import sys
 import time
-from tqdm import tqdm
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
+# tqdm is an OPTIONAL dependency. The orchestrator must stay runnable with the
+# stdlib alone (see module docstring + empty pyproject `dependencies`), so when
+# tqdm is absent we fall back to a tiny no-op shim that preserves the small
+# surface we use (`tqdm(...)` bars with update/set_description/close and the
+# `tqdm.write` classmethod). Install tqdm for live progress bars.
+try:
+    from tqdm import tqdm
+except ImportError:
+    class tqdm:  # type: ignore[no-redef]
+        def __init__(self, *args: Any, total: Optional[int] = None,
+                     desc: Optional[str] = None, **kwargs: Any) -> None:
+            self.total = total
+            self.desc = desc
+
+        def update(self, n: int = 1) -> None:
+            pass
+
+        def set_description(self, desc: Optional[str] = None,
+                            refresh: bool = True) -> None:
+            self.desc = desc
+
+        def close(self) -> None:
+            pass
+
+        @classmethod
+        def write(cls, msg: str = "", *args: Any, **kwargs: Any) -> None:
+            print(msg, flush=True)
 # ─────────────────────── hostname validation (chain glue) ────────────────────
 # Used by the A1 merge and the A2 parse to filter obvious garbage out of the
 # chain. Accepts DNS hostnames: 1-253 chars, dot-separated labels of
@@ -54,6 +80,7 @@ _HOSTNAME_RE = re.compile(
     r"^(?=.{1,253}$)(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+"
     r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.?$"
 )
+__version__ = "1.2.0"
 VALID_PHASES = {"A1", "A2", "B1", "C1", "C2", "D", "E", "F1", "F2", "G", "H", "I"}
 PhaseSet = Set[str]
 
@@ -214,7 +241,10 @@ async def run_parallel(jobs: List[Tuple[str, List[str], int]],
             pbar.update(1)
             return res
     coros = [_guarded(n, c, t) for n, c, t in jobs]
-    return await asyncio.gather(*coros)
+    try:
+        return await asyncio.gather(*coros)
+    finally:
+        pbar.close()
 # ───────────────────────────── file utilities ───────────────────────────────
 def ensure(p: Path) -> Path:
     p.parent.mkdir(parents=True, exist_ok=True)
@@ -1094,7 +1124,7 @@ def write_summary(outdir: Path, domain: str, state: dict,
     payload = {
         "domain": domain,
         "generated_at": datetime.now().isoformat(timespec="seconds"),
-        "toolchain": "reconchain v1.1",
+        "toolchain": f"reconchain v{__version__}",
         "missing_tools": sorted(set(state.get("missing_tools", []))),
         "tool_failures": dict(state.get("tool_failures", {})),
         "artifacts": {k: v for k, v in state.get("artifacts", {}).items()},
@@ -1145,7 +1175,7 @@ def write_html(outdir: Path, domain: str, counts: Dict[str, int],
 <title>recon report — {html_escape(domain)}</title>
 <style>{HTML_CSS}</style></head><body>
 <h1>Recon Report: {html_escape(domain)}</h1>
-<small>generated {datetime.now().isoformat(timespec='seconds')} · reconchain v1.1</small>
+<small>generated {datetime.now().isoformat(timespec='seconds')} · reconchain v{__version__}</small>
 {miss_html}
 <h2>Summary</h2><div class="grid">{cards}</div>
 {''.join(sections)}

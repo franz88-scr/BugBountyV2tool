@@ -260,13 +260,13 @@ def read_lines(p: Path) -> List[str]:
     """Return non-blank, non-`#`-prefixed lines. Used for *counting* and as
     a permissive existence check. For driving tool input, prefer passing
     the file path directly (tools handle their own comments)."""
-    if not p.exists():
+    if not p.is_file():
         return []
     return [ln.strip() for ln in p.read_text(errors="ignore").splitlines()
             if ln.strip() and not ln.startswith("#")]
 def count_nonblank(p: Path) -> int:
     """Count of non-blank lines (does NOT drop `#`-prefixed lines)."""
-    if not p.exists():
+    if not p.is_file():
         return 0
     return sum(1 for ln in p.read_text(errors="ignore").splitlines() if ln.strip())
 def merge_unique(srcs: List[Path], dst: Path,
@@ -276,7 +276,10 @@ def merge_unique(srcs: List[Path], dst: Path,
     for s in srcs:
         if not s:
             continue
-        if not s.exists():
+        # is_file() (not exists()) so a tool that writes a *directory* where we
+        # expected a file (e.g. gospider's -o output folder) is skipped instead
+        # of raising IsADirectoryError and crashing the whole phase.
+        if not s.is_file():
             continue
         # never feed the destination back into itself (recursion / self-merge)
         if s.resolve() == dst_resolved:
@@ -696,9 +699,21 @@ async def phase_C1(outdir: Path, t: Tools, only: PhaseSet, skip: PhaseSet,
         runner.chmod(0o755)
         g1.append(("waybackurls", ["bash", str(runner)], 1800))
     if t.has("gospider"):
-        g1.append(("gospider",
-            ["gospider", "-q", "-S", str(hosts),
-             "-o", str(outdir / "urls_gospider.txt")], 1800))
+        # gospider's -o is an output *folder* (one file per site), not a file,
+        # so we don't use it: run via a runner that captures stdout and extracts
+        # the URL token from each line into a flat urls_gospider.txt.
+        runner = outdir / "logs" / "gospider_runner.sh"
+        ensure(runner)
+        runner.write_text(
+            "#!/usr/bin/env bash\n"
+            "set -u\n"
+            f"OUT={shlex.quote(str(outdir / 'urls_gospider.txt'))}\n"
+            f"IN={shlex.quote(str(hosts))}\n"
+            "gospider -q -S \"$IN\" 2>/dev/null "
+            "| grep -oE 'https?://[^[:space:]\"]+' | sort -u > \"$OUT\" || true\n"
+        )
+        runner.chmod(0o755)
+        g1.append(("gospider", ["bash", str(runner)], 1800))
     g2: List[Tuple[str, List[str], int]] = []
     if t.has("katana"):
         g2.append(("katana",

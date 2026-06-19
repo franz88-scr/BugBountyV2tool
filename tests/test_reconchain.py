@@ -49,6 +49,22 @@ def test_merge_unique_filters_and_avoids_self_merge(tmp_path: Path) -> None:
     assert dst.read_text().splitlines() == ["a.example.com", "b.example.com"]
 
 
+def test_file_readers_treat_directories_as_empty(tmp_path: Path) -> None:
+    # A tool that writes a directory where a file is expected (e.g. gospider's
+    # -o output folder) must not crash the readers with IsADirectoryError.
+    as_dir = tmp_path / "urls_gospider.txt"
+    as_dir.mkdir()
+    assert reconchain.read_lines(as_dir) == []
+    assert reconchain.count_nonblank(as_dir) == 0
+
+    real = tmp_path / "real.txt"
+    real.write_text("a.example.com\n")
+    dst = tmp_path / "merged.txt"
+    # merge should skip the directory and still consume the real file.
+    assert reconchain.merge_unique([as_dir, real], dst) == 1
+    assert dst.read_text().splitlines() == ["a.example.com"]
+
+
 def test_read_jsonl_supports_jsonl_single_object_array_and_bad_input(tmp_path: Path) -> None:
     jsonl = tmp_path / "data.jsonl"
     jsonl.write_text('{"url":"https://a.example"}\nnot json\n{"url":"https://b.example"}\n')

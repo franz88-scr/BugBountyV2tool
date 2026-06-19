@@ -157,6 +157,50 @@ def test_no_tool_pipeline_generates_reports_without_oast(monkeypatch: pytest.Mon
     assert json.loads((tmp_path / "summary.json").read_text())["domain"] == "example.com"
 
 
+def test_stages_cover_pipeline_exactly_once() -> None:
+    pipeline_names = [name for name, _, _ in reconchain.PIPELINE]
+    staged = [name for stage in reconchain.STAGES for name in stage]
+    assert sorted(staged) == sorted(pipeline_names)
+    assert len(staged) == len(set(staged))  # no phase scheduled twice
+
+
+def test_stage_order_respects_dependencies() -> None:
+    # phase -> first stage index it appears in
+    stage_of = {name: i for i, stage in enumerate(reconchain.STAGES) for name in stage}
+    # A1 -> A2 -> B1 -> C1 must be strictly increasing; the fan-out phases
+    # (which consume C1/B1 output) must come no earlier than C1.
+    assert stage_of["A1"] < stage_of["A2"] < stage_of["B1"] < stage_of["C1"]
+    for fanout in ("C2", "D", "E", "F1", "F2", "G"):
+        assert stage_of[fanout] >= stage_of["C1"]
+
+
+def test_independent_phases_run_concurrently(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    # Drive run_pipeline with stub phase coroutines that record how many run at
+    # once, then assert the fan-out stage actually overlaps (>1 concurrent).
+    state = {"active": 0, "peak": 0}
+
+    async def make_stub() -> dict:
+        state["active"] += 1
+        state["peak"] = max(state["peak"], state["active"])
+        await asyncio.sleep(0.02)
+        state["active"] -= 1
+        return {}
+
+    async def phase(*_a: object, **_k: object) -> dict:
+        return await make_stub()
+
+    patched = [(name, phase, params) for name, _fn, params in reconchain.PIPELINE]
+    monkeypatch.setattr(reconchain, "PIPELINE", patched)
+
+    args = argparse.Namespace(
+        domain="example.com", out=str(tmp_path),
+        only=set(), skip=set(), resume=False, quiet=True,
+    )
+    assert asyncio.run(reconchain.run_pipeline(args)) == 0
+    # The fan-out stage has 6 independent phases, so peak concurrency must be >1.
+    assert state["peak"] > 1
+
+
 def test_cli_help_subprocess() -> None:
     result = subprocess.run(
         [sys.executable, "reconchain.py", "--help"],

@@ -386,7 +386,7 @@ class Interactsh:
             return False
         # remember the byte offset where this run's output begins
         self._start_pos = self.log.stat().st_size
-        deadline = time.time() + 45
+        deadline = time.time() + 90
         try:
             while time.time() < deadline:
                 if self.proc.poll() is not None:
@@ -399,10 +399,19 @@ class Interactsh:
                 except FileNotFoundError:
                     txt = ""
                 for ln in txt.splitlines():
-                    if "Domain" in ln and ":" in ln:
-                        cand = ln.split(":", 1)[1].strip()
-                        # hostname tokens only — reject anything that
-                        # could break the SSRF probe script later
+                    # Strip ANSI escape sequences
+                    clean = re.sub(r'\x1b\[[0-9;]*[a-zA-Z]', '', ln).strip()
+                    # Old format: "Domain: <domain>"
+                    if "Domain" in clean and ":" in clean:
+                        cand = clean.split(":", 1)[1].strip()
+                        if cand and "." in cand and " " not in cand:
+                            self.domain = cand
+                            log("ok", f"interactsh domain: {self.domain}")
+                            return True
+                    # New format: "[INF] <subdomain>.oast.<tld>"
+                    # Match lines that look like a bare hostname after [INF]
+                    if re.search(r'[a-zA-Z0-9-]+\.oast\.[a-z]+', clean):
+                        cand = clean.split()[-1].strip()
                         if cand and "." in cand and " " not in cand:
                             self.domain = cand
                             log("ok", f"interactsh domain: {self.domain}")
@@ -816,7 +825,7 @@ async def phase_C2(outdir: Path, t: Tools, only: PhaseSet,
     if t.has("nuclei"):
         jobs.append(("nuclei-exposures",
             ["nuclei", "-silent", "-l", str(js_urls),
-             "-t", "exposures", "-o", str(outdir / "nuclei_exposures.txt")],
+             "-t", "http/exposed-panels", "-o", str(outdir / "nuclei_exposures.txt")],
             1500))
     await run_parallel(jobs, outdir)
     n = merge_unique([outdir / "links.txt", outdir / "secrets.txt",
@@ -944,21 +953,58 @@ async def phase_E(outdir: Path, t: Tools, only: PhaseSet,
         wordlist = ""
     jobs: List[Tuple[str, List[str], int]] = []
     sample = read_lines(urls)[:5]
+    if not Path(wordlist).exists():
+        # fallback to any wordlist under /usr/share
+        alt = sorted(Path("/usr/share/seclists/Discovery/Web-Content").glob("raft*.txt"))
+        if alt:
+            wordlist = str(alt[0])
+            log("info", f"E: using fallback wordlist: {wordlist}")
     if t.has("ffuf") and wordlist:
         for u in sample:
             out_json = outdir / f"ffuf_{safe_suffix(u)}.json"
             jobs.append((f"ffuf-{u[:32]}",
-                ["ffuf", "-silent", "-u", u.rstrip("/") + "/FUZZ",
+                ["ffuf", "-s", "-u", u.rstrip("/") + "/FUZZ",
                  "-w", wordlist, "-mc", "200,301,302,403",
                  "-o", str(out_json)], 1500))
     if t.has("kr"):
-        for u in sample:
-            out_jsonl = outdir / f"kr_{safe_suffix(u)}.jsonl"
-            jobs.append((f"kiterunner-{u[:32]}",
-                ["kr", "scan", u, "-w",
-                 os.environ.get("KITELIST",
-                     "/usr/share/seclists/Discovery/Web-Content/api/api-endpoints.txt"),
-                 "-o", str(out_jsonl)], 1500))
+        # Kiterunner needs .kite format wordlists. Try to find or generate one.
+        kite_file = os.environ.get("KITE_FILE", "")
+        if not kite_file or not Path(kite_file).exists():
+            # Try common kite file paths
+            for cand in [
+                "/tmp/common.kite",
+                os.path.expanduser("~/.kiterunner/wordlist.kite"),
+            ]:
+                if Path(cand).exists():
+                    kite_file = cand
+                    break
+        if not kite_file or not Path(kite_file).exists():
+            # Generate a .kite file from a text wordlist
+            src_wordlist = Path(
+                "/usr/share/seclists/Discovery/Web-Content/common.txt"
+            )
+            if src_wordlist.exists():
+                kite_file = str(outdir / "kr_wordlist.kite")
+                log("info", f"E: generating kite wordlist from {src_wordlist}")
+                proc = await asyncio.create_subprocess_exec(
+                    "kr", "kb", "convert", str(src_wordlist), kite_file,
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.DEVNULL,
+                )
+                await proc.wait()
+                if not Path(kite_file).exists():
+                    kite_file = ""
+                    log("warn", "E: failed to generate kite wordlist")
+            else:
+                kite_file = ""
+        if not kite_file:
+            log("warn", "E: no kite wordlist available, skipping kiterunner")
+        else:
+            for u in sample:
+                out_jsonl = outdir / f"kr_{safe_suffix(u)}.jsonl"
+                jobs.append((f"kiterunner-{u[:32]}",
+                    ["kr", "scan", u, "-w", kite_file,
+                     "-o", str(out_jsonl)], 1500))
     if t.has("feroxbuster"):
         for u in sample:
             out_txt = outdir / f"fb_{safe_suffix(u)}.txt"
@@ -1007,7 +1053,7 @@ async def phase_F1(outdir: Path, t: Tools, only: PhaseSet,
         # tech-scanner uses the same nuclei binary; do not double-gate on httpx.
         jobs.append(("tech-scanner",
             ["nuclei", "-silent", "-l", str(hosts),
-             "-t", "technologies", "-o", str(outdir / "tech.txt")], 1800))
+             "-t", "http/technologies", "-o", str(outdir / "tech.txt")], 1800))
     await run_parallel(jobs, outdir)
     n = merge_unique([outdir / "nuclei.txt", outdir / "tech.txt"],
                      outdir / "nuclei_combined.txt")
@@ -1049,15 +1095,29 @@ async def phase_F2(outdir: Path, t: Tools, only: PhaseSet,
             testssl_jobs.append((f"testssl-{h[:32]}",
                                  ["bash", str(runner)], 1800))
     # wpscan writes per-host files natively via --output.
+    # Skip if the host doesn't appear to be WordPress (check for wp-content).
     wpscan_jobs: List[Tuple[str, List[str], int]] = []
     if t.has("wpscan"):
         for h in sample:
-            if h.startswith(("http://", "https://")):
-                wps_out = outdir / f"wpscan_{safe_suffix(h)}.txt"
-                wpscan_jobs.append((f"wpscan-{h[:32]}",
-                    ["wpscan", "--url", h, "--no-banner",
-                     "--output", str(wps_out)],
-                    1800))
+            if not h.startswith(("http://", "https://")):
+                continue
+            # Quick pre-check: is this WordPress?
+            try:
+                import urllib.request
+                req = urllib.request.Request(h.rstrip("/") + "/wp-login.php",
+                                             method="HEAD")
+                with urllib.request.urlopen(req, timeout=10) as resp:
+                    if resp.status not in (200, 301, 302):
+                        log("warn", f"F2: {h} does not appear to be WordPress, skipping wpscan")
+                        continue
+            except Exception:
+                log("warn", f"F2: {h} unreachable for WordPress check, skipping wpscan")
+                continue
+            wps_out = outdir / f"wpscan_{safe_suffix(h)}.txt"
+            wpscan_jobs.append((f"wpscan-{h[:32]}",
+                ["wpscan", "--url", h, "--no-banner",
+                 "--output", str(wps_out)],
+                1800))
     # run both groups in parallel; per-host files remove the race
     await run_parallel(testssl_jobs + wpscan_jobs, outdir)
     n = merge_unique(list(outdir.glob("testssl_*.txt")) +
@@ -1375,8 +1435,13 @@ async def run_pipeline(args: argparse.Namespace) -> int:
         overlap = sorted(only & skip)
         if overlap:
             raise ValueError(f"phase(s) cannot be both --only and --skip: {', '.join(overlap)}")
-    # pre-seed missing tools from state so a partial resume doesn't lose them
-    t.seed_missing(state.get("missing_tools", []))
+    # pre-seed missing tools from state so a partial resume doesn't lose them,
+    # but re-check each one so newly installed tools are recognized.
+    for m in list(state.get("missing_tools", [])):
+        if shutil.which(m):
+            state["missing_tools"].remove(m)
+        else:
+            t.seed_missing([m])
     # Bind the process-wide job semaphore to THIS event loop so every phase's
     # run_parallel() shares one budget of live external processes.
     global _JOB_SEM

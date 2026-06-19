@@ -145,15 +145,23 @@ Skip phases:
 Resume:
 ./reconchain.py -d example.com -o ./out --resume
 
+Fast:
+./reconchain.py -d example.com -o ./out --fast
+
 Quiet:
 ./reconchain.py -d example.com -o ./out -q
+
+High concurrency (faster on big targets):
+./reconchain.py -d example.com -o ./out -j 32
 
 ## Flags
 
 -d target domain  
 -o output folder  
+-j, --jobs max parallel external processes (default: 16)  
 --only selected phases  
 --skip skip phases  
+--fast fast mode: only recon phases (A1, A2, B1, C1, I)  
 --resume resume scan  
 -q quiet mode  
 -h show help

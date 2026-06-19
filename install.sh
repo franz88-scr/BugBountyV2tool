@@ -172,9 +172,9 @@ ALL_TOOLS=(subfinder amass assetfinder dnsx naabu nmap httpx subjack nuclei
 
            gau waybackurls gospider katana subjs linkfinder secretfinder
 
-           paramspider arjun x8 ffuf kr feroxbuster testssl.sh
+           paramspider arjun ffuf feroxbuster testssl.sh
 
-           wpscan dalfox sqlmap interactsh-client)
+           wpscan dalfox sqlmap interactsh-client kr x8)
 
 
 if [[ "$MODE" == "check" ]]; then
@@ -265,11 +265,9 @@ GO_TOOLS=(
 
   "github.com/lc/subjs"
 
-  "github.com/hahwul/x8"
-
   "github.com/ffuf/ffuf/v2"
 
-  "github.com/assetnote/kiterunner/cmd/kr"
+  "github.com/assetnote/kiterunner/cmd/kiterunner"
 
   "github.com/hahwul/dalfox/v2"
 
@@ -493,6 +491,33 @@ install_feroxbuster() {
 }
 
 
+# ───────────────────────────── x8 (Rust) ──────────────────────────
+install_x8() {
+  if ! command -v x8 >/dev/null 2>&1; then
+    log "Installing x8 (Rust crate)…"
+    if ! command -v cargo >/dev/null 2>&1; then
+      warn "cargo not found; install Rust/cargo, then run: cargo install x8"
+      return
+    fi
+    cargo install x8 || warn "x8 install failed (try: cargo install x8 --locked)"
+  fi
+  if command -v x8 >/dev/null 2>&1; then
+    ok "x8"
+  fi
+}
+
+# ───────────────────────────── kiterunner kite wordlist ────────────
+install_kr_wordlist() {
+  if command -v kr >/dev/null 2>&1; then
+    local kite="/tmp/common.kite"
+    if [[ ! -f "$kite" ]] && [[ -f /usr/share/seclists/Discovery/Web-Content/common.txt ]]; then
+      log "Generating kiterunner kite wordlist…"
+      kr kb convert /usr/share/seclists/Discovery/Web-Content/common.txt "$kite" 2>/dev/null && \
+        ok "kiterunner wordlist: $kite" || warn "failed to generate kite wordlist"
+    fi
+  fi
+}
+
 # ───────────────────────────── testssl.sh ──────────────────────────
 
 install_testssl() {
@@ -543,9 +568,13 @@ case "$MODE" in
 
     install_feroxbuster
 
+    install_x8
+
     install_wpscan
 
     install_testssl
+
+    install_kr_wordlist
 
     update_nuclei_templates
 

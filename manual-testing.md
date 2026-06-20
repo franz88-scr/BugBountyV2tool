@@ -13,7 +13,7 @@ that address previously manual gaps:
 Run them: `reconchain.py -d example.com -o ./out --only G2,J,K,L`
 
 However, several critical attack surfaces are **only addressable manually**. This guide
-catalogues gaps discovered during the `daymaker.study` scan with actionable steps.
+catalogues common gaps with actionable steps.
 
 ## J1 — API Endpoint Probing (IDOR / Auth Bypass / Mass Assignment)
 
@@ -21,7 +21,7 @@ catalogues gaps discovered during the `daymaker.study` scan with actionable step
 > The manual steps below cover **IDOR** and **authenticated mass assignment** — things that need
 > two user sessions and domain knowledge.
 
-Endpoints discovered via ffuf but never actively tested:
+Common endpoints to test:
 
 | Endpoint | Likely Methods | Test For |
 |----------|---------------|----------|
@@ -46,8 +46,8 @@ Endpoints discovered via ffuf but never actively tested:
 > Stripe, GitHub tokens, AWS keys, JWTs, internal IPs/hosts, GraphQL endpoints) plus source map
 > extraction (`js_secrets_deep.txt`). Run with `--only K` before manual review.
 
-53 secrets discovered but **none were manually reviewed**. The automated SecretFinder misses
-many patterns (e.g. obfuscated keys, Firebase URLs, internal GraphQL endpoints).
+The automated SecretFinder misses many patterns (e.g. obfuscated keys, Firebase URLs,
+internal GraphQL endpoints). Secrets discovered by the pipeline should be manually reviewed.
 
 ```bash
 # Extract high-entropy strings from JS files
@@ -67,8 +67,7 @@ done
 
 ## J3 — Deep Parameter Discovery
 
-Only **2 parameters** discovered. The app almost certainly has more (search, filters,
-pagination, sort). Automated tools (Arjun/x8) were shallow.
+Automated tools (Arjun/x8) can be shallow. Many apps have more parameters than discovered.
 
 ```bash
 # Arjun with tighter settings
@@ -78,9 +77,8 @@ arjun -i urls_all.txt -t 20 -o json/params_deep.json --headers "Cookie: <session
 x8 -u urls_all.txt -o json/params_x8_deep.json \
   --max-params 10 --max-values 5 --max-param-name-length 64
 
-# ParamSpider per endpoint with JS-exclusion reversed
-paramspider -d "https://daymaker.study/api" --level high --quiet
-paramspider -d "https://daymaker.study/account" --level high --quiet
+# ParamSpider per endpoint with high level
+paramspider -d "$(echo $URL | sed 's|https\?://||;s|/.*||')" --level high --quiet
 ```
 
 **Action items:**
@@ -96,26 +94,26 @@ paramspider -d "https://daymaker.study/account" --level high --quiet
 > certificate history, MX record extraction, and resolved-IP collection (`origin.txt`).
 > Run with `--only J`.
 
-The real server IP was **never enumerated**. Cloudflare obscures it, but several techniques
+If the target uses Cloudflare, the real server IP may be obscured. Several techniques
 can reveal it:
 
 ```bash
 # Historical DNS (SecurityTrails API)
-curl -s "https://api.securitytrails.com/v1/domain/daymaker.study/history?apikey=$ST_APIKEY"
+curl -s "https://api.securitytrails.com/v1/domain/$DOMAIN/history?apikey=$ST_APIKEY"
 
 # Censys / Shodan — search for SSL cert subject/organisation
-censys search "daymaker.study" --index certificates
-shodan search "ssl.cert.subject.cn:daymaker.study"
+censys search "$DOMAIN" --index certificates
+shodan search "ssl.cert.subject.cn:$DOMAIN"
 
 # DNS brute-force with full-zone-transfer attempt
-dig axfr @ns-cloud-e1.googledomains.com daymaker.study
+dig axfr @ns-cloud-e1.googledomains.com $DOMAIN
 
 # Check subdomains pointing to non-Cloudflare IPs
 # Review resolved_full.txt — any IP that doesn't belong to Cloudflare ASN (13335)
 # is a candidate origin.
 
 # SMTP / MX records — sometimes MX servers are not proxied
-dig mx daymaker.study
+dig mx $DOMAIN
 ```
 
 **Action items:**
@@ -124,22 +122,22 @@ dig mx daymaker.study
 - [ ] Try Favicon hash lookup (`mmh3` hash of `/favicon.ico` on Shodan).
 - [ ] Once an origin IP is found, re-run phases C1–G targeting it directly.
 
-## J5 — Business Logic Testing (Homework Planning App)
+## J5 — Business Logic Testing
 
-Business logic flaws **cannot be detected by automated scanners**. This is a homework planning
-app, so the attack surface includes:
+Business logic flaws **cannot be detected by automated scanners**. Common attack surfaces
+in web applications include:
 
 | Feature | Potential Flaw | How to Test |
 |---------|---------------|-------------|
-| Grade/task submission | Grade manipulation | Intercept POST to `/api/tasks` or `/api/grades`; modify `score`/`points`/`completed` |
-| Student collaboration | Accessing other students' work | Change `user_id`, `student_id`, or `assignment_id` in API calls |
-| Class/group membership | Privilege escalation | Try adding yourself to a teacher/admin group via `/api/groups/join` |
+| Grade/task submission | Grade manipulation | Intercept POST to relevant API; modify `score`/`points`/`completed` |
+| User collaboration | Accessing other users' data | Change `user_id`, `student_id`, or `assignment_id` in API calls |
+| Group/role membership | Privilege escalation | Try adding yourself to a privileged group via membership endpoints |
 | Deadlines / due dates | Bypass restrictions | Submit after deadline; modify `due_date` param |
 | File uploads (if any) | Arbitrary file upload | Upload `.php`/`.jsp`/`.war` files, check for path traversal in filename |
 | Ratings / reviews (if any) | Rating manipulation | Submit multiple ratings, negative scores, or out-of-range values |
 
 **Approach:**
-1. Create **two accounts** (student A, student B) with different class access.
+1. Create **two accounts** with different privilege levels.
 2. Map every state-changing request (POST/PUT/PATCH/DELETE).
 3. For each request, swap identifiers between accounts via Burp Repeater.
 4. Look for responses that leak another user's data or mutate another user's state.
@@ -149,8 +147,6 @@ app, so the attack surface includes:
 > **🔄 Phase G2 now automates** SSTI fuzzing across all param-bearing URLs (`ssti.txt`).
 > Phase G runs dalfox (XSS) and sqlmap (SQLi). These automated phases cover the easy
 > payloads; the manual steps below cover edge cases and chained exploits.
-
-18 discovered URLs were never actively fuzzed for common web vulnerabilities:
 
 ```bash
 # XSS — reflect/dom-based
@@ -181,8 +177,7 @@ done > j6_open_redirects.txt
 **Action items:**
 - [ ] XSS: test reflected params, DOM sinks in JS files, and stored inputs (profile fields,
   assignment names, comments).
-- [ ] SQLi: focus on the discovered `/api` endpoints and `id`/`user_id` params.
-- [ ] SSTI: look for params reflected in rendered output (e.g. assignment names displayed
-  on a dashboard).
+- [ ] SQLi: focus on discovered `/api` endpoints and `id`/`user_id` params.
+- [ ] SSTI: look for params reflected in rendered output.
 - [ ] SSRF: test `url`, `image`, `file`, `path` params; use the active interactsh domain from
   the pipeline's OAST phase.

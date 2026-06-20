@@ -847,6 +847,8 @@ async def phase_D(outdir: Path, t: Tools, only: PhaseSet, skip: PhaseSet,
     jobs: List[Tuple[str, List[str], int]] = []
     if t.has("paramspider"):
         for u in read_lines(urls)[:3]:
+            # ParamSpider -d expects a domain, not a full URL
+            domain_for_ps = _extract_domain(u)
             out_part = outdir / f"params_spider_{safe_suffix(u)}.txt"
             runner = outdir / "logs" / f"paramspider_{safe_suffix(u)}.sh"
             ensure(runner)
@@ -855,8 +857,9 @@ async def phase_D(outdir: Path, t: Tools, only: PhaseSet, skip: PhaseSet,
                 "set -u\n"
                 f"OUT={shlex.quote(str(out_part))}\n"
                 f"URL={shlex.quote(u)}\n"
+                f"DOMAIN={shlex.quote(domain_for_ps)}\n"
                 ": > \"$OUT\"\n"
-                "paramspider -d \"$URL\" --quiet >> \"$OUT\" 2>/dev/null || true\n"
+                "paramspider -d \"$DOMAIN\" --quiet >> \"$OUT\" 2>/dev/null || true\n"
             )
             runner.chmod(0o755)
             jobs.append((f"paramspider-{u[:40]}",
@@ -1014,6 +1017,11 @@ async def phase_E(outdir: Path, t: Tools, only: PhaseSet,
                  "-o", str(out_txt)], 1800))
     await run_parallel(jobs, outdir)
     # Normalize JSON fuzzer output into plain text lines BEFORE merging.
+    # Clean up stale normalized .txt files from prior runs first
+    for old in outdir.glob("ffuf_*.txt"):
+        old.unlink(missing_ok=True)
+    for old in outdir.glob("kr_*.txt"):
+        old.unlink(missing_ok=True)
     normalized: List[Path] = []
     for ffp in outdir.glob("ffuf_*.json"):
         norm = ffp.with_suffix(".txt")
@@ -1240,9 +1248,30 @@ async def phase_G2(outdir: Path, t: Tools, only: PhaseSet, skip: PhaseSet,
     if t.has("httpx"):
         jobs.append(("ssti-probe",
             ["httpx", "-silent", "-l", str(ssti_in), "-mc", "200",
-             "-o", str(outdir / "ssti.txt"), "-title"], 900))
+             "-o", str(outdir / "ssti_raw.txt"), "-title"], 900))
     await run_parallel(jobs, outdir)
-    return {"G2": str(outdir / "ssti.txt"), "count": count_nonblank(outdir / "ssti.txt")}
+    # Check for reflection of SSTI payloads in response bodies
+    ssti_findings: List[str] = []
+    if (outdir / "ssti_raw.txt").exists():
+        for ssti_url in read_lines(outdir / "ssti_raw.txt"):
+            url_only = ssti_url.split()[0] if ssti_url.split() else ""
+            if not url_only:
+                continue
+            try:
+                req = _urllib.Request(url_only, headers={"User-Agent": "Mozilla/5.0"})
+                with _urllib.urlopen(req, timeout=10) as resp:
+                    body = resp.read().decode("utf-8", errors="ignore")
+                # Check if any payload is reflected
+                for payload in ssti_payloads:
+                    if payload in body:
+                        ssti_findings.append(f"[SSTI-reflected] {url_only} payload={payload}")
+                        break
+            except Exception:
+                continue
+    if ssti_findings:
+        ensure(outdir / "ssti.txt").write_text("\n".join(ssti_findings) + "\n")
+    log("ok", f"G2: {len(ssti_findings)} SSTI reflections detected")
+    return {"G2": str(outdir / "ssti.txt"), "count": len(ssti_findings)}
 # ─────────────────────────── manual-testing phases ──────────────────────────
 # Phases J–L address gaps that automated scanners often miss but can be
 # partially automated with targeted scripts and API calls.
@@ -1314,7 +1343,7 @@ async def phase_J(domain: str, outdir: Path, t: Tools,
             with _urllib.urlopen(req, timeout=10) as resp:
                 data = resp.read()
             if data:
-                h = _mmh3_hash(data)
+                h = _mmh3_hash(data) & 0xFFFFFFFF
                 findings.append(f"favicon_hash={h} (url={url})")
                 findings.append(f"  Shodan: https://www.shodan.io/search?query=http.favicon.hash:{h}")
                 findings.append(f"  Shodan (org): https://www.shodan.io/search?query=org:%22Cloudflare%22+http.favicon.hash:{h}")
@@ -1324,13 +1353,18 @@ async def phase_J(domain: str, outdir: Path, t: Tools,
     # 2. crt.sh certificate history
     crt_urls = [f"https://crt.sh/?q={domain}&output=json",
                 f"https://crt.sh/?q=%25.{domain}&output=json"]
+    crt_found_any = False
     for crt_url in crt_urls:
+        if crt_found_any:
+            break
         try:
             req = _urllib.Request(crt_url, headers={"User-Agent": "Mozilla/5.0"})
             with _urllib.urlopen(req, timeout=15) as resp:
                 raw = resp.read().decode("utf-8", errors="ignore")
             import json as _json
             certs = _json.loads(raw)
+            if not isinstance(certs, list) or not certs:
+                continue
             ips: Set[str] = set()
             subdomains: Set[str] = set()
             for c in certs if isinstance(certs, list) else []:
@@ -1360,7 +1394,7 @@ async def phase_J(domain: str, outdir: Path, t: Tools,
                 findings.append(f"crt.sh: {len(subdomains)} subdomains, {len(ips)} unique IPs")
                 for ip in list(ips)[:10]:
                     findings.append(f"  origin_candidate={ip}")
-            break
+            crt_found_any = True
         except Exception:
             continue
     # 3. MX records (often not proxied by Cloudflare)
@@ -1396,22 +1430,41 @@ async def phase_J(domain: str, outdir: Path, t: Tools,
                             mip = mip.strip()
                             if mip and mip.count(".") == 3:
                                 findings.append(f"  mx_ip={mip} (non-CF origin candidate)")
-    # 4. Check resolved IPs against Cloudflare ASN (via whois/dig -x)
+    # 4. Check resolved IPs against Cloudflare ASN
     resolved_path = Path(prev.get("A2") or outdir / "resolved_full.txt")
     if resolved_path.exists():
-        cf_ips: Set[str] = set()
-        other_ips: Set[str] = set()
+        resolved_ips: Set[str] = set()
         for ln in read_lines(resolved_path):
             parts = ln.split()
             if len(parts) >= 2:
                 ip = parts[-1].strip("[]")
                 if ip and ip.count(".") == 3:
-                    other_ips.add(ip)
-        if other_ips:
-            findings.append(f"resolved_ips={', '.join(other_ips)}")
-            findings.append("  Check ASN: curl -s https://ipinfo.io/{ip}/json")
+                    resolved_ips.add(ip)
+        if resolved_ips:
+            cf_ips: Set[str] = set()
+            non_cf_ips: Set[str] = set()
+            for ip in sorted(resolved_ips)[:10]:
+                try:
+                    req = _urllib.Request(f"https://ipinfo.io/{ip}/json",
+                                          headers={"User-Agent": "Mozilla/5.0"})
+                    with _urllib.urlopen(req, timeout=10) as resp:
+                        info = resp.read().decode("utf-8", errors="ignore")
+                    import json as _json2
+                    info_data = _json2.loads(info)
+                    org = (info_data.get("org") or "").lower()
+                    if "cloudflare" in org or "13335" in org:
+                        cf_ips.add(ip)
+                    else:
+                        non_cf_ips.add(ip)
+                        findings.append(f"  non_cloudflare_ip={ip}  org={info_data.get('org', 'unknown')}")
+                except Exception:
+                    findings.append(f"  unresolved_ip={ip} (check manually: curl -s https://ipinfo.io/{ip}/json)")
+            if cf_ips:
+                findings.append(f"  cloudflare_ips={', '.join(sorted(cf_ips))}")
+            if non_cf_ips:
+                findings.append(f"  non_cloudflare_candidates={', '.join(sorted(non_cf_ips))}")
     out = ensure(outdir / "origin.txt")
-    out.write_text("\n".join(findings) + ("\n" if findings else "no origin findings\n"))
+    out.write_text("\n".join(findings) + ("\n" if findings else ""))
     log("ok", f"J: {len(findings)} origin findings → {out}")
     return {"J": str(out), "count": len(findings)}
 # ──────────────────── Phase K: deep JS secret scanning ──────────────────────
@@ -1423,7 +1476,7 @@ _JS_SECRET_PATTERNS: List[Tuple[str, str]] = [
     ("github-tok",  r"gh[opsu]_[0-9A-Za-z]{36,}"),
     ("aws-key",     r"AKIA[0-9A-Z]{16}"),
     ("aws-secret",  r"(?i)aws(.{0,20})?(?:secret|key).{0,20}[\"'][0-9a-zA-Z\/+=]{40}[\"']"),
-    ("google-api",  r"AIza[0-9A-Za-z\-_]{35}"),
+    ("google-oauth", r"[0-9]+-[0-9A-Za-z_]{32}\.apps\.googleusercontent\.com"),
     ("slack-tok",   r"xox[baprs]-[0-9A-Za-z\-]{10,}"),
     ("jwt",         r"eyJ[a-zA-Z0-9_-]{10,}\.[a-zA-Z0-9_-]{10,}\.[a-zA-Z0-9_-]{10,}"),
     ("heroku",      r"https://api\.heroku\.com"),
@@ -1443,6 +1496,7 @@ async def phase_K(outdir: Path, t: Tools, only: PhaseSet,
         return {"K": str(outdir / "js_secrets_deep.txt"), "count": 0}
     findings: List[str] = []
     seen_secrets: Set[str] = set()
+    seen_sourcemaps: Set[str] = set()
     for js_url in read_lines(js_urls):
         try:
             req = _urllib.Request(js_url, headers={"User-Agent": "Mozilla/5.0"})
@@ -1463,9 +1517,11 @@ async def phase_K(outdir: Path, t: Tools, only: PhaseSet,
             if not sm_url.startswith("http"):
                 base = js_url.rsplit("/", 1)[0]
                 sm_url = base.rstrip("/") + "/" + sm_url.lstrip("/")
-            findings.append(f"[sourcemap] {sm_url}  ({js_url})")
-            if findings.count(f"[sourcemap] {sm_url}") > 1:
+            sm_entry = f"[sourcemap] {sm_url}  ({js_url})"
+            if sm_url in seen_sourcemaps:
                 continue
+            seen_sourcemaps.add(sm_url)
+            findings.append(sm_entry)
             try:
                 sm_req = _urllib.Request(sm_url, headers={"User-Agent": "Mozilla/5.0"})
                 with _urllib.urlopen(sm_req, timeout=15) as sm_resp:
@@ -1484,7 +1540,7 @@ async def phase_K(outdir: Path, t: Tools, only: PhaseSet,
             except Exception:
                 continue
     out = ensure(outdir / "js_secrets_deep.txt")
-    out.write_text("\n".join(findings) + ("\n" if findings else "no additional secrets found\n"))
+    out.write_text("\n".join(findings) + ("\n" if findings else ""))
     log("ok", f"K: {len(findings)} deep JS findings → {out}")
     return {"K": str(out), "count": len(findings)}
 # ─────────────── Phase L: auth bypass + mass assignment ─────────────────────
@@ -1542,18 +1598,34 @@ async def phase_L(outdir: Path, t: Tools, only: PhaseSet,
         findings.append(f"  endpoint={ep}")
     # 2. Auth bypass header probes (non-destructive)
     bypass_found: List[str] = []
-    for ep in sorted(api_endpoints)[:5]:
+    for ep in sorted(api_endpoints)[:15]:
+        # Make a baseline request WITHOUT bypass headers first
+        try:
+            base_req = _urllib.Request(ep, method="GET")
+            with _urllib.urlopen(base_req, timeout=8) as base_resp:
+                baseline_status = base_resp.status
+        except Exception:
+            continue
         for hdr in _AUTH_BYPASS_HEADERS:
             try:
                 req = _urllib.Request(ep, method="GET")
                 if ":" in hdr:
                     k, v = hdr.split(":", 1)
                     req.add_header(k.strip(), v.strip())
+                elif hdr in ("X-Original-URL", "X-Rewrite-URL"):
+                    req.add_header(hdr, "/admin")
+                elif hdr in ("X-Auth-Token", "X-Auth-User"):
+                    req.add_header(hdr, "admin")
+                elif hdr == "X-Custom-IP-Authorization":
+                    req.add_header(hdr, "127.0.0.1")
+                elif hdr == "Authorization: Basic YWRtaW46YWRtaW4=":
+                    req.add_header("Authorization", "Basic YWRtaW46YWRtaW4=")
                 else:
                     req.add_header(hdr, "127.0.0.1")
                 with _urllib.urlopen(req, timeout=8) as resp:
-                    if resp.status == 200:
-                        bypass_found.append(f"  bypass={hdr} → {resp.status} on {ep}")
+                    if resp.status != baseline_status and resp.status in (200, 302, 403, 401):
+                        bypass_found.append(f"  bypass={hdr} → {resp.status} (baseline={baseline_status}) on {ep}")
+                        break
             except Exception:
                 continue
     findings.append("auth_bypass_probes:")
@@ -1603,7 +1675,7 @@ def write_summary(outdir: Path, domain: str, state: dict,
         "counts": counts,
     }
     out = ensure(outdir / "summary.json")
-    out.write_text(json.dumps(payload, indent=2))
+    out.write_text(json.dumps(payload, indent=2, default=str))
     return out
 HTML_CSS = """
 :root{--fg:#e6edf3;--bg:#0d1117;--mut:#8b949e;--acc:#58a6ff;--warn:#d29922;--ok:#3fb950;--err:#f85149;}
@@ -1708,6 +1780,17 @@ STAGES: List[List[str]] = [
     ["C1"],
     ["C2", "D", "E", "F1", "F2", "G", "G2", "J", "K", "L"],
 ]
+def _extract_domain(s: str) -> str:
+    """Extract a bare domain from a URL or hostname."""
+    s = s.strip()
+    if s.startswith("http://"):
+        s = s[7:]
+    elif s.startswith("https://"):
+        s = s[8:]
+    s = s.split("/")[0].split(":")[0].split("?")[0]
+    if _is_valid_hostname(s):
+        return s
+    return ""
 def _atomic_write_json(path: Path, payload: dict) -> None:
     """Write JSON atomically: temp file + rename, so a mid-write crash
     can't leave a half-written state.json that breaks --resume."""

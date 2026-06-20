@@ -1,4 +1,4 @@
-# ReconChain
+# ReconChain v2.2
 
 A Python orchestrator that chains 25+ recon and vulnerability tools into a single,
 resumable pipeline — no config files, no YAML, no DSL.

@@ -82,7 +82,8 @@ _HOSTNAME_RE = re.compile(
     r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.?$"
 )
 __version__ = "1.2.0"
-VALID_PHASES = {"A1", "A2", "B1", "C1", "C2", "D", "E", "F1", "F2", "G", "H", "I"}
+VALID_PHASES = {"A1", "A2", "B1", "C1", "C2", "D", "E", "F1", "F2", "G", "G2",
+                "H", "I", "J", "K", "L"}
 FAST_PHASES = {"A1", "A2", "B1", "C1", "I"}
 PhaseSet = Set[str]
 
@@ -1201,6 +1202,370 @@ async def phase_G(outdir: Path, t: Tools, only: PhaseSet, skip: PhaseSet,
             parts.append(fp)
     n = merge_unique(parts, outdir / "vulns.txt")
     return {"G": str(outdir / "vulns.txt"), "count": n}
+async def phase_G2(outdir: Path, t: Tools, only: PhaseSet, skip: PhaseSet,
+                   prev: Dict[str, Any]) -> Dict[str, Any]:
+    """Enhanced vuln fuzzing: SSTI, deeper XSS/SQLi on API endpoints."""
+    if skip & {"G2"}:
+        return {}
+    log("info", "Phase G2: SSTI + deep XSS/SQLi fuzzing")
+    urls = outdir / "urls_all.txt"
+    all_urls = read_lines(urls) if urls.exists() else []
+    if not all_urls:
+        log("warn", "G2: no URLs; skipping")
+        return {"G2": str(outdir / "ssti.txt"), "count": 0}
+    param_urls = [u for u in all_urls if "=" in u]
+    if not param_urls:
+        param_urls = all_urls[:5]
+    jobs: List[Tuple[str, List[str], int]] = []
+    ssti_payloads = (
+        "{{7*7}}",
+        "${7*7}",
+        "#{7*7}",
+        "*{7*7}",
+        "{{7*'7'}}",
+        "<%= 7*7 %>",
+        "${{7*7}}",
+    )
+    ssti_in = ensure(outdir / "urls_ssti.txt")
+    ssti_urls: List[str] = []
+    for u in param_urls:
+        for payload in ssti_payloads:
+            if "=" in u:
+                base, _, val = u.partition("=")
+                ssti_urls.append(f"{base}={payload}")
+            else:
+                ssti_urls.append(f"{u}?q={payload}")
+    if ssti_urls:
+        ssti_in.write_text("\n".join(ssti_urls[:200]) + "\n")
+    if t.has("httpx"):
+        jobs.append(("ssti-probe",
+            ["httpx", "-silent", "-l", str(ssti_in), "-mc", "200",
+             "-o", str(outdir / "ssti.txt"), "-title"], 900))
+    await run_parallel(jobs, outdir)
+    return {"G2": str(outdir / "ssti.txt"), "count": count_nonblank(outdir / "ssti.txt")}
+# ─────────────────────────── manual-testing phases ──────────────────────────
+# Phases J–L address gaps that automated scanners often miss but can be
+# partially automated with targeted scripts and API calls.
+# ───────────────────── Phase J: origin IP bypass ────────────────────────────
+import urllib.request as _urllib
+import struct as _struct
+def _mmh3_hash(data: bytes) -> int:
+    """Python implementation of mmh3 hash (used by Shodan favicon lookup)."""
+    seed = 0
+    c1 = 0xcc9e2d51
+    c2 = 0x1b873593
+    r1 = 15
+    r2 = 13
+    m = 5
+    n = 0xe6546b64
+    h = seed
+    length = len(data)
+    nblocks = length // 4
+    for i in range(nblocks):
+        k = _struct.unpack_from("<I", data, i * 4)[0]
+        k = (k * c1) & 0xFFFFFFFF
+        k = ((k << r1) | (k >> (32 - r1))) & 0xFFFFFFFF
+        k = (k * c2) & 0xFFFFFFFF
+        h ^= k
+        h = ((h << r2) | (h >> (32 - r2))) & 0xFFFFFFFF
+        h = (h * m + n) & 0xFFFFFFFF
+    tail = data[nblocks * 4:]
+    k = 0
+    tail_len = length & 3
+    if tail_len == 3:
+        k ^= tail[2] << 16
+    if tail_len >= 2:
+        k ^= tail[1] << 8
+    if tail_len >= 1:
+        k ^= tail[0]
+        k = (k * c1) & 0xFFFFFFFF
+        k = ((k << r1) | (k >> (32 - r1))) & 0xFFFFFFFF
+        k = (k * c2) & 0xFFFFFFFF
+        h ^= k
+    h ^= length
+    h ^= h >> 16
+    h = (h * 0x85ebca6b) & 0xFFFFFFFF
+    h ^= h >> 13
+    h = (h * 0xc2b2ae35) & 0xFFFFFFFF
+    h ^= h >> 16
+    return h
+async def phase_J(domain: str, outdir: Path, t: Tools,
+                  only: PhaseSet, skip: PhaseSet,
+                  prev: Dict[str, Any]) -> Dict[str, Any]:
+    if skip & {"J"}:
+        return {}
+    log("info", "Phase J: origin IP bypass enumeration")
+    findings: List[str] = []
+    hosts_file = Path(prev.get("B1.targets") or outdir / "host_targets.txt")
+    if not hosts_file.exists():
+        hosts_file = outdir / "resolved.txt"
+    have_hosts = hosts_file.exists() and bool(read_lines(hosts_file))
+    # 1. Favicon hash
+    favicon_urls = []
+    if have_hosts:
+        for h in read_lines(hosts_file)[:3]:
+            base = h if h.startswith("http") else f"https://{h}"
+            favicon_urls.append(base.rstrip("/") + "/favicon.ico")
+    if not favicon_urls:
+        favicon_urls = [f"https://{domain}/favicon.ico"]
+    for url in favicon_urls:
+        try:
+            req = _urllib.Request(url, headers={"User-Agent": "Mozilla/5.0"}, method="GET")
+            with _urllib.urlopen(req, timeout=10) as resp:
+                data = resp.read()
+            if data:
+                h = _mmh3_hash(data)
+                findings.append(f"favicon_hash={h} (url={url})")
+                findings.append(f"  Shodan: https://www.shodan.io/search?query=http.favicon.hash:{h}")
+                findings.append(f"  Shodan (org): https://www.shodan.io/search?query=org:%22Cloudflare%22+http.favicon.hash:{h}")
+                break
+        except Exception:
+            continue
+    # 2. crt.sh certificate history
+    crt_urls = [f"https://crt.sh/?q={domain}&output=json",
+                f"https://crt.sh/?q=%25.{domain}&output=json"]
+    for crt_url in crt_urls:
+        try:
+            req = _urllib.Request(crt_url, headers={"User-Agent": "Mozilla/5.0"})
+            with _urllib.urlopen(req, timeout=15) as resp:
+                raw = resp.read().decode("utf-8", errors="ignore")
+            import json as _json
+            certs = _json.loads(raw)
+            ips: Set[str] = set()
+            subdomains: Set[str] = set()
+            for c in certs if isinstance(certs, list) else []:
+                if isinstance(c, dict):
+                    nv = c.get("name_value", "")
+                    for name in nv.split("\n"):
+                        name = name.strip().lower()
+                        if name and _is_valid_hostname(name):
+                            subdomains.add(name)
+            # Try to resolve a few subdomains to find non-CF IPs
+            resolved = [s for s in subdomains if s != domain][:10]
+            if t.has("dnsx") and resolved:
+                crt_subs = outdir / "crt_subs.txt"
+                ensure(crt_subs).write_text("\n".join(resolved) + "\n")
+                crt_resolved = outdir / "crt_resolved.txt"
+                await _run("dnsx-crt",
+                    ["dnsx", "-silent", "-l", str(crt_subs),
+                     "-o", str(crt_resolved), "-a", "-resp"], 300, outdir)
+                if crt_resolved.exists():
+                    for ln in read_lines(crt_resolved):
+                        parts = ln.split()
+                        if len(parts) >= 3:
+                            ip = parts[-1].strip("[]")
+                            if ip and ip.count(".") == 3:
+                                ips.add(ip)
+            if ips:
+                findings.append(f"crt.sh: {len(subdomains)} subdomains, {len(ips)} unique IPs")
+                for ip in list(ips)[:10]:
+                    findings.append(f"  origin_candidate={ip}")
+            break
+        except Exception:
+            continue
+    # 3. MX records (often not proxied by Cloudflare)
+    mx_file = outdir / "mx_records.txt"
+    if t.has("dig"):
+        proc = await asyncio.create_subprocess_exec(
+            "dig", "+short", "mx", domain,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
+        try:
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=15)
+        except asyncio.TimeoutError:
+            proc.kill()
+            stdout = b""
+        mx = stdout.decode("utf-8", errors="ignore").strip()
+        if mx:
+            ensure(mx_file).write_text(mx + "\n")
+            for ln in mx.splitlines():
+                ln = ln.strip()
+                if ln:
+                    findings.append(f"mx_record={ln}")
+                    # Try resolving the MX target
+                    mx_host = ln.split()[-1] if len(ln.split()) > 1 else ln
+                    if t.has("dig"):
+                        try:
+                            proc2 = await asyncio.create_subprocess_exec(
+                                "dig", "+short", mx_host.rstrip("."),
+                                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
+                            out2, _ = await asyncio.wait_for(proc2.communicate(), timeout=10)
+                        except asyncio.TimeoutError:
+                            proc2.kill()
+                            out2 = b""
+                        for mip in out2.decode().splitlines():
+                            mip = mip.strip()
+                            if mip and mip.count(".") == 3:
+                                findings.append(f"  mx_ip={mip} (non-CF origin candidate)")
+    # 4. Check resolved IPs against Cloudflare ASN (via whois/dig -x)
+    resolved_path = Path(prev.get("A2") or outdir / "resolved_full.txt")
+    if resolved_path.exists():
+        cf_ips: Set[str] = set()
+        other_ips: Set[str] = set()
+        for ln in read_lines(resolved_path):
+            parts = ln.split()
+            if len(parts) >= 2:
+                ip = parts[-1].strip("[]")
+                if ip and ip.count(".") == 3:
+                    other_ips.add(ip)
+        if other_ips:
+            findings.append(f"resolved_ips={', '.join(other_ips)}")
+            findings.append("  Check ASN: curl -s https://ipinfo.io/{ip}/json")
+    out = ensure(outdir / "origin.txt")
+    out.write_text("\n".join(findings) + ("\n" if findings else "no origin findings\n"))
+    log("ok", f"J: {len(findings)} origin findings → {out}")
+    return {"J": str(out), "count": len(findings)}
+# ──────────────────── Phase K: deep JS secret scanning ──────────────────────
+import re as _re
+_JS_SECRET_PATTERNS: List[Tuple[str, str]] = [
+    ("firebase",    r"AIza[0-9A-Za-z\-_]{35}"),
+    ("stripe-live", r"(?:sk|pk)_live_[0-9A-Za-z]{24,}"),
+    ("stripe-test", r"(?:sk|pk)_test_[0-9A-Za-z]{24,}"),
+    ("github-tok",  r"gh[opsu]_[0-9A-Za-z]{36,}"),
+    ("aws-key",     r"AKIA[0-9A-Z]{16}"),
+    ("aws-secret",  r"(?i)aws(.{0,20})?(?:secret|key).{0,20}[\"'][0-9a-zA-Z\/+=]{40}[\"']"),
+    ("google-api",  r"AIza[0-9A-Za-z\-_]{35}"),
+    ("slack-tok",   r"xox[baprs]-[0-9A-Za-z\-]{10,}"),
+    ("jwt",         r"eyJ[a-zA-Z0-9_-]{10,}\.[a-zA-Z0-9_-]{10,}\.[a-zA-Z0-9_-]{10,}"),
+    ("heroku",      r"https://api\.heroku\.com"),
+    ("graphql",     r"(graphql|gql)\s*[=:]\s*[\"']https?://"),
+    ("internal-ip", r"(?:10\.\d{1,3}\.\d{1,3}\.\d{1,3}|172\.(?:1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3}|192\.168\.\d{1,3}\.\d{1,3})"),
+    ("internal-host", r"(?i)(?:internal|private|staging|dev|jenkins|gitlab|jira|confluence)\.(?:com|local|internal|corp)"),
+]
+_SOURCE_MAP_RE = re.compile(r'(?://#\s*sourceMappingURL=|sourceMappingURL=)([^\s"\']+)')
+async def phase_K(outdir: Path, t: Tools, only: PhaseSet,
+                  skip: PhaseSet) -> Dict[str, Any]:
+    if skip & {"K"}:
+        return {}
+    log("info", "Phase K: deep JS secret scanning (custom regex + entropy + source maps)")
+    js_urls = outdir / "urls_js.txt"
+    if not js_urls.exists() or not read_lines(js_urls):
+        log("warn", "K: no JS URLs; skipping")
+        return {"K": str(outdir / "js_secrets_deep.txt"), "count": 0}
+    findings: List[str] = []
+    seen_secrets: Set[str] = set()
+    for js_url in read_lines(js_urls):
+        try:
+            req = _urllib.Request(js_url, headers={"User-Agent": "Mozilla/5.0"})
+            with _urllib.urlopen(req, timeout=15) as resp:
+                body = resp.read().decode("utf-8", errors="ignore")
+        except Exception:
+            continue
+        # Custom regex patterns
+        for name, pattern in _JS_SECRET_PATTERNS:
+            for m in _re.finditer(pattern, body):
+                val = m.group()
+                if val not in seen_secrets:
+                    seen_secrets.add(val)
+                    findings.append(f"[{name}] {val}  ({js_url})")
+        # Source maps
+        for m in _SOURCE_MAP_RE.finditer(body):
+            sm_url = m.group(1)
+            if not sm_url.startswith("http"):
+                base = js_url.rsplit("/", 1)[0]
+                sm_url = base.rstrip("/") + "/" + sm_url.lstrip("/")
+            findings.append(f"[sourcemap] {sm_url}  ({js_url})")
+            if findings.count(f"[sourcemap] {sm_url}") > 1:
+                continue
+            try:
+                sm_req = _urllib.Request(sm_url, headers={"User-Agent": "Mozilla/5.0"})
+                with _urllib.urlopen(sm_req, timeout=15) as sm_resp:
+                    sm_body = sm_resp.read().decode("utf-8", errors="ignore")
+                import json as _json
+                sm_data = _json.loads(sm_body)
+                sources = sm_data.get("sources") or []
+                for src in sources:
+                    if isinstance(src, str):
+                        for name2, pattern2 in _JS_SECRET_PATTERNS:
+                            for m2 in _re.finditer(pattern2, src):
+                                val2 = m2.group()
+                                if val2 not in seen_secrets:
+                                    seen_secrets.add(val2)
+                                    findings.append(f"  [sourcemap-{name2}] {val2}")
+            except Exception:
+                continue
+    out = ensure(outdir / "js_secrets_deep.txt")
+    out.write_text("\n".join(findings) + ("\n" if findings else "no additional secrets found\n"))
+    log("ok", f"K: {len(findings)} deep JS findings → {out}")
+    return {"K": str(out), "count": len(findings)}
+# ─────────────── Phase L: auth bypass + mass assignment ─────────────────────
+_AUTH_BYPASS_HEADERS = [
+    "X-Original-URL",
+    "X-Rewrite-URL",
+    "X-Forwarded-For",
+    "X-Forwarded-Host",
+    "X-Host",
+    "X-Forwarded-Scheme",
+    "X-Real-IP",
+    "Client-IP",
+    "X-Custom-IP-Authorization",
+    "X-Auth-Token",
+    "X-Auth-User",
+    "Authorization: Basic YWRtaW46YWRtaW4=",
+]
+_MASS_ASSIGN_FIELDS = [
+    "admin", "is_admin", "role", "roles", "permissions",
+    "is_teacher", "is_student", "group", "user_type",
+    "balance", "points", "score", "grade", "completed",
+    "approved", "verified", "active", "enabled",
+    "plan", "tier", "subscription",
+]
+async def phase_L(outdir: Path, t: Tools, only: PhaseSet,
+                  skip: PhaseSet) -> Dict[str, Any]:
+    if skip & {"L"}:
+        return {}
+    log("info", "Phase L: auth bypass headers + mass assignment probes")
+    findings: List[str] = []
+    # 1. Collect API-like endpoints from urls_all.txt + ffuf output
+    urls = outdir / "urls_all.txt"
+    api_endpoints: Set[str] = set()
+    if urls.exists():
+        for u in read_lines(urls):
+            path = u.split("?")[0].split("#")[0].lower()
+            if "/api/" in path or path.endswith(("/api", "/account", "/login",
+               "/register", "/password", "/user", "/admin", "/graphql")):
+                api_endpoints.add(u)
+    # Also check ffuf output for 200/301/302/403 endpoints
+    for ff in outdir.glob("ffuf_*.txt"):
+        if ff.exists() and ff.name != "fuzz.txt":
+            for ln in read_lines(ff):
+                parts = ln.split("\t", 1)
+                if len(parts) == 2:
+                    api_endpoints.add(parts[1])
+    if not api_endpoints:
+        # Fall back to first 10 urls
+        api_endpoints = set(read_lines(urls)[:10]) if urls.exists() else set()
+    if not api_endpoints:
+        log("warn", "L: no endpoints found; skipping")
+        return {"L": str(outdir / "auth_bypass.txt"), "count": 0}
+    findings.append(f"target_endpoints={len(api_endpoints)}")
+    for ep in sorted(api_endpoints)[:20]:
+        findings.append(f"  endpoint={ep}")
+    # 2. Auth bypass header probes (non-destructive)
+    bypass_found: List[str] = []
+    for ep in sorted(api_endpoints)[:5]:
+        for hdr in _AUTH_BYPASS_HEADERS:
+            try:
+                req = _urllib.Request(ep, method="GET")
+                if ":" in hdr:
+                    k, v = hdr.split(":", 1)
+                    req.add_header(k.strip(), v.strip())
+                else:
+                    req.add_header(hdr, "127.0.0.1")
+                with _urllib.urlopen(req, timeout=8) as resp:
+                    if resp.status == 200:
+                        bypass_found.append(f"  bypass={hdr} → {resp.status} on {ep}")
+            except Exception:
+                continue
+    findings.append("auth_bypass_probes:")
+    findings.extend(bypass_found or ["  none detected (expected)"])
+    # 3. Mass assignment probes on API POST endpoints (dry-run)
+    findings.append("mass_assignment_fields_to_test:")
+    for field in _MASS_ASSIGN_FIELDS:
+        findings.append(f"  try POST/PUT with body: {{\"{field}\": true}}")
+    out = ensure(outdir / "auth_bypass.txt")
+    out.write_text("\n".join(findings) + ("\n" if findings else ""))
+    log("ok", f"L: {len(findings)} auth bypass findings → {out}")
+    return {"L": str(out), "count": len(bypass_found)}
 # ───────────────────────────── report writers ──────────────────────────────
 def _counts(outdir: Path) -> Dict[str, int]:
     keys = {
@@ -1212,10 +1577,13 @@ def _counts(outdir: Path) -> Dict[str, int]:
         "urls":        outdir / "urls_all.txt",
         "js_urls":     outdir / "urls_js.txt",
         "js_secrets":  outdir / "js_secrets.txt",
+        "js_deep":     outdir / "js_secrets_deep.txt",
         "params":      outdir / "params.txt",
         "fuzz":        outdir / "fuzz.txt",
         "nuclei":      outdir / "nuclei_combined.txt",
         "tls_wp":      outdir / "tls_wp.txt",
+        "origin":      outdir / "origin.txt",
+        "auth_bypass": outdir / "auth_bypass.txt",
         "vulns":       outdir / "vulns.txt",
         "oast":        outdir / "oast" / "callbacks.txt",
     }
@@ -1262,8 +1630,9 @@ def write_html(outdir: Path, domain: str, counts: Dict[str, int],
     sections = []
     for key in ("all_subs.txt", "resolved.txt", "hosts.txt", "ports.txt",
                 "takeover.txt", "urls_all.txt", "js_secrets.txt",
-                "params.txt", "fuzz.txt", "nuclei_combined.txt",
-                "tls_wp.txt", "vulns.txt"):
+                "js_secrets_deep.txt", "params.txt", "fuzz.txt",
+                "nuclei_combined.txt", "tls_wp.txt",
+                "origin.txt", "auth_bypass.txt", "vulns.txt"):
         p = outdir / key
         if p.exists():
             txt = p.read_text(errors="ignore")
@@ -1321,6 +1690,10 @@ PIPELINE = [
     ("F1", phase_F1, ("outdir", "t", "only", "skip")),
     ("F2", phase_F2, ("outdir", "t", "only", "skip")),
     ("G",  phase_G,  ("outdir", "t", "only", "skip", "oast_domain")),
+    ("G2", phase_G2, ("outdir", "t", "only", "skip", "prev")),
+    ("J",  phase_J,  ("domain", "outdir", "t", "only", "skip", "prev")),
+    ("K",  phase_K,  ("outdir", "t", "only", "skip")),
+    ("L",  phase_L,  ("outdir", "t", "only", "skip")),
 ]
 # Dependency-ordered execution stages. Phases in the same stage are independent
 # of one another (they only read artifacts produced by *earlier* stages, never
@@ -1333,7 +1706,7 @@ STAGES: List[List[str]] = [
     ["A2"],
     ["B1"],
     ["C1"],
-    ["C2", "D", "E", "F1", "F2", "G"],
+    ["C2", "D", "E", "F1", "F2", "G", "G2", "J", "K", "L"],
 ]
 def _atomic_write_json(path: Path, payload: dict) -> None:
     """Write JSON atomically: temp file + rename, so a mid-write crash
@@ -1524,15 +1897,130 @@ async def run_pipeline(args: argparse.Namespace) -> int:
     log("ok", f"report  → {mj}")
     progress.close()
     return 0
+# ────────────────────────── interactive setup ──────────────────────────────
+_RECON_LEVELS = {
+    "1": {
+        "name": "Basic reconnaissance",
+        "desc": "Subdomains → DNS → Ports/HTTP → URLs → Report (fast, no vuln scanning)",
+        "phases": {"A1", "A2", "B1", "C1", "I"},
+    },
+    "2": {
+        "name": "Standard assessment",
+        "desc": "Basic + JS secrets + params + fuzzing + nuclei + TLS/WordPress",
+        "phases": {"A1", "A2", "B1", "C1", "C2", "D", "E", "F1", "F2", "I"},
+    },
+    "full": {
+        "name": "Full audit",
+        "desc": "Standard + SSTI + origin bypass + deep JS + auth bypass/mass assignment",
+        "phases": VALID_PHASES - {"H"},
+    },
+}
+def _prompt(prompt_text: str, default: str = "",
+            validator: Optional[Callable[[str], bool]] = None,
+            error_msg: str = "") -> str:
+    while True:
+        suffix = f" [{default}]" if default else ""
+        val = input(f"  {prompt_text}{suffix}: ").strip()
+        if not val and default:
+            return default
+        if not val:
+            continue
+        if validator is None or validator(val):
+            return val
+        log("err", error_msg or "invalid input")
+def _prompt_yes_no(prompt_text: str, default: bool = True) -> bool:
+    suffix = " [Y/n]" if default else " [y/N]"
+    val = input(f"  {prompt_text}{suffix}: ").strip().lower()
+    if not val:
+        return default
+    return val in ("y", "yes")
+def _banner() -> None:
+    banner = f"""
+{C['c']}╔══════════════════════════════════════════╗
+║         {C['g']}ReconChain v{__version__}{C['c']}            ║
+║   {C['d']}Automated recon & vulnerability pipeline{C['c']}   ║
+╚══════════════════════════════════════════╝{C['r']}
+"""
+    print(banner, flush=True)
+def interactive_setup() -> argparse.Namespace:
+    _banner()
+    log("info", "Interactive setup — press Ctrl+C anytime to abort\n")
+    # 1. Domain
+    domain = _prompt("Target domain (e.g. example.com)",
+                     validator=_is_valid_hostname,
+                     error_msg="Enter a valid domain with at least one dot")
+    # 2. Recon level
+    print(f"\n{C['b']}Recon levels:{C['r']}")
+    for key, lvl in sorted(_RECON_LEVELS.items()):
+        print(f"  {C['y']}{key:4}{C['r']} {lvl['name']}")
+        print(f"       {C['d']}{lvl['desc']}{C['r']}")
+    level = _prompt("Choose recon level", default="full",
+                    validator=lambda v: v in _RECON_LEVELS,
+                    error_msg="Enter 1, 2, or full")
+    base_phases = _RECON_LEVELS[level]["phases"]
+    # 3. Output directory
+    out = _prompt("Output directory", default=f"./out_{domain}")
+    # 4. Concurrent jobs
+    jobs_str = _prompt("Max parallel processes", default=str(MAX_PARALLEL_JOBS),
+                       validator=lambda v: v.isdigit() and int(v) > 0,
+                       error_msg="Enter a positive number")
+    jobs = int(jobs_str)
+    # 5. Manual testing add-ons (only for level 2 / full)
+    extra_phases: Set[str] = set()
+    if level in ("2", "full"):
+        print(f"\n{C['b']}Additional manual-testing phases:{C['r']}")
+        for p, desc in [("G2", "SSTI fuzzing"),
+                        ("J",  "Origin IP bypass (Cloudflare)"),
+                        ("K",  "Deep JS secret scanning"),
+                        ("L",  "Auth bypass + mass assignment probes")]:
+            if _prompt_yes_no(f"Run {C['y']}{p}{C['r']} - {desc}",
+                              default=(level == "full")):
+                extra_phases.add(p)
+    selected = base_phases | extra_phases
+    # 6. Resume
+    state_path = Path(out) / "state.json"
+    resume = False
+    if state_path.exists():
+        resume = _prompt_yes_no("State file exists — resume previous scan", default=True)
+    # 7. Summary
+    print(f"\n{C['b']}{'─' * 50}{C['r']}")
+    print(f" {C['g']}Scan summary:{C['r']}")
+    print(f"   Domain:     {C['y']}{domain}{C['r']}")
+    print(f"   Output:     {C['y']}{out}{C['r']}")
+    print(f"   Level:      {C['y']}{level}{C['r']}")
+    print(f"   Phases:     {C['y']}{', '.join(sorted(selected))}{C['r']}")
+    print(f"   Jobs:       {C['y']}{jobs}{C['r']}")
+    print(f"   Resume:     {C['y']}{'yes' if resume else 'no'}{C['r']}")
+    print(f" {C['b']}{'─' * 50}{C['r']}")
+    if not _prompt_yes_no("Start scan", default=True):
+        log("info", "Aborted by user")
+        sys.exit(0)
+    # Build a namespace that run_pipeline expects
+    class NS:
+        pass
+    ns = NS()
+    ns.domain = domain
+    ns.out = out
+    ns.only = selected
+    ns.skip = set()
+    ns.jobs = jobs
+    ns.fast = False
+    ns.resume = resume
+    ns.quiet = False
+    ns.no_color = False
+    ns.interactive = False
+    return ns
 # ─────────────────────────────────── main ──────────────────────────────────
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="reconchain",
         description="Chain recon tools into a single orchestrated pipeline.")
-    p.add_argument("-d", "--domain", required=True, type=_domain_arg,
+    p.add_argument("-d", "--domain", type=str, default="",
                    help="target root domain, e.g. example.com")
     p.add_argument("-o", "--out", default="./out",
                    help="output directory (default: ./out)")
+    p.add_argument("-i", "--interactive", action="store_true",
+                   help="interactive setup wizard (prompts for domain, level, etc.)")
     p.add_argument("--only", default=set(), type=_parse_phase_csv,
                    help="comma-separated phases to run, e.g. A1,A2,B1")
     p.add_argument("--skip", default=set(), type=_parse_phase_csv,
@@ -1551,11 +2039,18 @@ def build_parser() -> argparse.ArgumentParser:
                    help="disable ANSI color output")
     return p
 def main() -> int:
-    args = build_parser().parse_args()
+    parser = build_parser()
+    args = parser.parse_args()
+    if args.interactive:
+        args = interactive_setup()
+    else:
+        if not args.domain or not _is_valid_hostname(args.domain):
+            parser.error("the following arguments are required: -d/--domain (or use -i for interactive)")
+        args.domain = args.domain.rstrip(".").lower()
     if args.no_color:
         disable_color()
     if args.only and args.skip and (args.only & args.skip):
-        build_parser().error(
+        parser.error(
             "phase(s) cannot be both --only and --skip: "
             + ", ".join(sorted(args.only & args.skip))
         )

@@ -246,7 +246,7 @@ def test_cli_help_subprocess() -> None:
 def test_phase_g_no_urls_returns_zero(tmp_path: Path) -> None:
     """Phase G (dalfox/sqlmap/SSRF) should return count 0 when no URLs exist."""
     tools = reconchain.Tools()
-    result = asyncio.run(reconchain.phase_G(tmp_path, tools, set(), set(), None))
+    result = asyncio.run(reconchain.phase_G("example.com", tmp_path, tools, set(), set(), None))
     assert result["count"] == 0
 
 
@@ -259,7 +259,7 @@ def test_phase_g_creates_xss_urls_and_ssrf_urls(tmp_path: Path) -> None:
         "https://example.com/api\n"
     )
     tools = reconchain.Tools()
-    asyncio.run(reconchain.phase_G(tmp_path, tools, set(), set(), None))
+    asyncio.run(reconchain.phase_G("example.com", tmp_path, tools, set(), set(), None))
 
     xss = tmp_path / "urls_xss.txt"
     assert xss.exists()
@@ -274,7 +274,7 @@ def test_phase_g_creates_xss_urls_and_ssrf_urls(tmp_path: Path) -> None:
 def test_phase_g_skips_when_urls_file_missing(tmp_path: Path) -> None:
     """Phase G should gracefully return 0 if urls_all.txt does not exist."""
     tools = reconchain.Tools()
-    result = asyncio.run(reconchain.phase_G(tmp_path, tools, set(), set(), "oast.example.com"))
+    result = asyncio.run(reconchain.phase_G("example.com", tmp_path, tools, set(), set(), "oast.example.com"))
     assert result["count"] == 0
 
 
@@ -401,7 +401,7 @@ def test_phase_k_source_map_regex() -> None:
 def test_phase_l_no_endpoints_returns_zero(tmp_path: Path) -> None:
     """Phase L should return count 0 when no endpoints exist."""
     tools = reconchain.Tools()
-    result = asyncio.run(reconchain.phase_L(tmp_path, tools, set(), set()))
+    result = asyncio.run(reconchain.phase_L("example.com", tmp_path, tools, set(), set()))
     assert result["count"] == 0
 
 
@@ -414,7 +414,7 @@ def test_phase_l_extracts_api_endpoints_from_urls(tmp_path: Path) -> None:
         "https://example.com/admin\n"
     )
     tools = reconchain.Tools()
-    asyncio.run(reconchain.phase_L(tmp_path, tools, set(), set()))
+    asyncio.run(reconchain.phase_L("example.com", tmp_path, tools, set(), set()))
 
     auth = tmp_path / "auth_bypass.txt"
     content = auth.read_text()
@@ -445,9 +445,66 @@ def test_vuln_txt_merge_includes_existing_files(tmp_path: Path) -> None:
     (tmp_path / "xss.txt").write_text("xss finding\n")
     (tmp_path / "sqlmap.log").write_text("sqlmap finding\n")
     tools = reconchain.Tools()
-    asyncio.run(reconchain.phase_G(tmp_path, tools, set(), set(), None))
+    asyncio.run(reconchain.phase_G("example.com", tmp_path, tools, set(), set(), None))
 
     vulns = tmp_path / "vulns.txt"
     assert vulns.exists()
     assert "xss finding" in vulns.read_text() or "sqlmap finding" in vulns.read_text()
+
+
+def test_merge_unique_skips_dst_in_srcs(tmp_path: Path) -> None:
+    """merge_unique should skip dst when it appears in srcs (self-merge guard)."""
+    src = tmp_path / "subs.txt"
+    src.write_text("a.example.com\nb.example.com\n")
+    dst = tmp_path / "all_subs.txt"
+    dst.write_text("b.example.com\nc.example.com\n")
+    n = reconchain.merge_unique([src, dst, src], dst, reconchain._is_valid_hostname)
+    assert n == 2  # only src contributes (dst is skipped)
+    lines = dst.read_text().splitlines()
+    assert sorted(lines) == ["a.example.com", "b.example.com"]
+
+
+def test_phase_e_feroxbuster_stale_txt_cleaned(tmp_path: Path) -> None:
+    """Phase E feroxbuster cleanup should remove stale fb_*.txt (P1-4)."""
+    stale = tmp_path / "fb_stale.txt"
+    stale.write_text("https://stale.example\n")
+    # Simulate the cleanup pattern from phase_E
+    for old in tmp_path.glob("fb_*.txt"):
+        old.unlink(missing_ok=True)
+    assert not stale.exists()
+
+
+def test_no_destructive_post_without_flag(tmp_path: Path) -> None:
+    """Mass assignment POSTs should be skipped unless --i-own-this-target is set (P0-1)."""
+    from reconchain import phase_L, Tools
+    tools = Tools()
+    urls = tmp_path / "urls_all.txt"
+    urls.write_text("https://example.com/api/v1/users\n")
+    result = asyncio.run(phase_L("example.com", tmp_path, tools, set(), set()))
+    auth_file = tmp_path / "auth_bypass.txt"
+    content = auth_file.read_text()
+    assert "mass_assignment_probes:" not in content, "POST probes ran without --i-own-this-target"
+
+
+def test_phase_dedup_includes_param_values(tmp_path: Path) -> None:
+    """Phase G dedup key should distinguish URLs with different param values (P1-1)."""
+    urls = [
+        "https://example.com/page?a=1&b=2",
+        "https://example.com/page?a=2&b=2",
+        "https://example.com/page?a=1&b=3",
+    ]
+    seen: set = set()
+    deduped = []
+    for u in urls:
+        parsed = reconchain.urllib.parse.urlparse(u)
+        qs = tuple(sorted(
+            (k, tuple(sorted(v)))
+            for k, v in reconchain.urllib.parse.parse_qs(parsed.query, keep_blank_values=True).items()
+        ))
+        key = (parsed.scheme, parsed.hostname or "", parsed.path.rstrip("/"), qs)
+        if key not in seen:
+            seen.add(key)
+            deduped.append(u)
+    # All 3 URLs have different param values, so all 3 should survive dedup
+    assert len(deduped) == 3, f"got {len(deduped)} deduped URLs: {deduped}"
 

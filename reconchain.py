@@ -32,9 +32,11 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import contextvars
 import hashlib
 import inspect
 import json
+import math
 import os
 import re
 import shlex
@@ -46,7 +48,7 @@ import sys
 import time
 import urllib.request
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
@@ -120,6 +122,26 @@ VALID_PHASES = {
 }
 FAST_PHASES = {"A1", "A2", "B1", "C1", "I"}
 PhaseSet = Set[str]
+
+# Phase dependency graph: each phase lists its required predecessors.
+# Used by --only/--skip validation to prevent silent zero-output runs.
+PHASE_DEPS: Dict[str, Set[str]] = {
+    "A2": {"A1"},
+    "A3": {"A1"},
+    "B1": {"A1", "A2"},
+    "C1": {"A1", "A2"},
+    "C2": {"A1", "A2", "C1"},
+    "D": {"A1", "A2", "C1"},
+    "E": {"A1", "A2", "B1", "C1"},
+    "F1": {"A1", "A2", "B1"},
+    "F2": {"A1", "A2", "B1"},
+    "G": {"A1", "A2", "B1", "C1"},
+    "G2": {"A1", "A2", "B1", "C1"},
+    "H": {"G"},
+    "J": {"A1", "A2", "B1"},
+    "K": {"A1", "A2", "C1"},
+    "L": {"A1", "A2", "B1", "C1", "D", "E"},
+}
 
 
 def _is_valid_hostname(s: str) -> bool:
@@ -204,7 +226,7 @@ def disable_color() -> None:
 
 
 def log(lvl: str, msg: str) -> None:
-    ts = datetime.now().strftime("%H:%M:%S")
+    ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
     tqdm.write(f"{C['d']}{ts}{C['r']} {LVL[lvl]}[{lvl.upper():4}]{C['r']} {msg}")
 
 
@@ -257,9 +279,11 @@ class PipelineConfig:
     sample_endpoints_l: int = 20
     sample_urls_xss_blind: int = 20
     sample_urls_ssti: int = 5
-    sample_endpoints_post: int = 5
+    sample_endpoints_post: int = 0  # default 0 (opt-in via --i-own-this-target or explicit --sample-endpoints-post)
     sample_endpoints_cors: int = 10
     nuclei_exclude_tags: str = ""
+    nuclei_severity_default: str = "low,medium,high,critical"
+    i_own_this_target: bool = False
     cookie: str = ""
     extra_headers: List[str] = None  # type: ignore[assignment]
     proxy: str = ""
@@ -306,26 +330,19 @@ def _run_blocking(
     with log_path.open("wb") as logf:
         proc: Optional[subprocess.Popen[bytes]] = None
         try:
-            proc = subprocess.Popen(
-                cmd,
+            popen_kwargs: Dict[str, Any] = dict(
                 cwd=str(cwd) if cwd else None,
                 stdout=logf,
                 stderr=subprocess.STDOUT,
-                start_new_session=True,
             )
+            if sys.platform != "win32":
+                popen_kwargs["start_new_session"] = True
+            proc = subprocess.Popen(cmd, **popen_kwargs)
             proc.wait(timeout=timeout)
             return proc.returncode, time.monotonic() - t0
         except subprocess.TimeoutExpired:
             if proc is not None and proc.poll() is None:
-                with contextlib.suppress(ProcessLookupError):
-                    os.killpg(proc.pid, signal.SIGTERM)
-                try:
-                    proc.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    with contextlib.suppress(ProcessLookupError):
-                        os.killpg(proc.pid, signal.SIGKILL)
-                    with contextlib.suppress(Exception):
-                        proc.wait(timeout=5)
+                _kill_process_tree(proc, timeout=5)
             with log_path.open("ab") as f:
                 f.write(f"\n[timeout after {timeout}s]\n".encode("utf-8"))
             return 124, time.monotonic() - t0
@@ -333,6 +350,34 @@ def _run_blocking(
             with log_path.open("ab") as f:
                 f.write(f"\n[binary not found: {e}]\n".encode("utf-8"))
             return 127, time.monotonic() - t0
+
+
+def _kill_process_tree(proc: subprocess.Popen[bytes], timeout: int = 5) -> None:
+    """Kill proc and its children via psutil (or SIGTERM fallback on POSIX)."""
+    try:
+        import psutil
+        parent = psutil.Process(proc.pid)
+        children = parent.children(recursive=True)
+        for child in children:
+            with contextlib.suppress(psutil.NoSuchProcess):
+                child.terminate()
+        parent.terminate()
+        _, alive = psutil.wait_procs(children + [parent], timeout=timeout)
+        for p in alive:
+            with contextlib.suppress(psutil.NoSuchProcess):
+                p.kill()
+    except ImportError:
+        # Fallback: traditional killpg on POSIX, nothing on Windows
+        if sys.platform != "win32":
+            with contextlib.suppress(ProcessLookupError, PermissionError):
+                os.killpg(proc.pid, signal.SIGTERM)
+            try:
+                proc.wait(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                with contextlib.suppress(ProcessLookupError, PermissionError):
+                    os.killpg(proc.pid, signal.SIGKILL)
+                with contextlib.suppress(Exception):
+                    proc.wait(timeout=timeout)
 
 
 async def _run(name: str, cmd: List[str], timeout: int, outdir: Path, note: str = "") -> StepResult:
@@ -350,15 +395,20 @@ async def _run(name: str, cmd: List[str], timeout: int, outdir: Path, note: str 
 # Concurrency cap so a phase with many jobs (e.g. phase E: 5 URLs × 3 fuzzers)
 # does not fork-bomb the host. Defaults to 2× CPU count (auto-scaled);
 # pass -j/--jobs to override.
-MAX_PARALLEL_JOBS = max(4, (os.cpu_count() or 4) * 2)
-# Process-wide job semaphore. When several independent phases run concurrently
-# (see STAGES), they all draw from this single semaphore so the total number of
-# live external processes stays bounded by MAX_PARALLEL_JOBS regardless of how
-# many phases are in flight. Created on the running loop in run_pipeline; falls
-# back to a fresh per-call semaphore when unset (e.g. a phase called directly
-# from a test).
-_JOB_SEM: Optional[asyncio.Semaphore] = None
-_PIPELINE_CFG: PipelineConfig = PipelineConfig()
+MAX_PARALLEL_JOBS = min(32, max(4, (os.cpu_count() or 4) * 2))
+# Contextvars so concurrent run_pipeline calls in the same event loop
+# (future feature / test / wrapper) do not race on module-level globals.
+_JOB_SEM_CTX: contextvars.ContextVar[Optional[asyncio.Semaphore]] = (
+    contextvars.ContextVar('_JOB_SEM', default=None)
+)
+_PIPELINE_CFG_CTX: contextvars.ContextVar['PipelineConfig'] = (
+    contextvars.ContextVar('_PIPELINE_CFG', default=PipelineConfig())
+)
+
+
+def _get_cfg() -> PipelineConfig:
+    """Return the current pipeline config from context, or a default."""
+    return _PIPELINE_CFG_CTX.get()
 
 
 class Progress:
@@ -376,7 +426,9 @@ class Progress:
 async def run_parallel(
     jobs: List[Tuple[str, List[str], int]], outdir: Path, desc: str = "jobs"
 ) -> List[StepResult]:
-    sem = _JOB_SEM if _JOB_SEM is not None else asyncio.Semaphore(MAX_PARALLEL_JOBS)
+    sem = _JOB_SEM_CTX.get()
+    if sem is None:
+        sem = asyncio.Semaphore(MAX_PARALLEL_JOBS)
     pbar = tqdm(total=len(jobs), desc=desc, leave=False)
 
     async def _guarded(n: str, c: List[str], t: int) -> StepResult:
@@ -736,20 +788,11 @@ async def phase_A2(
         return {"A2": str(out), "count": count_nonblank(out)}
     subs_file = Path(prev.get("A1") or outdir / "all_subs.txt")
 
-    # Streaming: poll for input from A1 (which may be writing incrementally)
-    if not subs_file.exists() or subs_file.stat().st_size == 0:
-        log("info", "A2: waiting for subdomains from A1…")
-        for _ in range(60):  # up to ~5 min
-            await asyncio.sleep(5)
-            if subs_file.exists() and subs_file.stat().st_size > 0:
-                break
-        else:
-            log("warn", "A2: A1 produced no subdomains within timeout; skipping")
-            return {"A2": str(out), "count": 0}
-
+    # Streaming: single time-budget loop combining initial wait + polling (P1-8)
     log("info", "Phase A2: dnsx resolution (streaming)")
     _a2_processed: Set[str] = set()
     _a2_stable_count = 0
+    _a2_total_budget = 0
 
     async def _resolve_batch(batch_subs: Path) -> int:
         """Run dnsx on a batch of subdomains, append results to resolved files."""
@@ -777,24 +820,35 @@ async def phase_A2(
         tmp.unlink(missing_ok=True)
         return 0
 
-    # Process initial available subdomains
-    n = await _resolve_batch(subs_file)
-    log("info", f"A2: resolved {n} initial hosts")
-
-    # Poll for new subdomains while A1 may still be running (up to 10 min total)
-    for _ in range(40):  # 40 * 15s = 10 min ceiling
-        await asyncio.sleep(15)
-        new_subs = [s.strip().lower() for s in read_lines(subs_file)
-                    if s.strip() and s.strip().lower() not in _a2_processed]
-        if not new_subs:
-            _a2_stable_count += 1
-            if _a2_stable_count >= 4:  # no new subs for ~1min → assume A1 done
-                break
+    # Single poll loop: up to ~15 min total, 15s intervals
+    for _ in range(60):  # 60 * 15s = 15 min ceiling
+        if not subs_file.exists() or not read_lines(subs_file):
+            await asyncio.sleep(15)
+            _a2_total_budget += 15
             continue
-        _a2_stable_count = 0
-        new_count = await _resolve_batch(subs_file)
-        if new_count:
-            log("info", f"A2: resolved {new_count} more hosts (streaming batch)")
+        if _a2_total_budget == 0:
+            # First time we see data — process initial batch
+            n = await _resolve_batch(subs_file)
+            log("info", f"A2: resolved {n} initial hosts")
+        else:
+            # Poll for new subdomains
+            new_subs = [s.strip().lower() for s in read_lines(subs_file)
+                        if s.strip() and s.strip().lower() not in _a2_processed]
+            if not new_subs:
+                _a2_stable_count += 1
+                if _a2_stable_count >= 4:  # no new subs for ~1min → assume A1 done
+                    break
+            else:
+                _a2_stable_count = 0
+                new_count = await _resolve_batch(subs_file)
+                if new_count:
+                    log("info", f"A2: resolved {new_count} more hosts (streaming batch)")
+        await asyncio.sleep(15)
+        _a2_total_budget += 15
+    else:
+        if not read_lines(out):
+            log("warn", "A2: A1 produced no subdomains within timeout; skipping")
+            return {"A2": str(out), "count": 0}
 
     c = count_nonblank(out)
     log("info", f"A2: {c} total unique hosts resolved")
@@ -1331,7 +1385,7 @@ async def phase_D(
     log("info", f"D: {len(read_lines(urls))} raw URLs → {len(_d_urls)} unique paths")
     jobs: List[Tuple[str, List[str], int]] = []
     if t.has("paramspider"):
-        for u in _d_urls[:_PIPELINE_CFG.sample_urls_pspider]:
+        for u in _d_urls[:_get_cfg().sample_urls_pspider]:
             # ParamSpider -d expects a domain, not a full URL
             domain_for_ps = _extract_domain(u)
             out_part = outdir / f"params_spider_{safe_suffix(u)}.txt"
@@ -1353,7 +1407,7 @@ async def phase_D(
     # Over Tor these are very slow — sample URLs heavily
     if t.has("arjun"):
         arjun_in = ensure(outdir / "urls_arjun_sample.txt")
-        arjun_urls = _d_urls[:_PIPELINE_CFG.sample_urls_params]
+        arjun_urls = _d_urls[:_get_cfg().sample_urls_params]
         if arjun_urls:
             arjun_in.write_text("\n".join(arjun_urls) + "\n")
             jobs.append(
@@ -1361,7 +1415,7 @@ async def phase_D(
             )
     if t.has("x8"):
         x8_in = ensure(outdir / "urls_x8_sample.txt")
-        x8_urls = _d_urls[:_PIPELINE_CFG.sample_urls_params]
+        x8_urls = _d_urls[:_get_cfg().sample_urls_params]
         if x8_urls:
             x8_in.write_text("\n".join(x8_urls) + "\n")
             jobs.append(("x8", ["x8", "-u", str(x8_in), "-o", str(outdir / "params_x8.json")], 1800))
@@ -1472,6 +1526,25 @@ def _dedupe_by_host_path(urls: List[str]) -> List[str]:
     return result
 
 
+def _find_artifact(outdir: Path, phase_name: str) -> Optional[Path]:
+    """Resume helper: scan outdir for a known artifact filename by phase name.
+    Used when state.json predates outdir tracking (P1-7)."""
+    phase_to_file = {
+        "A1": "all_subs.txt", "A2": "resolved.txt", "A3": "all_subs.txt",
+        "B1": "hosts.txt", "C1": "urls_all.txt", "C2": "js_secrets.txt",
+        "D": "params.txt", "E": "fuzz.txt",
+        "F1": "nuclei_combined.txt", "F2": "tls_wp.txt",
+        "G": "vulns.txt", "G2": "ssti.txt",
+        "J": "origin.txt", "K": "js_secrets_deep.txt", "L": "auth_bypass.txt",
+    }
+    fname = phase_to_file.get(phase_name)
+    if fname:
+        candidate = outdir / fname
+        if candidate.exists():
+            return candidate
+    return None
+
+
 async def phase_E(outdir: Path, t: Tools, only: PhaseSet, skip: PhaseSet, force: bool = False) -> Dict[str, Any]:
     if skip & {"E"}:
         return {}
@@ -1484,7 +1557,7 @@ async def phase_E(outdir: Path, t: Tools, only: PhaseSet, skip: PhaseSet, force:
     # Dedupe by (host, path) so URLs differing only in query params
     # don't all get fuzzed independently — saves significant time.
     deduped = _dedupe_by_host_path(all_urls)
-    sample = deduped[:_PIPELINE_CFG.sample_urls_fuzz]
+    sample = deduped[:_get_cfg().sample_urls_fuzz]
     log("info", f"E: {len(all_urls)} raw URLs → {len(deduped)} unique paths, sampling {len(sample)}")
     wordlist = os.environ.get(
         "FFUF_WORDLIST",
@@ -1608,6 +1681,8 @@ async def phase_E(outdir: Path, t: Tools, only: PhaseSet, skip: PhaseSet, force:
         old.unlink(missing_ok=True)
     for old in outdir.glob("kr_*.txt"):
         old.unlink(missing_ok=True)
+    for old in outdir.glob("fb_*.txt"):  # P1-4: feroxbuster partial output
+        old.unlink(missing_ok=True)
     normalized: List[Path] = []
     for ffp in outdir.glob("ffuf_*.json"):
         norm = ffp.with_suffix(".txt")
@@ -1680,15 +1755,15 @@ async def phase_F1(outdir: Path, t: Tools, only: PhaseSet, skip: PhaseSet, force
             "nuclei", "-silent", "-l", str(hosts),
             "-H", "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
         ]
-        if _PIPELINE_CFG.rate_limit:
-            nuclei_base += ["-rl", str(_PIPELINE_CFG.rate_limit)]
+        if _get_cfg().rate_limit:
+            nuclei_base += ["-rl", str(_get_cfg().rate_limit)]
         # Bulk-size: process multiple templates per host for faster scans
         nuclei_base += ["-bs", "25"]
         # Tags: prefer cves, exposures for high-signal findings; exclude
         # info-severity templates that add noise on large targets.
         nuclei_tags = ["cves", "exposures", "misconfig", "vulnerabilities"]
-        if _PIPELINE_CFG.nuclei_exclude_tags:
-            nuclei_base += ["-et", _PIPELINE_CFG.nuclei_exclude_tags]
+        if _get_cfg().nuclei_exclude_tags:
+            nuclei_base += ["-et", _get_cfg().nuclei_exclude_tags]
         jobs.append(
             (
                 "nuclei-cves",
@@ -1717,14 +1792,16 @@ async def phase_F1(outdir: Path, t: Tools, only: PhaseSet, skip: PhaseSet, force
                 "tech-scanner",
                 nuclei_base
                 + ["-t", "http/technologies",
-                   "-o", str(outdir / "tech.txt")]
+                   "-severity", _get_cfg().nuclei_severity_default,
+                   "-o", str(outdir / "nuclei_tech.txt")]
                 + _proxy_opt,
                 3600,
             )
         )
     await run_parallel(jobs, outdir)
     n = merge_unique(
-        [outdir / "nuclei.txt", outdir / "nuclei_headless.txt", outdir / "tech.txt"],
+        [outdir / "nuclei.txt", outdir / "nuclei_headless.txt",
+         outdir / "nuclei_tech.txt", outdir / "tech.txt"],
         outdir / "nuclei_combined.txt",
     )
     return {"F1": str(outdir / "nuclei_combined.txt"), "count": n}
@@ -1747,7 +1824,7 @@ async def phase_F2(outdir: Path, t: Tools, only: PhaseSet, skip: PhaseSet, force
     if not hosts.exists() or not read_lines(hosts):
         log("warn", "F2: no hosts; skipping")
         return {"F2": str(outdir / "tls_wp.txt"), "count": 0}
-    sample = read_lines(hosts)[:_PIPELINE_CFG.sample_hosts_ssl]
+    sample = read_lines(hosts)[:_get_cfg().sample_hosts_ssl]
     testssl_bin = "testssl.sh" if t.has("testssl.sh") else ("testssl" if t.has("testssl") else None)
     # testssl: write PER-HOST files via a runner (no shared `>>` file ⇒ no race).
     testssl_jobs: List[Tuple[str, List[str], int]] = []
@@ -1809,33 +1886,32 @@ async def phase_F2(outdir: Path, t: Tools, only: PhaseSet, skip: PhaseSet, force
     # Skip if the host doesn't appear to be WordPress (check multiple indicators).
     wpscan_jobs: List[Tuple[str, List[str], int]] = []
     if t.has("wpscan"):
-        for h in sample:
+
+        async def _check_wp(h: str) -> Optional[str]:
+            """Concurrent WP pre-check: returns host if WordPress detected, None otherwise."""
             if not h.startswith(("http://", "https://")):
-                continue
-            # Quick pre-check: is this WordPress? Check multiple paths + homepage body
-            # to reduce false negatives from hardened / hidden wp-login.php.
-            wp_found = False
+                return None
             for wp_path in ("/wp-login.php", "/wp-content/", "/wp-includes/"):
                 try:
                     req = urllib.request.Request(h.rstrip("/") + wp_path, method="HEAD")
                     with urllib.request.urlopen(req, timeout=10) as resp:
                         if resp.status in (200, 301, 302, 403, 401):
-                            wp_found = True
-                            break
+                            return h
                 except Exception:
                     continue
-            if not wp_found:
-                # Check homepage body for WordPress markers
-                try:
-                    req = urllib.request.Request(h, method="GET", headers={"User-Agent": "Mozilla/5.0"})
-                    with urllib.request.urlopen(req, timeout=10) as resp:
-                        body = resp.read().decode("utf-8", errors="ignore").lower()
-                        if "wp-content" in body or "wordpress" in body:
-                            wp_found = True
-                except Exception:
-                    pass
-            if not wp_found:
-                log("warn", f"F2: {h} does not appear to be WordPress, skipping wpscan")
+            try:
+                req = urllib.request.Request(h, method="GET", headers={"User-Agent": "Mozilla/5.0"})
+                with urllib.request.urlopen(req, timeout=10) as resp:
+                    body = resp.read().decode("utf-8", errors="ignore").lower()
+                    if "wp-content" in body or "wordpress" in body:
+                        return h
+            except Exception:
+                pass
+            return None
+
+        wp_results = await asyncio.gather(*[_check_wp(h) for h in sample])
+        for h in wp_results:
+            if h is None:
                 continue
             wps_out = outdir / f"wpscan_{safe_suffix(h)}.txt"
             wpscan_cmd = ["wpscan", "--url", h, "--no-banner",
@@ -1861,7 +1937,7 @@ async def phase_F2(outdir: Path, t: Tools, only: PhaseSet, skip: PhaseSet, force
 
 
 async def phase_G(
-    outdir: Path, t: Tools, only: PhaseSet, skip: PhaseSet, oast_domain: Optional[str], force: bool = False,
+    domain: str, outdir: Path, t: Tools, only: PhaseSet, skip: PhaseSet, oast_domain: Optional[str], force: bool = False,
 ) -> Dict[str, Any]:
     if skip & {"G"}:
         return {}
@@ -1874,13 +1950,16 @@ async def phase_G(
     if not all_urls:
         log("warn", "G: no URLs; skipping")
         return {"G": str(outdir / "vulns.txt"), "count": 0}
-    # Dedupe by (host, path, sorted param keys) — keep URLs with different param names
-    _g_seen: Set[Tuple[str, str, str, str]] = set()
+    # Dedupe by (host, path, param key-value pairs) — P1-1: include values, not just keys
+    _g_seen: Set[Tuple[str, str, str, Tuple[Tuple[str, Tuple[str, ...]], ...]]] = set()
     _g_deduped: List[str] = []
     for u in all_urls:
         parsed = urllib.parse.urlparse(u)
-        qs = frozenset(urllib.parse.parse_qs(parsed.query))
-        key = (parsed.scheme, parsed.hostname or "", parsed.path.rstrip("/"), str(sorted(qs)))
+        qs = tuple(sorted(
+            (k, tuple(sorted(v)))
+            for k, v in urllib.parse.parse_qs(parsed.query, keep_blank_values=True).items()
+        ))
+        key = (parsed.scheme, parsed.hostname or "", parsed.path.rstrip("/"), qs)
         if key not in _g_seen:
             _g_seen.add(key)
             _g_deduped.append(u)
@@ -1926,8 +2005,8 @@ async def phase_G(
             f"IN={shlex.quote(str(xss_in))}\n"
             f"DIR={shlex.quote(str(sqlmap_dir))}\n"
             'mkdir -p "$DIR"\n'
-            f'sqlmap -m "$IN" --batch --level={_PIPELINE_CFG.sqlmap_level} --risk={_PIPELINE_CFG.sqlmap_risk} --random-agent '
-            f'--delay={max(_PIPELINE_CFG.delay, 2)} --time-sec=10 '
+            f'sqlmap -m "$IN" --batch --level={_get_cfg().sqlmap_level} --risk={_get_cfg().sqlmap_risk} --random-agent '
+            f'--delay={max(_get_cfg().delay, 2)} --time-sec=10 '
             f'--output-dir="$DIR" > "$OUT" 2>&1 || true\n'
         )
         runner.chmod(0o755)
@@ -1935,7 +2014,8 @@ async def phase_G(
     ssrf_urls = [
         u
         for u in all_urls
-        if any(k in u.lower() for k in (
+        if _is_under_domain(_extract_domain(u), domain)  # scope safety (P0-2)
+        and any(k in u.lower() for k in (
             "url=", "uri=", "path=", "dest=", "redirect=", "img=",
             "target=", "site=", "view=", "domain=", "feed=", "host=",
             "to=", "out=", "callback=", "load=", "fetch=", "proxy=",
@@ -1955,6 +2035,10 @@ async def phase_G(
             "#!/usr/bin/env python3\n"
             '"""SSRF probe: rewrite URL parameters to point at OAST listener and internal targets."""\n'
             "import os, random, sys, urllib.request, urllib.parse\n"
+            "class _NoRedirect(urllib.request.HTTPRedirectHandler):\n"
+            "    def redirect_request(self, req, fp, code, msg, headers, newurl):\n"
+            "        return None\n"
+            "_opener = urllib.request.build_opener(_NoRedirect)\n"
             f"OAST = {shlex.quote(oast_domain)}\n"
             f"IN = {shlex.quote(str(ssrf_in))}\n"
             "SSRF_PARAMS = {\n"
@@ -1971,9 +2055,6 @@ async def phase_G(
             "    'http://127.0.0.1:80/',\n"
             "    'http://0.0.0.0:80/',\n"
             "    'http://localhost:80/',\n"
-            "    'file:///etc/passwd',\n"
-            "    'gopher://127.0.0.1:6379/_',\n"
-            "    'dict://127.0.0.1:6379/info',\n"
             "]\n"
             "import uuid\n"
             "with open(IN) as f:\n"
@@ -1998,9 +2079,12 @@ async def phase_G(
             "                    new_qs = urllib.parse.urlencode(test_qs, doseq=True)\n"
             "                    new_url = urllib.parse.urlunparse(parsed._replace(query=new_qs))\n"
             "                    try:\n"
+            "                        new_parsed = urllib.parse.urlparse(new_url)\n"
+            "                        if new_parsed.scheme not in ('http', 'https'):\n"
+            "                            continue\n"
             "                        req = urllib.request.Request(new_url, method='GET',\n"
             "                            headers={'User-Agent': 'Mozilla/5.0'})\n"
-            "                        urllib.request.urlopen(req, timeout=10)\n"
+            "                        _opener.open(req, timeout=10)\n"
             "                    except Exception:\n"
             "                        pass\n"
         )
@@ -2008,7 +2092,7 @@ async def phase_G(
         jobs.append(("ssrf-probe", ["python3", str(ssrf_script)], 600))
         # Blind XSS — inject a header that will callback to OAST when rendered server-side
         blind_xss_in = ensure(outdir / "urls_xss_blind.txt")
-        blind_xss_urls = xss_urls[:_PIPELINE_CFG.sample_urls_xss_blind]
+        blind_xss_urls = xss_urls[:_get_cfg().sample_urls_xss_blind]
         if blind_xss_urls and oast_domain:
             blind_xss_in.write_text("\n".join(blind_xss_urls) + "\n")
             blind_script = outdir / "blind_xss_probe.py"
@@ -2072,14 +2156,13 @@ async def phase_G2(
     all_urls = _dedupe_by_host_path(all_urls)
     param_urls = [u for u in all_urls if "=" in u]
     if not param_urls:
-        param_urls = all_urls[:_PIPELINE_CFG.sample_urls_ssti]
+        param_urls = all_urls[:_get_cfg().sample_urls_ssti]
 
     eval_map = {
         "{{7*7}}": "49",
         "${7*7}": "49",
         "#{7*7}": "49",
         "*{7*7}": "49",
-        "{{7*'7'}}": "7777777",
         "<%= 7*7 %>": "49",
         "${{7*7}}": "49",
     }
@@ -2092,6 +2175,18 @@ async def phase_G2(
         qs = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
         if not qs:
             continue
+        # Baseline: fetch without the injected payload to compare (P1-2)
+        baseline_body: Optional[str] = None
+        baseline_url = urllib.parse.urlunparse(parsed._replace(query=""))
+        try:
+            req = urllib.request.Request(
+                baseline_url,
+                headers={"User-Agent": "Mozilla/5.0"},
+            )
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                baseline_body = resp.read().decode("utf-8", errors="ignore")
+        except Exception:
+            baseline_body = None
         for param_name in qs:
             for payload, expected in eval_map.items():
                 test_qs = qs.copy()
@@ -2108,6 +2203,8 @@ async def phase_G2(
                     )
                     with urllib.request.urlopen(req, timeout=15) as resp:
                         body = resp.read().decode("utf-8", errors="ignore")
+                    if baseline_body is not None and body == baseline_body:
+                        continue  # no difference from baseline
                     if expected in body:
                         ssti_findings.append(
                             f"[SSTI-evaluated] {test_url} param={param_name} payload={payload} → {expected}"
@@ -2205,7 +2302,7 @@ async def phase_J(
     # 1. Favicon hash
     favicon_urls = []
     if have_hosts:
-        for h in read_lines(hosts_file)[:_PIPELINE_CFG.sample_hosts_origin]:
+        for h in read_lines(hosts_file)[:_get_cfg().sample_hosts_origin]:
             base = h if h.startswith("http") else f"https://{h}"
             favicon_urls.append(base.rstrip("/") + "/favicon.ico")
     if not favicon_urls:
@@ -2253,7 +2350,7 @@ async def phase_J(
                         if name and _is_valid_hostname(name):
                             subdomains.add(name)
             # Try to resolve a few subdomains to find non-CF IPs
-            resolved = [s for s in subdomains if s != domain][:_PIPELINE_CFG.sample_hosts_origin]
+            resolved = [s for s in subdomains if s != domain][:_get_cfg().sample_hosts_origin]
             if t.has("dnsx") and resolved:
                 crt_subs = outdir / "crt_subs.txt"
                 ensure(crt_subs).write_text("\n".join(resolved) + "\n")
@@ -2387,13 +2484,22 @@ async def phase_J(
                         findings.append(f"    → {label}: no hardfail — consider -all")
             except Exception:
                 continue
-    # 4. Check resolved IPs against Cloudflare ASN (with local caching)
+    # 4. Check resolved IPs against Cloudflare ASN (with local caching — P1-6)
+    _IPCACHE_MAX = 10000
+    _IPCACHE_TTL = 7 * 86400
     resolved_path = Path(prev.get("A2") or outdir / "resolved_full.txt")
     ipcache = outdir / ".ipinfo_cache.json"
     ipcache_data: Dict[str, dict] = {}
+    now_ts = time.time()
     if ipcache.exists():
         try:
-            ipcache_data = json.loads(ipcache.read_text(errors="ignore"))
+            raw = json.loads(ipcache.read_text(errors="ignore"))
+            if isinstance(raw, dict):
+                # Filter expired entries
+                for k, v in list(raw.items()):
+                    if isinstance(v, dict) and v.get("_ts", 0) < now_ts - _IPCACHE_TTL:
+                        del raw[k]
+                ipcache_data = raw
         except (json.JSONDecodeError, ValueError):
             ipcache_data = {}
     if resolved_path.exists():
@@ -2401,17 +2507,18 @@ async def phase_J(
         for ln in read_lines(resolved_path):
             parts = ln.split()
             if len(parts) >= 3 and parts[-2].strip("[]") == "A":
-                # Only A-record lines: host [A] [1.2.3.4]
                 ip = parts[-1].strip("[]")
                 if ip and ip.count(".") == 3:
                     resolved_ips.add(ip)
         if resolved_ips:
             cf_ips: Set[str] = set()
             non_cf_ips: Set[str] = set()
-            for ip in sorted(resolved_ips)[:_PIPELINE_CFG.sample_hosts_origin]:
+            for ip in sorted(resolved_ips)[:_get_cfg().sample_hosts_origin]:
                 if ip in ipcache_data:
                     info_data = ipcache_data[ip]
                 else:
+                    if len(ipcache_data) >= _IPCACHE_MAX:
+                        break  # capped
                     try:
                         req = urllib.request.Request(
                             f"https://ipinfo.io/{ip}/json", headers={"User-Agent": "Mozilla/5.0"}
@@ -2419,6 +2526,7 @@ async def phase_J(
                         with urllib.request.urlopen(req, timeout=10) as resp:
                             info = resp.read().decode("utf-8", errors="ignore")
                         info_data = json.loads(info)
+                        info_data["_ts"] = now_ts
                         ipcache_data[ip] = info_data
                     except Exception:
                         findings.append(
@@ -2434,7 +2542,9 @@ async def phase_J(
                         f"  non_cloudflare_ip={ip}  org={info_data.get('org', 'unknown')}"
                     )
             if ipcache_data:
-                ipcache.write_text(json.dumps(ipcache_data, indent=2))
+                # Trim to max, keep newest
+                trimmed = dict(sorted(ipcache_data.items(), key=lambda x: x[1].get("_ts", 0), reverse=True)[:_IPCACHE_MAX])
+                ipcache.write_text(json.dumps(trimmed, indent=2))
             if cf_ips:
                 findings.append(f"  cloudflare_ips={', '.join(sorted(cf_ips))}")
             if non_cf_ips:
@@ -2516,7 +2626,7 @@ async def phase_K(outdir: Path, t: Tools, only: PhaseSet, skip: PhaseSet, force:
             for f in freq:
                 if f > 0:
                     p = f / len(val)
-                    entropy -= p * (p and __import__("math").log2(p) or 0.0)
+                    entropy -= p * (p and math.log2(p) or 0.0)
             if entropy > 4.5:
                 seen_secrets.add(val)
                 findings.append(f"[high-entropy] {val[:60]}… (entropy={entropy:.2f})  ({js_url})")
@@ -2637,7 +2747,9 @@ _MASS_ASSIGN_FIELDS = [
 ]
 
 
-async def phase_L(outdir: Path, t: Tools, only: PhaseSet, skip: PhaseSet, force: bool = False) -> Dict[str, Any]:
+async def phase_L(
+    domain: str, outdir: Path, t: Tools, only: PhaseSet, skip: PhaseSet, force: bool = False,
+) -> Dict[str, Any]:
     if skip & {"L"}:
         return {}
     _l_out = outdir / "auth_bypass.txt"
@@ -2672,28 +2784,50 @@ async def phase_L(outdir: Path, t: Tools, only: PhaseSet, skip: PhaseSet, force:
                 if len(parts) == 2:
                     api_endpoints.add(parts[1])
     if not api_endpoints:
-        # Fall back to first 10 urls
-        api_endpoints = set(read_lines(urls)[:_PIPELINE_CFG.sample_endpoints_l]) if urls.exists() else set()
+        api_endpoints = set(read_lines(urls)[:_get_cfg().sample_endpoints_l]) if urls.exists() else set()
     if not api_endpoints:
         log("warn", "L: no endpoints found; skipping")
         return {"L": str(outdir / "auth_bypass.txt"), "count": 0}
     findings.append(f"target_endpoints={len(api_endpoints)}")
-    for ep in sorted(api_endpoints)[:_PIPELINE_CFG.sample_endpoints_l]:
+    # Filter endpoints to hosts under the target domain (P0-1 scope safety)
+    api_endpoints = {u for u in api_endpoints if _is_under_domain(_extract_domain(u), domain)}
+    if not api_endpoints:
+        log("warn", "L: no in-scope endpoints; skipping")
+        return {"L": str(outdir / "auth_bypass.txt"), "count": 0}
+    for ep in sorted(api_endpoints)[:_get_cfg().sample_endpoints_l]:
         findings.append(f"  endpoint={ep}")
     # 2. Auth bypass header probes (non-destructive, concurrent)
     bypass_found: List[str] = []
-    targets = sorted(api_endpoints)[:_PIPELINE_CFG.sample_endpoints_l]
+    targets = sorted(api_endpoints)[:_get_cfg().sample_endpoints_l]
 
     async def _check_bypass(ep: str) -> List[str]:
         results: List[str] = []
-        try:
-            base_req = urllib.request.Request(ep, method="GET")
-            with urllib.request.urlopen(base_req, timeout=8) as base_resp:
-                baseline_status = base_resp.status
-                baseline_body = base_resp.read()
-                baseline_len = len(baseline_body)
-        except Exception:
+        # Baseline: median of 3 control fetches to reduce noise from dynamic content
+        baseline_lens: List[int] = []
+        baseline_status: Optional[int] = None
+        for _ in range(3):
+            try:
+                req = urllib.request.Request(ep, method="GET",
+                    headers={"User-Agent": "Mozilla/5.0"})
+                with urllib.request.urlopen(req, timeout=8) as base_resp:
+                    if baseline_status is None:
+                        baseline_status = base_resp.status
+                    baseline_lens.append(len(base_resp.read()))
+            except Exception:
+                break
+        if not baseline_lens:
             return results
+        baseline_lens.sort()
+        baseline_len = baseline_lens[len(baseline_lens) // 2]
+        # Control probe with a different User-Agent to measure natural variance
+        control_len: Optional[int] = None
+        try:
+            req = urllib.request.Request(ep, method="GET",
+                headers={"User-Agent": "curl/8.0"})
+            with urllib.request.urlopen(req, timeout=8) as ctrl_resp:
+                control_len = len(ctrl_resp.read())
+        except Exception:
+            pass
         for hdr in _AUTH_BYPASS_HEADERS:
             try:
                 req = urllib.request.Request(ep, method="GET")
@@ -2719,11 +2853,13 @@ async def phase_L(outdir: Path, t: Tools, only: PhaseSet, skip: PhaseSet, force:
                             f"  bypass={hdr} → {resp.status} (baseline={baseline_status}) on {ep}"
                         )
                         break
-                    # Same status code but significantly different body length → may indicate
-                    # different content being served (e.g. admin panel vs login page)
+                    # Same status code but significantly different body length
+                    # Threshold: >50% diff from baseline AND larger than control diff (P1-5)
                     if (resp.status == baseline_status
                             and probe_len
-                            and abs(probe_len - baseline_len) > max(100, baseline_len * 0.1)):
+                            and abs(probe_len - baseline_len) > max(200, baseline_len * 0.5)):
+                        if control_len is not None and abs(probe_len - baseline_len) <= abs(control_len - baseline_len) * 2:
+                            continue  # noise: control changes as much
                         results.append(
                             f"  bypass_body_diff={hdr} (status={resp.status}, len={probe_len}, baseline_len={baseline_len}) on {ep}"
                         )
@@ -2735,45 +2871,61 @@ async def phase_L(outdir: Path, t: Tools, only: PhaseSet, skip: PhaseSet, force:
     for br in bypass_results:
         bypass_found.extend(br)
 
-    # 3. POST body mass assignment probes (concurrent)
+    # 3. POST body mass assignment probes — gated behind --i-own-this-target (P0-1)
     post_findings: List[str] = []
-    post_targets = [ep for ep in targets if "?" not in ep.split("#")[0]][:_PIPELINE_CFG.sample_endpoints_post]
+    if _get_cfg().i_own_this_target and _get_cfg().sample_endpoints_post > 0:
+        post_targets = [
+            ep for ep in targets
+            if "?" not in ep.split("#")[0]
+            and _is_under_domain(_extract_domain(ep), domain)
+        ][:_get_cfg().sample_endpoints_post]
 
-    async def _check_mass_assignment(ep: str) -> List[str]:
-        results: List[str] = []
-        for field in _MASS_ASSIGN_FIELDS[:_PIPELINE_CFG.sample_endpoints_post]:
-            body = json.dumps({field: True}).encode()
-            try:
-                req = urllib.request.Request(ep, data=body, method="POST",
-                    headers={"Content-Type": "application/json", "User-Agent": "Mozilla/5.0"})
-                with urllib.request.urlopen(req, timeout=8) as resp:
-                    if resp.status in (200, 201, 302):
-                        results.append(f"  POST {ep} {{{field}: true}} → {resp.status}")
-            except Exception:
-                continue
-        return results
+        async def _check_mass_assignment(ep: str) -> List[str]:
+            results: List[str] = []
+            for field in _MASS_ASSIGN_FIELDS[:_get_cfg().sample_endpoints_post]:
+                body = json.dumps({field: True}).encode()
+                try:
+                    req = urllib.request.Request(ep, data=body, method="POST",
+                        headers={"Content-Type": "application/json", "User-Agent": "Mozilla/5.0"})
+                    with urllib.request.urlopen(req, timeout=8) as resp:
+                        if resp.status in (200, 201, 302):
+                            results.append(f"  POST {ep} {{{field}: true}} → {resp.status}")
+                except Exception:
+                    continue
+            return results
 
-    post_results = await asyncio.gather(*[_check_mass_assignment(ep) for ep in post_targets])
-    for pr in post_results:
-        post_findings.extend(pr)
+        post_results = await asyncio.gather(*[_check_mass_assignment(ep) for ep in post_targets])
+        for pr in post_results:
+            post_findings.extend(pr)
+    else:
+        log("info", "L: mass assignment POSTs skipped (requires --i-own-this-target)")
 
     findings.append("auth_bypass_probes:")
     findings.extend(bypass_found or ["  none detected (expected)"])
     if post_findings:
         findings.append("mass_assignment_probes:")
         findings.extend(post_findings)
-    # 4. Basic CORS misconfiguration check (origin reflection)
+    # 4. Basic CORS misconfiguration check (origin reflection — P0-3)
     cors_findings: List[str] = []
-    for ep in targets[:_PIPELINE_CFG.sample_endpoints_cors]:
+    for ep in targets[:_get_cfg().sample_endpoints_cors]:
         try:
             req = urllib.request.Request(ep, method="GET")
-            req.add_header("Origin", "https://evil.example.com")
+            sent_origin = "https://evil.example.com"
+            req.add_header("Origin", sent_origin)
             with urllib.request.urlopen(req, timeout=8) as resp:
-                acao = resp.headers.get("Access-Control-Allow-Origin", "")
-                acac = resp.headers.get("Access-Control-Allow-Credentials", "")
-                if "*" in acao or "evil.example.com" in acao:
+                acao = resp.headers.get("Access-Control-Allow-Origin", "").strip()
+                acac = resp.headers.get("Access-Control-Allow-Credentials", "").strip()
+                if acao == sent_origin:
                     cors_findings.append(
                         f"  cors_origin_reflection=YES (ACAO={acao}, ACAC={acac}) on {ep}"
+                    )
+                elif acao == "*" and acac.lower() == "true":
+                    cors_findings.append(
+                        f"  cors_wildcard_with_credentials (ACAO={acao}, ACAC={acac}) on {ep}"
+                    )
+                elif acao == "*":
+                    cors_findings.append(
+                        f"  cors_wildcard (ACAO={acao}, ACAC={acac}) on {ep}"
                     )
         except Exception:
             continue
@@ -2821,7 +2973,7 @@ def _counts(outdir: Path) -> Dict[str, int]:
 def write_summary(outdir: Path, domain: str, state: dict, counts: Dict[str, int]) -> Path:
     payload = {
         "domain": domain,
-        "generated_at": datetime.now().isoformat(timespec="seconds"),
+        "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds") + "Z",
         "toolchain": f"reconchain v{__version__}",
         "missing_tools": sorted(set(state.get("missing_tools", []))),
         "tool_failures": dict(state.get("tool_failures", {})),
@@ -2903,7 +3055,7 @@ def write_html(outdir: Path, domain: str, counts: Dict[str, int], missing: List[
 <title>recon report — {html_escape(domain)}</title>
 <style>{HTML_CSS}</style></head><body>
 <h1>Recon Report: {html_escape(domain)}</h1>
-<small>generated {datetime.now().isoformat(timespec="seconds")} · reconchain v{__version__}</small>
+<small>generated {datetime.now(timezone.utc).isoformat(timespec="seconds")}Z · reconchain v{__version__}</small>
 {miss_html}
 <h2>Summary</h2><div class="grid">{cards}</div>
 {"".join(sections)}
@@ -2918,7 +3070,7 @@ def write_full_summary(outdir: Path, domain: str, counts: Dict[str, int], missin
     lines = [
         "=" * 60,
         f"  Recon Summary — {domain}",
-        f"  generated {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+        f"  generated {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}",
         "=" * 60,
         "",
     ]
@@ -2971,7 +3123,7 @@ def write_full_summary(outdir: Path, domain: str, counts: Dict[str, int], missin
 def write_markdown(outdir: Path, domain: str, counts: Dict[str, int], missing: List[str]) -> Path:
     lines = [
         f"# Recon Report — {domain}",
-        f"_generated {datetime.now().isoformat(timespec='seconds')}_",
+        f"_generated {datetime.now(timezone.utc).isoformat(timespec='seconds')}Z_",
         "",
     ]
     if missing:
@@ -3004,12 +3156,12 @@ PIPELINE = [
     ("E", phase_E, ("outdir", "t", "only", "skip", "force")),
     ("F1", phase_F1, ("outdir", "t", "only", "skip", "force")),
     ("F2", phase_F2, ("outdir", "t", "only", "skip", "force")),
-    ("G", phase_G, ("outdir", "t", "only", "skip", "oast_domain", "force")),
+    ("G", phase_G, ("domain", "outdir", "t", "only", "skip", "oast_domain", "force")),
     ("G2", phase_G2, ("outdir", "t", "only", "skip", "prev", "force")),
     ("H", phase_H, ("outdir", "t", "only", "skip", "oast", "force")),
     ("J", phase_J, ("domain", "outdir", "t", "only", "skip", "prev", "force")),
     ("K", phase_K, ("outdir", "t", "only", "skip", "force")),
-    ("L", phase_L, ("outdir", "t", "only", "skip", "force")),
+    ("L", phase_L, ("domain", "outdir", "t", "only", "skip", "force")),
 ]
 # Dependency-ordered execution stages. Phases in the same stage are independent
 # of one another (they only read artifacts produced by *earlier* stages, never
@@ -3101,10 +3253,7 @@ async def run_pipeline(args: argparse.Namespace) -> int:
                     f"not {args.domain!r}; ignoring and starting fresh",
                 )
             else:
-                # Resolve stored artifact paths against THIS outdir. The
-                # state file may have been written from a previous run
-                # whose absolute paths no longer apply (BUG-6); relative
-                # paths from the stored outdir are rebased onto outdir.
+                # Resolve stored artifact paths against THIS outdir (P1-7).
                 prev_outdir_s = saved.get("outdir")
                 prev_outdir = Path(prev_outdir_s) if prev_outdir_s else None
                 rebased: Dict[str, Any] = {}
@@ -3116,10 +3265,15 @@ async def run_pipeline(args: argparse.Namespace) -> int:
                         try:
                             p = p.relative_to(prev_outdir)
                         except ValueError:
-                            pass  # path wasn't under the old outdir; keep as-is
+                            pass
                         rebased[k] = str(outdir / p)
                     elif p.is_absolute():
-                        rebased[k] = v
+                        if prev_outdir is None:
+                            # State predates outdir tracking; rebuild from filesystem
+                            log("warn", f"state.json predates outdir tracking; scanning filesystem for {k}")
+                            rebased[k] = str(_find_artifact(outdir, k) or outdir / k)
+                        else:
+                            rebased[k] = v
                     else:
                         rebased[k] = str(outdir / p)
                 saved["artifacts"] = rebased
@@ -3149,9 +3303,10 @@ async def run_pipeline(args: argparse.Namespace) -> int:
             state["missing_tools"].remove(m)
         else:
             t.seed_missing([m])
-    # Bind the process-wide job semaphore to THIS event loop so every phase's
-    # run_parallel() shares one budget of live external processes.
-    global _JOB_SEM, _PIPELINE_CFG
+    # Bind the process-wide job semaphore to THIS run_pipeline invocation via
+    # contextvar so every phase's run_parallel() shares one budget of live
+    # external processes.
+
 
     proxy = getattr(args, 'proxy', '')
     if not proxy:
@@ -3165,7 +3320,7 @@ async def run_pipeline(args: argparse.Namespace) -> int:
         if cookie:
             log("info", "cookie auto-detected")
 
-    _PIPELINE_CFG = PipelineConfig(
+    _PIPELINE_CFG_CTX.set(PipelineConfig(
         sqlmap_level=getattr(args, 'sqlmap_level', 1),
         sqlmap_risk=getattr(args, 'sqlmap_risk', 1),
         delay=getattr(args, 'delay', 0.0),
@@ -3178,17 +3333,31 @@ async def run_pipeline(args: argparse.Namespace) -> int:
         sample_endpoints_l=getattr(args, 'sample_endpoints_l', 20),
         sample_urls_xss_blind=getattr(args, 'sample_urls_xss_blind', 20),
         sample_urls_ssti=getattr(args, 'sample_urls_ssti', 5),
-        sample_endpoints_post=getattr(args, 'sample_endpoints_post', 5),
+        sample_endpoints_post=getattr(args, 'sample_endpoints_post', 0) if not getattr(args, 'i_own_this_target', False) else max(1, getattr(args, 'sample_endpoints_post', 5)),
         sample_endpoints_cors=getattr(args, 'sample_endpoints_cors', 10),
         nuclei_exclude_tags=getattr(args, 'exclude_tags', ''),
+        nuclei_severity_default="low,medium,high,critical",
+        i_own_this_target=getattr(args, 'i_own_this_target', False),
         cookie=cookie,
         extra_headers=list(getattr(args, 'extra_headers', [])),
         proxy=proxy,
-    )
+    ))
     jobs = max(1, args.jobs)
     if jobs != MAX_PARALLEL_JOBS:
         log("info", f"parallel jobs set to {jobs}")
-    _JOB_SEM = asyncio.Semaphore(jobs)
+    _JOB_SEM_CTX.set(asyncio.Semaphore(jobs))
+
+    # Phase dependency enforcement (P1-3)
+    if only:
+        for phase_name in only:
+            deps = PHASE_DEPS.get(phase_name, set())
+            missing_deps = deps - only
+            if missing_deps:
+                log(
+                    "warn",
+                    f"--only {phase_name} missing dependencies: {', '.join(sorted(missing_deps))}. "
+                    f"Add them via --only or results will be empty.",
+                )
     oast = Interactsh(outdir)
     oast_started = False
     phase_map = {name: fn for name, fn, _ in PIPELINE}
@@ -3243,13 +3412,13 @@ async def run_pipeline(args: argparse.Namespace) -> int:
         }
         sig = inspect.signature(fn)
         call = {k: v for k, v in kwargs.items() if k in sig.parameters}
-        t0 = datetime.now()
+        t0 = datetime.now(timezone.utc)
         try:
             result = await fn(**call)
         except Exception as e:
             log("err", f"phase {name} crashed: {e}")
             result = {}
-        t1 = datetime.now()
+        t1 = datetime.now(timezone.utc)
         elapsed = (t1 - t0).total_seconds()
         phase_timing[name] = {
             "start": t0.isoformat(timespec="seconds"),
@@ -3280,7 +3449,7 @@ async def run_pipeline(args: argparse.Namespace) -> int:
     finally:
         if oast_started and not h_selected:
             oast.stop()
-        _JOB_SEM = None
+        _JOB_SEM_CTX.set(None)
     counts = _counts(outdir)
     sj = write_summary(outdir, args.domain, state, counts)
     # Reopen summary.json to inject phase_timing after write_summary
@@ -3654,13 +3823,18 @@ def build_parser() -> argparse.ArgumentParser:
         "--sample-endpoints-post",
         type=int,
         default=5,
-        help="number of endpoints for POST mass-assignment probes (default: 5)",
+        help="number of endpoints for POST mass-assignment probes (default: 5; requires --i-own-this-target)",
     )
     p.add_argument(
         "--sample-endpoints-cors",
         type=int,
         default=10,
         help="number of endpoints for CORS misconfiguration probes (default: 10)",
+    )
+    p.add_argument(
+        "--i-own-this-target",
+        action="store_true",
+        help="confirm you own/have permission for the target; enables destructive POST probes",
     )
     return p
 
@@ -3689,7 +3863,7 @@ def main() -> int:
 
         def log(lvl, msg):  # type: ignore
             if lvl in ("ok", "err", "warn"):
-                ts = datetime.now().strftime("%H:%M:%S")
+                ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
                 print(f"{ts} [{lvl.upper():4}] {msg}", flush=True)
 
     try:

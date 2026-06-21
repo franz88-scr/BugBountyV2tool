@@ -98,7 +98,7 @@ _HOSTNAME_RE = re.compile(
     r"^(?=.{1,253}$)(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+"
     r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.?$"
 )
-__version__ = "1.2.0"
+__version__ = "1.4.0"
 VALID_PHASES = {
     "A1",
     "A2",
@@ -259,6 +259,7 @@ class PipelineConfig:
     sample_urls_ssti: int = 5
     sample_endpoints_post: int = 5
     sample_endpoints_cors: int = 10
+    nuclei_exclude_tags: str = ""
     cookie: str = ""
     extra_headers: List[str] = None  # type: ignore[assignment]
     proxy: str = ""
@@ -619,7 +620,7 @@ async def phase_A1(
     if skip & {"A1"}:
         return {}
     out = outdir / "all_subs.txt"
-    if out.exists() and not force and (resume or only.isdisjoint({"A1"})):
+    if out.exists() and not force:
         return {"A1": str(out), "count": count_nonblank(out)}
     log("info", "Phase A1: subdomain enumeration")
     jobs: List[Tuple[str, List[str], int]] = []
@@ -671,24 +672,44 @@ async def phase_A1(
         jobs.append(("assetfinder", ["bash", str(runner)], 600))
     if not jobs:
         log("warn", "A1: no subdomain tools available")
+        return {"A1": str(out), "count": 0}
+
+    # Incremental merge: while tools run, merge partial results into all_subs.txt
+    # every 30s so downstream phases (A2, B1, C1) can start early.
+    def _under_domain(s: str) -> bool:
+        return _is_valid_hostname(s) and _is_under_domain(s, domain)
+
+    _a1_sources = [
+        outdir / "subs_subfinder.txt",
+        outdir / "subs_amass.txt",
+        outdir / "subs_assetfinder.txt",
+    ]
+
+    async def _incremental_merge() -> None:
+        """Merge tool outputs into all_subs.txt every 30s during execution."""
+        _last_size = 0
+        while True:
+            await asyncio.sleep(30)
+            if all(p.exists() for p in _a1_sources):
+                current = sum(len(read_lines(p)) for p in _a1_sources)
+                if current > _last_size:
+                    merge_unique(_a1_sources, out, validator=_under_domain)
+                    _last_size = current
+                    log("info", f"A1: incremental merge — {count_nonblank(out)} subdomains so far")
+
+    merge_task = asyncio.create_task(_incremental_merge())
     results = await run_parallel(jobs, outdir)
+    merge_task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await merge_task
+
     # Surface partial tool failures in summary.json (BUG-5). rc==0 and
     # skipped are not failures; anything else (timeouts, crash, signal)
     # is recorded so the user knows the merged output may be partial.
     failures = {r.name: r.rc for r in results if r.rc not in (0, None) and r.note != "skipped"}
 
-    # Merge + drop anything that isn't a hostname under `-d`. subfinder
-    # frequently emits bare tokens (e.g. registered-domain-only entries
-    # from CT logs) which would otherwise flow into A2 / naabu / httpx
-    # as "hosts" and waste hours of scan time on unresolvable garbage.
-    def _under_domain(s: str) -> bool:
-        return _is_valid_hostname(s) and _is_under_domain(s, domain)
-
-    n = merge_unique(
-        [outdir / "subs_subfinder.txt", outdir / "subs_amass.txt", outdir / "subs_assetfinder.txt"],
-        out,
-        validator=_under_domain,
-    )
+    # Final merge
+    n = merge_unique(_a1_sources, out, validator=_under_domain)
     log("ok", f"A1: {n} unique subdomains → {out}")
     ret: Dict[str, Any] = {"A1": str(out), "count": n}
     if failures:
@@ -710,76 +731,84 @@ async def phase_A2(
     if skip & {"A2"}:
         return {}
     out = outdir / "resolved.txt"
-    if out.exists() and not force and (resume or only.isdisjoint({"A2"})):
-        return {"A2": str(out), "count": count_nonblank(out)}
-    subs = Path(prev.get("A1") or outdir / "all_subs.txt")
-    # Existence check is "file is non-empty"; we do NOT use read_lines()
-    # here because it drops `#`-prefixed lines, which would make A2 skip
-    # on a file that contains only valid subdomains below a `#` header.
-    if not subs.exists() or subs.stat().st_size == 0:
-        log("warn", "A2: no input subdomains; skipping")
-        return {"A2": str(out), "count": 0}
-    log("info", "Phase A2: dnsx resolution")
-    if not t.has("dnsx"):
-        log("warn", "A2: dnsx missing, falling back to copy of subdomain list")
-        merge_unique([subs], out)
-        return {"A2": str(out), "count": len(read_lines(out))}
-    # dnsx with `-resp` writes one line per record in the form
-    # `host [TYPE] [value]`, e.g. `sub.example.com [A] [1.2.3.4]`.
-    # Downstream tools (naabu/httpx/nuclei/testssl/wpscan) only accept
-    # bare hostnames, so we keep the rich record-level output as
-    # `resolved_full.txt` (for reporting / forensics) and produce a
-    # deduped host-only list as `resolved.txt` for the rest of the
-    # pipeline.
     full = outdir / "resolved_full.txt"
-    res = await _run(
-        "dnsx",
-        ["dnsx", "-silent", "-l", str(subs), "-o", str(full), "-a", "-aaaa", "-cname", "-resp"],
-        1800,
-        outdir,
-    )
-    if not full.exists() or not read_lines(full):
-        # Defensive: dnsx failed or produced no output - fall back to
-        # the raw subdomain list so B1 et al. still get something
-        # usable.
-        log("warn", "A2: dnsx produced no output; falling back to subdomain list")
-        merge_unique([subs], out)
-        return {"A2": str(out), "count": len(read_lines(out)), "rc": res.rc}
-    seen: Set[str] = set()
-    for ln in full.read_text(errors="ignore").splitlines():
-        ln = ln.strip()
-        if not ln or ln.startswith("#"):
+    if out.exists() and not force:
+        return {"A2": str(out), "count": count_nonblank(out)}
+    subs_file = Path(prev.get("A1") or outdir / "all_subs.txt")
+
+    # Streaming: poll for input from A1 (which may be writing incrementally)
+    if not subs_file.exists() or subs_file.stat().st_size == 0:
+        log("info", "A2: waiting for subdomains from A1…")
+        for _ in range(60):  # up to ~5 min
+            await asyncio.sleep(5)
+            if subs_file.exists() and subs_file.stat().st_size > 0:
+                break
+        else:
+            log("warn", "A2: A1 produced no subdomains within timeout; skipping")
+            return {"A2": str(out), "count": 0}
+
+    log("info", "Phase A2: dnsx resolution (streaming)")
+    _a2_processed: Set[str] = set()
+    _a2_stable_count = 0
+
+    async def _resolve_batch(batch_subs: Path) -> int:
+        """Run dnsx on a batch of subdomains, append results to resolved files."""
+        tmp = outdir / ".a2_batch.txt"
+        batch = [s.strip().lower() for s in read_lines(batch_subs)
+                 if s.strip() and s.strip().lower() not in _a2_processed]
+        if not batch:
+            return 0
+        _a2_processed.update(b.lower() for b in batch)
+        tmp.write_text("\n".join(batch) + "\n")
+        if not t.has("dnsx"):
+            merge_unique([tmp], out)
+            return len(batch)
+        full_batch = outdir / ".a2_full_batch.txt"
+        res = await _run(
+            "dnsx",
+            ["dnsx", "-silent", "-l", str(tmp), "-o", str(full_batch),
+             "-a", "-aaaa", "-cname", "-resp"],
+            1800, outdir,
+        )
+        if full_batch.exists() and read_lines(full_batch):
+            _merge_dnsx_output(full_batch, out, full)
+            full_batch.unlink(missing_ok=True)
+            return count_nonblank(full_batch) if full_batch.exists() else 0
+        tmp.unlink(missing_ok=True)
+        return 0
+
+    # Process initial available subdomains
+    n = await _resolve_batch(subs_file)
+    log("info", f"A2: resolved {n} initial hosts")
+
+    # Poll for new subdomains while A1 may still be running (up to 10 min total)
+    for _ in range(40):  # 40 * 15s = 10 min ceiling
+        await asyncio.sleep(15)
+        new_subs = [s.strip().lower() for s in read_lines(subs_file)
+                    if s.strip() and s.strip().lower() not in _a2_processed]
+        if not new_subs:
+            _a2_stable_count += 1
+            if _a2_stable_count >= 4:  # no new subs for ~1min → assume A1 done
+                break
             continue
-        # First whitespace-delimited token is the host we resolved;
-        # this drops both the ` [A] [1.2.3.4]` and ` [CNAME] [target]`
-        # suffixes. Validate it actually looks like a hostname before
-        # adding it — a truncated / malformed dnsx line (e.g. a write
-        # interrupted mid-flush) would otherwise leak bracket fragments
-        # like `[A]` as "hosts" and poison every downstream phase.
-        host = ln.split()[0].rstrip(".")
-        if not _is_valid_hostname(host):
-            continue
-        if host not in seen:
-            seen.add(host)
-    ensure(out)
-    out.write_text("\n".join(sorted(seen)) + ("\n" if seen else ""))
-    n_records = len(read_lines(full))
-    log(
-        "info",
-        f"A2: {len(seen)} unique hosts (from {n_records} "
-        f"A/AAAA/CNAME records in resolved_full.txt)",
-    )
-    return {"A2": str(out), "count": len(seen), "rc": res.rc}
+        _a2_stable_count = 0
+        new_count = await _resolve_batch(subs_file)
+        if new_count:
+            log("info", f"A2: resolved {new_count} more hosts (streaming batch)")
+
+    c = count_nonblank(out)
+    log("info", f"A2: {c} total unique hosts resolved")
+    return {"A2": str(out), "count": c}
 
 
 async def phase_A3(
-    domain: str, outdir: Path, t: Tools, only: PhaseSet, skip: PhaseSet, prev: Dict[str, Any],
+    domain: str, outdir: Path, t: Tools, only: PhaseSet, skip: PhaseSet, prev: Dict[str, Any], force: bool = False,
 ) -> Dict[str, Any]:
-    """Subdomain permutation / alteration via dnsgen + dnsx.
-    Takes A1's all_subs.txt, generates permutations with dnsgen, resolves
-    with dnsx, and merges newly-discovered hosts into a fresh subdomain list."""
     if skip & {"A3"}:
         return {}
+    _a3_out = outdir / "all_subs.txt"
+    if _a3_out.exists() and not force and not (only & {"A3"}):
+        return {"A1": str(_a3_out), "A3": str(_a3_out), "count": count_nonblank(_a3_out)}
     log("info", "Phase A3: subdomain permutation (dnsgen → dnsx)")
     # Input: all discovered subdomains from A1
     subs_in = Path(prev.get("A1") or outdir / "all_subs.txt")
@@ -835,10 +864,22 @@ async def phase_A3(
 
 
 async def phase_B1(
-    outdir: Path, t: Tools, only: PhaseSet, skip: PhaseSet, prev: Dict[str, Any]
+    outdir: Path, t: Tools, only: PhaseSet, skip: PhaseSet, prev: Dict[str, Any], force: bool = False,
 ) -> Dict[str, Any]:
     if skip & {"B1"}:
         return {}
+    if all(
+        (outdir / f).exists()
+        for f in ("ports.txt", "hosts.txt", "host_targets.txt", "takeover.txt")
+    ) and not force and not (only & {"B1"}):
+        ports_file = outdir / "ports.txt"
+        return {
+            "B1.ports": str(ports_file),
+            "B1.hosts": str(outdir / "hosts.txt"),
+            "B1.targets": str(outdir / "host_targets.txt"),
+            "B1.takeover": str(outdir / "takeover.txt"),
+            "count": count_nonblank(ports_file),
+        }
     log("info", "Phase B1: ports / hosts / takeover (parallel)")
     # naabu/httpx/nuclei-takeover accept host:port (or hosts from httpx)
     hosts = Path(prev.get("A2") or outdir / "resolved.txt")
@@ -925,6 +966,7 @@ async def phase_B1(
                     "-tech-detect",
                     "-status-code",
                     "-follow-redirects",
+                    "-fr",  # follow redirects on the same host (faster)
                 ],
                 1800,
             )
@@ -1036,10 +1078,13 @@ async def phase_B1(
 
 
 async def phase_C1(
-    outdir: Path, t: Tools, only: PhaseSet, skip: PhaseSet, prev: Dict[str, Any]
+    outdir: Path, t: Tools, only: PhaseSet, skip: PhaseSet, prev: Dict[str, Any], force: bool = False,
 ) -> Dict[str, Any]:
     if skip & {"C1"}:
         return {}
+    _c1_out = outdir / "urls_all.txt"
+    if _c1_out.exists() and not force and not (only & {"C1"}):
+        return {"C1": str(_c1_out), "count": count_nonblank(_c1_out)}
     log("info", "Phase C1: URL harvesting (parallel groups)")
     hosts = Path(prev.get("B1.targets") or outdir / "host_targets.txt")
     if not hosts.exists() or not read_lines(hosts):
@@ -1131,6 +1176,7 @@ async def phase_C1(
                     "3",
                     "-kf",
                     "all",
+                    "-duc",  # disable unique check for faster incremental runs
                 ],
                 1800,
             )
@@ -1148,6 +1194,20 @@ async def phase_C1(
         )
         runner.chmod(0o755)
         g2.append(("subjs", ["bash", str(runner)], 1200))
+    # waymore — modern URL harvester combining gau/wayback/crtsh with caching
+    if t.has("waymore"):
+        g2.append(
+            (
+                "waymore",
+                [
+                    "waymore", "-i", str(hosts), "-mode", "U",
+                    "-o", str(outdir / "urls_waymore.txt"),
+                    "-p", str(outdir / "logs" / "waymore"),
+                    "-n", "1",
+                ],
+                1800,
+            )
+        )
     if g1:
         await run_parallel(g1, outdir)
     if g2:
@@ -1158,6 +1218,7 @@ async def phase_C1(
         outdir / "urls_gospider.txt",
         outdir / "urls_katana.txt",
         outdir / "urls_subjs.txt",
+        outdir / "urls_waymore.txt",
     ]
     if not any(p.exists() and read_lines(p) for p in harvested):
         log("warn", "C1: no URL harvesters produced output")
@@ -1166,9 +1227,12 @@ async def phase_C1(
     return {"C1": str(outdir / "urls_all.txt"), "count": n}
 
 
-async def phase_C2(outdir: Path, t: Tools, only: PhaseSet, skip: PhaseSet) -> Dict[str, Any]:
+async def phase_C2(outdir: Path, t: Tools, only: PhaseSet, skip: PhaseSet, force: bool = False) -> Dict[str, Any]:
     if skip & {"C2"}:
         return {}
+    _c2_out = outdir / "js_secrets.txt"
+    if _c2_out.exists() and not force and not (only & {"C2"}):
+        return {"C2": str(_c2_out), "count": count_nonblank(_c2_out)}
     log("info", "Phase C2: JS analysis (LinkFinder + SecretFinder)")
     urls = outdir / "urls_all.txt"
     js_urls = outdir / "urls_js.txt"
@@ -1251,18 +1315,23 @@ async def phase_C2(outdir: Path, t: Tools, only: PhaseSet, skip: PhaseSet) -> Di
 
 
 async def phase_D(
-    outdir: Path, t: Tools, only: PhaseSet, skip: PhaseSet, prev: Dict[str, Any]
+    outdir: Path, t: Tools, only: PhaseSet, skip: PhaseSet, prev: Dict[str, Any], force: bool = False,
 ) -> Dict[str, Any]:
     if skip & {"D"}:
         return {}
+    _d_out = outdir / "params.txt"
+    if _d_out.exists() and not force and not (only & {"D"}):
+        return {"D": str(_d_out), "count": count_nonblank(_d_out)}
     log("info", "Phase D: parameter discovery")
     urls = outdir / "urls_all.txt"
     if not urls.exists() or not read_lines(urls):
         log("warn", "D: no URLs; skipping")
         return {"D": str(outdir / "params.txt"), "count": 0}
+    _d_urls = _dedupe_by_host_path(read_lines(urls))
+    log("info", f"D: {len(read_lines(urls))} raw URLs → {len(_d_urls)} unique paths")
     jobs: List[Tuple[str, List[str], int]] = []
     if t.has("paramspider"):
-        for u in read_lines(urls)[:_PIPELINE_CFG.sample_urls_pspider]:
+        for u in _d_urls[:_PIPELINE_CFG.sample_urls_pspider]:
             # ParamSpider -d expects a domain, not a full URL
             domain_for_ps = _extract_domain(u)
             out_part = outdir / f"params_spider_{safe_suffix(u)}.txt"
@@ -1284,7 +1353,7 @@ async def phase_D(
     # Over Tor these are very slow — sample URLs heavily
     if t.has("arjun"):
         arjun_in = ensure(outdir / "urls_arjun_sample.txt")
-        arjun_urls = read_lines(urls)[:_PIPELINE_CFG.sample_urls_params]
+        arjun_urls = _d_urls[:_PIPELINE_CFG.sample_urls_params]
         if arjun_urls:
             arjun_in.write_text("\n".join(arjun_urls) + "\n")
             jobs.append(
@@ -1292,7 +1361,7 @@ async def phase_D(
             )
     if t.has("x8"):
         x8_in = ensure(outdir / "urls_x8_sample.txt")
-        x8_urls = read_lines(urls)[:_PIPELINE_CFG.sample_urls_params]
+        x8_urls = _d_urls[:_PIPELINE_CFG.sample_urls_params]
         if x8_urls:
             x8_in.write_text("\n".join(x8_urls) + "\n")
             jobs.append(("x8", ["x8", "-u", str(x8_in), "-o", str(outdir / "params_x8.json")], 1800))
@@ -1367,6 +1436,27 @@ def _extract_urls_from_kiterunner_jsonl(p: Path) -> List[str]:
     return out
 
 
+def _merge_dnsx_output(src: Path, hosts_out: Path, full_out: Path) -> None:
+    """Parse dnsx -resp output from `src` and append to hosts_out + full_out."""
+    seen_hosts: Set[str] = set()
+    if hosts_out.exists():
+        seen_hosts.update(l.strip().lower() for l in read_lines(hosts_out) if l.strip())
+    new_hosts: List[str] = []
+    if full_out.exists():
+        new_hosts.extend(read_lines(full_out))
+    for ln in read_lines(src):
+        ln = ln.strip()
+        if not ln or ln.startswith("#"):
+            continue
+        host = ln.split()[0].rstrip(".")
+        if _is_valid_hostname(host) and host.lower() not in seen_hosts:
+            seen_hosts.add(host.lower())
+            new_hosts.append(host)
+    if new_hosts:
+        full_out.write_text("\n".join(new_hosts) + "\n")
+        hosts_out.write_text("\n".join(sorted(seen_hosts)) + "\n")
+
+
 def _dedupe_by_host_path(urls: List[str]) -> List[str]:
     """Deduplicate URLs by (scheme, host, path), keeping the first occurrence.
     This avoids redundant fuzzing on URLs that differ only by query params
@@ -1382,7 +1472,7 @@ def _dedupe_by_host_path(urls: List[str]) -> List[str]:
     return result
 
 
-async def phase_E(outdir: Path, t: Tools, only: PhaseSet, skip: PhaseSet) -> Dict[str, Any]:
+async def phase_E(outdir: Path, t: Tools, only: PhaseSet, skip: PhaseSet, force: bool = False) -> Dict[str, Any]:
     if skip & {"E"}:
         return {}
     log("info", "Phase E: fuzzing")
@@ -1535,9 +1625,19 @@ async def phase_E(outdir: Path, t: Tools, only: PhaseSet, skip: PhaseSet) -> Dic
 
 
 async def _update_nuclei_templates(outdir: Path) -> None:
-    """Update nuclei templates if nuclei is available (non-blocking, best-effort)."""
+    """Update nuclei templates if nuclei is available (non-blocking, best-effort).
+    Skips update if templates were updated less than 24 hours ago (cache stamp)."""
     if not shutil.which("nuclei"):
         return
+    cache_stamp = outdir / ".nuclei_update_stamp"
+    if cache_stamp.exists():
+        try:
+            age = time.time() - float(cache_stamp.read_text().strip())
+            if age < 86400:
+                log("info", f"F1: nuclei templates updated {age/3600:.1f}h ago, skipping")
+                return
+        except (ValueError, OSError):
+            pass
     log("info", "F1: updating nuclei templates…")
     proc = await asyncio.create_subprocess_exec(
         "nuclei", "-update-templates", "-silent",
@@ -1546,14 +1646,18 @@ async def _update_nuclei_templates(outdir: Path) -> None:
     )
     try:
         await asyncio.wait_for(proc.wait(), timeout=120)
+        cache_stamp.write_text(str(time.time()))
     except asyncio.TimeoutError:
         proc.kill()
         log("warn", "F1: nuclei template update timed out")
 
 
-async def phase_F1(outdir: Path, t: Tools, only: PhaseSet, skip: PhaseSet) -> Dict[str, Any]:
+async def phase_F1(outdir: Path, t: Tools, only: PhaseSet, skip: PhaseSet, force: bool = False) -> Dict[str, Any]:
     if skip & {"F1"}:
         return {}
+    _f1_out = outdir / "nuclei_combined.txt"
+    if _f1_out.exists() and not force and not (only & {"F1"}):
+        return {"F1": str(_f1_out), "count": count_nonblank(_f1_out)}
     log("info", "Phase F1: nuclei (full) + tech-scanner")
     await _update_nuclei_templates(outdir)
     hosts = outdir / "host_targets.txt"
@@ -1578,9 +1682,13 @@ async def phase_F1(outdir: Path, t: Tools, only: PhaseSet, skip: PhaseSet) -> Di
         ]
         if _PIPELINE_CFG.rate_limit:
             nuclei_base += ["-rl", str(_PIPELINE_CFG.rate_limit)]
+        # Bulk-size: process multiple templates per host for faster scans
+        nuclei_base += ["-bs", "25"]
         # Tags: prefer cves, exposures for high-signal findings; exclude
         # info-severity templates that add noise on large targets.
         nuclei_tags = ["cves", "exposures", "misconfig", "vulnerabilities"]
+        if _PIPELINE_CFG.nuclei_exclude_tags:
+            nuclei_base += ["-et", _PIPELINE_CFG.nuclei_exclude_tags]
         jobs.append(
             (
                 "nuclei-cves",
@@ -1622,9 +1730,12 @@ async def phase_F1(outdir: Path, t: Tools, only: PhaseSet, skip: PhaseSet) -> Di
     return {"F1": str(outdir / "nuclei_combined.txt"), "count": n}
 
 
-async def phase_F2(outdir: Path, t: Tools, only: PhaseSet, skip: PhaseSet) -> Dict[str, Any]:
+async def phase_F2(outdir: Path, t: Tools, only: PhaseSet, skip: PhaseSet, force: bool = False) -> Dict[str, Any]:
     if skip & {"F2"}:
         return {}
+    _f2_out = outdir / "tls_wp.txt"
+    if _f2_out.exists() and not force and not (only & {"F2"}):
+        return {"F2": str(_f2_out), "count": count_nonblank(_f2_out)}
     log("info", "Phase F2: testssl + wpscan")
     hosts = outdir / "host_targets.txt"
     if not hosts.exists() or not read_lines(hosts):
@@ -1750,16 +1861,30 @@ async def phase_F2(outdir: Path, t: Tools, only: PhaseSet, skip: PhaseSet) -> Di
 
 
 async def phase_G(
-    outdir: Path, t: Tools, only: PhaseSet, skip: PhaseSet, oast_domain: Optional[str]
+    outdir: Path, t: Tools, only: PhaseSet, skip: PhaseSet, oast_domain: Optional[str], force: bool = False,
 ) -> Dict[str, Any]:
     if skip & {"G"}:
         return {}
+    _g_out = outdir / "vulns.txt"
+    if _g_out.exists() and not force and not (only & {"G"}):
+        return {"G": str(_g_out), "count": count_nonblank(_g_out)}
     log("info", "Phase G: dalfox → sqlmap → SSRF probes")
     urls = outdir / "urls_all.txt"
     all_urls = read_lines(urls) if urls.exists() else []
     if not all_urls:
         log("warn", "G: no URLs; skipping")
         return {"G": str(outdir / "vulns.txt"), "count": 0}
+    # Dedupe by (host, path, sorted param keys) — keep URLs with different param names
+    _g_seen: Set[Tuple[str, str, str, str]] = set()
+    _g_deduped: List[str] = []
+    for u in all_urls:
+        parsed = urllib.parse.urlparse(u)
+        qs = frozenset(urllib.parse.parse_qs(parsed.query))
+        key = (parsed.scheme, parsed.hostname or "", parsed.path.rstrip("/"), str(sorted(qs)))
+        if key not in _g_seen:
+            _g_seen.add(key)
+            _g_deduped.append(u)
+    all_urls = _g_deduped
     if oast_domain:
         os.environ["COLLABORATOR"] = oast_domain
     jobs: List[Tuple[str, List[str], int]] = []
@@ -1930,16 +2055,21 @@ async def phase_G(
 
 
 async def phase_G2(
-    outdir: Path, t: Tools, only: PhaseSet, skip: PhaseSet, prev: Dict[str, Any]
+    outdir: Path, t: Tools, only: PhaseSet, skip: PhaseSet, prev: Dict[str, Any], force: bool = False,
 ) -> Dict[str, Any]:
     if skip & {"G2"}:
         return {}
+    _g2_out = outdir / "ssti.txt"
+    if _g2_out.exists() and not force and not (only & {"G2"}):
+        return {"G2": str(_g2_out), "count": count_nonblank(_g2_out)}
     log("info", "Phase G2: SSTI + deep XSS/SQLi fuzzing")
     urls = outdir / "urls_all.txt"
     all_urls = read_lines(urls) if urls.exists() else []
     if not all_urls:
         log("warn", "G2: no URLs; skipping")
         return {"G2": str(outdir / "ssti.txt"), "count": 0}
+    # Dedupe by (host, path) so the same path isn't SSTI-probed multiple times
+    all_urls = _dedupe_by_host_path(all_urls)
     param_urls = [u for u in all_urls if "=" in u]
     if not param_urls:
         param_urls = all_urls[:_PIPELINE_CFG.sample_urls_ssti]
@@ -2042,9 +2172,12 @@ def _mmh3_hash(data: bytes) -> int:
     return h
 
 
-async def phase_H(outdir: Path, t: Tools, only: PhaseSet, skip: PhaseSet, oast: Interactsh) -> Dict[str, Any]:
+async def phase_H(outdir: Path, t: Tools, only: PhaseSet, skip: PhaseSet, oast: Interactsh, force: bool = False) -> Dict[str, Any]:
     if skip & {"H"}:
         return {}
+    _h_out = outdir / "oast" / "callbacks.txt"
+    if _h_out.exists() and not force and not (only & {"H"}):
+        return {"H": str(_h_out), "count": count_nonblank(_h_out)}
     log("info", "Phase H: OAST callback collection")
     out = oast.stop()
     n = count_nonblank(out)
@@ -2056,10 +2189,13 @@ async def phase_H(outdir: Path, t: Tools, only: PhaseSet, skip: PhaseSet, oast: 
 
 
 async def phase_J(
-    domain: str, outdir: Path, t: Tools, only: PhaseSet, skip: PhaseSet, prev: Dict[str, Any]
+    domain: str, outdir: Path, t: Tools, only: PhaseSet, skip: PhaseSet, prev: Dict[str, Any], force: bool = False,
 ) -> Dict[str, Any]:
     if skip & {"J"}:
         return {}
+    _j_out = outdir / "origin.txt"
+    if _j_out.exists() and not force and not (only & {"J"}):
+        return {"J": str(_j_out), "count": count_nonblank(_j_out)}
     log("info", "Phase J: origin IP bypass enumeration")
     findings: List[str] = []
     hosts_file = Path(prev.get("B1.targets") or outdir / "host_targets.txt")
@@ -2337,9 +2473,12 @@ _JS_SECRET_PATTERNS: List[Tuple[str, str]] = [
 _SOURCE_MAP_RE = re.compile(r'(?://#\s*sourceMappingURL=|sourceMappingURL=)([^\s"\']+)')
 
 
-async def phase_K(outdir: Path, t: Tools, only: PhaseSet, skip: PhaseSet) -> Dict[str, Any]:
+async def phase_K(outdir: Path, t: Tools, only: PhaseSet, skip: PhaseSet, force: bool = False) -> Dict[str, Any]:
     if skip & {"K"}:
         return {}
+    _k_out = outdir / "js_secrets_deep.txt"
+    if _k_out.exists() and not force and not (only & {"K"}):
+        return {"K": str(_k_out), "count": count_nonblank(_k_out)}
     log("info", "Phase K: deep JS secret scanning (custom regex + entropy + source maps)")
     js_urls = outdir / "urls_js.txt"
     if not js_urls.exists() or not read_lines(js_urls):
@@ -2498,16 +2637,19 @@ _MASS_ASSIGN_FIELDS = [
 ]
 
 
-async def phase_L(outdir: Path, t: Tools, only: PhaseSet, skip: PhaseSet) -> Dict[str, Any]:
+async def phase_L(outdir: Path, t: Tools, only: PhaseSet, skip: PhaseSet, force: bool = False) -> Dict[str, Any]:
     if skip & {"L"}:
         return {}
+    _l_out = outdir / "auth_bypass.txt"
+    if _l_out.exists() and not force and not (only & {"L"}):
+        return {"L": str(_l_out), "count": count_nonblank(_l_out)}
     log("info", "Phase L: auth bypass headers + mass assignment probes")
     findings: List[str] = []
     # 1. Collect API-like endpoints from urls_all.txt + ffuf output
     urls = outdir / "urls_all.txt"
     api_endpoints: Set[str] = set()
     if urls.exists():
-        for u in read_lines(urls):
+        for u in _dedupe_by_host_path(read_lines(urls)):
             path = u.split("?")[0].split("#")[0].lower()
             if "/api/" in path or path.endswith(
                 (
@@ -2854,20 +2996,20 @@ def write_markdown(outdir: Path, domain: str, counts: Dict[str, int], missing: L
 PIPELINE = [
     ("A1", phase_A1, ("domain", "outdir", "t", "only", "skip", "resume", "force")),
     ("A2", phase_A2, ("domain", "outdir", "t", "only", "skip", "prev", "resume", "force")),
-    ("A3", phase_A3, ("domain", "outdir", "t", "only", "skip", "prev")),
-    ("B1", phase_B1, ("outdir", "t", "only", "skip", "prev")),
-    ("C1", phase_C1, ("outdir", "t", "only", "skip", "prev")),
-    ("C2", phase_C2, ("outdir", "t", "only", "skip")),
-    ("D", phase_D, ("outdir", "t", "only", "skip", "prev")),
-    ("E", phase_E, ("outdir", "t", "only", "skip")),
-    ("F1", phase_F1, ("outdir", "t", "only", "skip")),
-    ("F2", phase_F2, ("outdir", "t", "only", "skip")),
-    ("G", phase_G, ("outdir", "t", "only", "skip", "oast_domain")),
-    ("G2", phase_G2, ("outdir", "t", "only", "skip", "prev")),
-    ("H", phase_H, ("outdir", "t", "only", "skip", "oast")),
-    ("J", phase_J, ("domain", "outdir", "t", "only", "skip", "prev")),
-    ("K", phase_K, ("outdir", "t", "only", "skip")),
-    ("L", phase_L, ("outdir", "t", "only", "skip")),
+    ("A3", phase_A3, ("domain", "outdir", "t", "only", "skip", "prev", "force")),
+    ("B1", phase_B1, ("outdir", "t", "only", "skip", "prev", "force")),
+    ("C1", phase_C1, ("outdir", "t", "only", "skip", "prev", "force")),
+    ("C2", phase_C2, ("outdir", "t", "only", "skip", "force")),
+    ("D", phase_D, ("outdir", "t", "only", "skip", "prev", "force")),
+    ("E", phase_E, ("outdir", "t", "only", "skip", "force")),
+    ("F1", phase_F1, ("outdir", "t", "only", "skip", "force")),
+    ("F2", phase_F2, ("outdir", "t", "only", "skip", "force")),
+    ("G", phase_G, ("outdir", "t", "only", "skip", "oast_domain", "force")),
+    ("G2", phase_G2, ("outdir", "t", "only", "skip", "prev", "force")),
+    ("H", phase_H, ("outdir", "t", "only", "skip", "oast", "force")),
+    ("J", phase_J, ("domain", "outdir", "t", "only", "skip", "prev", "force")),
+    ("K", phase_K, ("outdir", "t", "only", "skip", "force")),
+    ("L", phase_L, ("outdir", "t", "only", "skip", "force")),
 ]
 # Dependency-ordered execution stages. Phases in the same stage are independent
 # of one another (they only read artifacts produced by *earlier* stages, never
@@ -2876,11 +3018,7 @@ PIPELINE = [
 # C2/D/E/F1/F2/G all fan out in parallel. The process-wide _JOB_SEM keeps the
 # total external-process count bounded across the whole fan-out.
 STAGES: List[List[str]] = [
-    ["A1"],
-    ["A2"],
-    ["A3"],
-    ["B1"],
-    ["C1"],
+    ["A1", "A2", "A3", "B1", "C1"],
     ["C2", "D", "E", "F1", "F2", "G", "G2", "J", "K", "L"],
     ["H"],
 ]
@@ -3042,6 +3180,7 @@ async def run_pipeline(args: argparse.Namespace) -> int:
         sample_urls_ssti=getattr(args, 'sample_urls_ssti', 5),
         sample_endpoints_post=getattr(args, 'sample_endpoints_post', 5),
         sample_endpoints_cors=getattr(args, 'sample_endpoints_cors', 10),
+        nuclei_exclude_tags=getattr(args, 'exclude_tags', ''),
         cookie=cookie,
         extra_headers=list(getattr(args, 'extra_headers', [])),
         proxy=proxy,
@@ -3498,6 +3637,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=20,
         help="number of URLs to probe for blind XSS via OAST (default: 20)",
+    )
+    p.add_argument(
+        "--exclude-tags",
+        type=str,
+        default="",
+        help="nuclei tags to exclude (comma-separated), e.g. 'info,tech'",
     )
     p.add_argument(
         "--sample-urls-ssti",

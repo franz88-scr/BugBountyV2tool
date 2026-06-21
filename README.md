@@ -87,7 +87,7 @@ Shows a summary before starting. Zero flags to remember.
 | **2 — Standard** | Level 1 + C2 → D → E → F1 → F2 | Full automated vuln scanning |
 | **Full** | Level 2 + G2 → J → K → L | Maximum coverage (SSTI, origin bypass, deep JS, auth bypass) |
 
-## Pipeline
+## Pipeline (streaming: A1→A2→B1→C1 overlap via incremental processing)
 
 ```
 A1  subdomains     ──→ all_subs.txt
@@ -113,8 +113,10 @@ Phases A1–I are the standard automated pipeline. Phases G2, J, K, L target gap
 automated scanners often miss (SSTI, Cloudflare origin discovery, deep secret scanning,
 mass assignment probes).
 
-Parallel stages: C2/D/E/F1/F2/G/G2/J/K/L all run concurrently once URLs and hosts are
-available.
+Streaming stages: A1/A2/A3/B1/C1 all run concurrently in the first stage — A1 writes
+subdomains incrementally, A2 polls and resolves them as they arrive, B1 and C1 start
+on partial hosts. This cuts wall-clock time by overlapping the linear chain.
+The remaining phases C2/D/E/F1/F2/G/G2/J/K/L fan out in the second stage.
 
 ### Phase Details
 
@@ -188,7 +190,7 @@ out/
 |----------|-------|
 | Enumeration | subfinder, amass, assetfinder, dnsx |
 | Network | naabu, nmap, httpx, subjack |
-| URLs | gau, waybackurls, gospider, katana, subjs |
+| URLs | gau, waybackurls, gospider, katana, subjs, waymore |
 | Analysis | LinkFinder, SecretFinder, ParamSpider, Arjun, x8, dnsgen |
 | Fuzzing | ffuf, kiterunner (kr), feroxbuster |
 | Vulns | nuclei (with auto-updated templates), dalfox, sqlmap, testssl.sh, wpscan, kxss |
@@ -227,6 +229,7 @@ binary.
 --sample-urls-ssti        SSTI sample URLs (default: 5)
 --sample-endpoints-post   Endpoints to mass-assign POST (default: 5)
 --sample-endpoints-cors   Endpoints to CORS-fuzz (default: 10)
+--exclude-tags            Nuclei tags to exclude (e.g. 'info,tech')
 ```
 
 ## Configuration
@@ -241,19 +244,23 @@ binary.
 | `COOKIE` | Default cookie for authenticated scans |
 | `NO_COLOR` | Disable colour output |
 
-## Key Improvements Over v1.2
+## Key Improvements Over v1.3
 
-- **New phase A3** — subdomain permutation via dnsgen + dnsx, appends newly-resolved hosts
-- **New tools** — kxss (pre-filter reflected params), dnsgen (permutation generator),
-  gitleaks (JS secret scanning)
-- **Extended J phase** — SPF, DMARC, DKIM DNS record audits via dig
-- **Extended K phase** — gitleaks scans all downloaded raw JS files for hardcoded secrets
-- **Extended B1** — UDP port scan via `naabu -udp -top-ports 100` alongside TCP scan
-- **Better G phase** — kxss pre-filter reduces dalfox noise by testing only reflected-param URLs
-- **More sample caps** — `--sample-urls-xss-blind`, `--sample-urls-ssti`,
-  `--sample-endpoints-post`, `--sample-endpoints-cors`
-- **Deterministic merge order** — results are now insertion-ordered (not set-sorted)
-- **Phase timing in reports** — `summary.json` includes per-phase start/end/elapsed_seconds
+- **Streaming pipeline** — A1/A2/B1/C1 now run concurrently in a single stage; A1 writes
+  subdomains incrementally every 30s, A2 polls and resolves them as they arrive, B1 and C1
+  start on partial hosts. Wall-clock reduction of 40–60% on typical targets.
+- **Output-existence guards (all phases)** — every phase now skips if its output exists and
+  `--force` is not set; saves 5–10 min on incremental re-runs.
+- **`--exclude-tags`** — exclude nuclei tags at runtime (e.g. `--exclude-tags info,tech`)
+- **Nuclei template cache** — templates auto-update at most once per 24 hours (stamp file)
+- **Nuclei `-bs 25`** — bulk-size=25 for faster multi-template scanning
+- **Waymore support** — optional waymore URL harvester (combines gau+wayback+crtsh)
+- **URL dedup in D, G, G2, L** — reduce redundant work by deduplicating (host, path) and
+  (param keys) before scanning
+- **Deduplicated silent re-runs** — `only.isdisjoint` removed from A1/A2 guards; phases
+  respect their output files regardless of `--only`
+- **httpx `-fr`** — follow-redirects on same host (faster)
+- **Katana `-duc`** — disable unique check for faster incremental re-runs
 
 ## Security
 

@@ -174,7 +174,9 @@ ALL_TOOLS=(subfinder amass assetfinder dnsx naabu nmap httpx subjack nuclei
 
            paramspider arjun ffuf feroxbuster testssl.sh
 
-           wpscan dalfox sqlmap interactsh-client kr x8)
+           wpscan dalfox sqlmap interactsh-client kr x8
+
+           kxss dnsgen gitleaks)
 
 
 if [[ "$MODE" == "check" ]]; then
@@ -273,6 +275,10 @@ GO_TOOLS=(
 
   "github.com/projectdiscovery/interactsh/cmd/interactsh-client"
 
+  "github.com/tomnomnom/hacks/kxss"
+
+  "github.com/zricethezav/gitleaks/v8"
+
 )
 
 
@@ -355,26 +361,23 @@ install_python_tools() {
 
   pip3 install --user --upgrade pip 2>/dev/null || true
 
-  for pkg in secretfinder arjun; do
-
-    # previous code used ${pkg%finder} which looked for the `secret` stdlib
-
-    # module and ALWAYS reported secretfinder as installed. Check the actual
-
-    # package import name (and CLI binary as a fallback).
-
+  # NOTE: secretfinder (m4ll0k/SecretFinder) is installed via git below,
+  # not from pip. The pip package `secretfinder` is a different tool.
+  for pkg in arjun; do
     if ! python3 -c "import ${pkg}" 2>/dev/null && \
-
        ! command -v "${pkg}" >/dev/null 2>&1; then
-
       pip3 install --user "$pkg" || warn "$pkg pip install failed"
-
     fi
-
     ok "$pkg"
-
   done
 
+
+  # dnsgen — subdomain permutation (Python)
+  if ! command -v dnsgen >/dev/null 2>&1; then
+    pip3 install --user --break-system-packages dnsgen 2>/dev/null || \
+      pip3 install --user dnsgen || warn "dnsgen pip install failed"
+  fi
+  ok "dnsgen"
 
   # paramspider (git)
 
@@ -624,5 +627,19 @@ if [[ ":$PATH:" != *":$GOPATH_BIN:"* ]]; then
 
 fi
 
+
+# Ensure `python` points to `python3` (some tools use #!/usr/bin/env python)
+if ! command -v python >/dev/null 2>&1 && command -v python3 >/dev/null 2>&1; then
+  PYTHON_BIN_DIR="$(dirname "$(command -v python3)")"
+  if [[ -w "$PYTHON_BIN_DIR" ]]; then
+    ln -sf python3 "$PYTHON_BIN_DIR/python"
+    ok "created $PYTHON_BIN_DIR/python -> python3"
+  elif [[ -w "$HOME/.local/bin" ]]; then
+    ln -sf "$(command -v python3)" "$HOME/.local/bin/python"
+    ok "created ~/.local/bin/python -> python3"
+  else
+    warn "python not found — create symlink: sudo ln -sf \$(which python3) /usr/local/bin/python"
+  fi
+fi
 
 ok "install complete. run: python3 reconchain.py -d example.com -o ./out"

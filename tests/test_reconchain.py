@@ -194,9 +194,9 @@ def test_stages_cover_pipeline_exactly_once() -> None:
 def test_stage_order_respects_dependencies() -> None:
     # phase -> first stage index it appears in
     stage_of = {name: i for i, stage in enumerate(reconchain.STAGES) for name in stage}
-    # A1 -> A2 -> B1 -> C1 must be strictly increasing; the fan-out phases
+    # A1-A2-B1-C1 are all in the same streaming stage now; fan-out phases
     # (which consume C1/B1 output) must come no earlier than C1.
-    assert stage_of["A1"] < stage_of["A2"] < stage_of["B1"] < stage_of["C1"]
+    assert stage_of["A1"] == stage_of["A2"] == stage_of["B1"] == stage_of["C1"]
     for fanout in ("C2", "D", "E", "F1", "F2", "G"):
         assert stage_of[fanout] >= stage_of["C1"]
 

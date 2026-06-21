@@ -77,6 +77,9 @@ Shows a summary before starting. Zero flags to remember.
 
 # Custom sample sizes (more URLs = thorough but slower)
 ./reconchain.py -d example.com --sample-urls-fuzz 50 --sample-urls-params 200
+
+# Exclude noisy nuclei tags
+./reconchain.py -d example.com --exclude-tags info,tech
 ```
 
 ## Recon Levels
@@ -126,7 +129,7 @@ The remaining phases C2/D/E/F1/F2/G/G2/J/K/L fan out in the second stage.
 | **A2** | dnsx | DNS resolution with A/AAAA/CNAME records; validates and deduplicates |
 | **A3** | dnsgen, dnsx | Subdomain permutation generation; resolves candidates, appends new findings |
 | **B1** | naabu (nmap fallback), httpx, subjack (nuclei fallback) | TCP + UDP port scanning, HTTP service detection, subdomain takeover checks |
-| **C1** | gau, waybackurls, gospider, katana, subjs | Historical URL harvesting + active crawling + JS URL extraction |
+| **C1** | gau, waybackurls, gospider, katana, subjs, waymore | Historical URL harvesting + active crawling + JS URL extraction |
 | **C2** | LinkFinder, SecretFinder, nuclei (exposures) | JavaScript file analysis for endpoints and secrets |
 | **D** | ParamSpider, Arjun, x8 | Parameter discovery on harvested URLs |
 | **E** | ffuf, kiterunner (kr), feroxbuster | Directory/file fuzzing with SecLists wordlists |
@@ -209,7 +212,7 @@ binary.
 -i, --interactive Interactive wizard
 --only            Comma-separated phases to run (e.g. A1,J,K)
 --skip            Comma-separated phases to skip
--j, --jobs        Max parallel processes (default: 16)
+-j, --jobs        Max parallel processes (default: cpu_count × 2)
 --fast            Basic recon only (A1, A2, B1, C1, I)
 --resume          Resume from state.json
 --force           Re-run all phases even if output files already exist
@@ -244,9 +247,9 @@ binary.
 | `COOKIE` | Default cookie for authenticated scans |
 | `NO_COLOR` | Disable colour output |
 
-## Key Improvements Over v1.3
+## Key Improvements
 
-- **Streaming pipeline** — A1/A2/B1/C1 now run concurrently in a single stage; A1 writes
+- **Streaming pipeline** — A1/A2/A3/B1/C1 all run concurrently in a single stage; A1 writes
   subdomains incrementally every 30s, A2 polls and resolves them as they arrive, B1 and C1
   start on partial hosts. Wall-clock reduction of 40–60% on typical targets.
 - **Output-existence guards (all phases)** — every phase now skips if its output exists and

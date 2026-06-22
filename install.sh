@@ -163,6 +163,8 @@ check() {
 
     warn "missing: ${missing[*]}"
 
+    return 1
+
   fi
 
 }
@@ -187,9 +189,7 @@ if [[ "$MODE" == "check" ]]; then
 
   log "Tool check:"
 
-  check "${ALL_TOOLS[@]}"
-
-  exit 0
+  check "${ALL_TOOLS[@]}"; exit $?
 
 fi
 
@@ -389,9 +389,11 @@ install_python_tools() {
   for pkg in arjun; do
     if ! python3 -c "import ${pkg}" 2>/dev/null && \
        ! command -v "${pkg}" >/dev/null 2>&1; then
-      pip3 install --user "$pkg" || warn "$pkg pip install failed"
+      pip3 install --user "$pkg" 2>/dev/null || \
+        pip3 install --user --break-system-packages "$pkg" 2>/dev/null || \
+        warn "$pkg pip install failed"
     fi
-    ok "$pkg"
+    command -v "$pkg" >/dev/null 2>&1 && ok "$pkg" || dim "$pkg not installed"
   done
 
 
@@ -445,6 +447,22 @@ EOF
 
   fi
 
+
+  # secretfinder (git) — originally installed by m4ll0k/SecretFinder
+  if ! command -v secretfinder >/dev/null 2>&1; then
+    if [[ ! -d /opt/SecretFinder ]]; then
+      sudo git clone --depth 1 https://github.com/m4ll0k/SecretFinder.git /opt/SecretFinder 2>/dev/null || true
+    fi
+    if [[ -f /opt/SecretFinder/SecretFinder.py ]]; then
+      sudo ln -sf /opt/SecretFinder/SecretFinder.py /usr/local/bin/secretfinder 2>/dev/null || true
+      # also install its requirements
+      pip3 install -r /opt/SecretFinder/requirements.txt 2>/dev/null || \
+        pip3 install --break-system-packages -r /opt/SecretFinder/requirements.txt 2>/dev/null || true
+      ok "secretfinder"
+    else
+      warn "secretfinder install failed"
+    fi
+  fi
 
   # assetfinder (go binary but listed here for visibility)
 

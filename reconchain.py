@@ -44,6 +44,7 @@ import struct
 import subprocess
 import sys
 import time
+import math
 import urllib.request
 from dataclasses import dataclass
 from datetime import datetime
@@ -154,7 +155,7 @@ def _parse_httpx_tech(src: Path, dst: Path) -> int:
         parts = line.strip().split()
         if len(parts) >= 4:
             url = parts[0]
-            status = parts[1] if parts[1].startswith("[") else ""
+            status = parts[1] if len(parts) > 1 and parts[1].startswith("[") else ""
             title = parts[2] if len(parts) > 2 and parts[2].startswith("[") else ""
             tech = parts[3] if len(parts) > 3 and parts[3].startswith("[") else ""
             entry = f"{url} {status} {title} {tech}".rstrip()
@@ -301,6 +302,8 @@ class StepResult:
 def _run_blocking(
     cmd: List[str], timeout: int, cwd: Optional[Path], log_path: Path
 ) -> Tuple[int, float]:
+    if _USE_PROXYCHAINS:
+        cmd = ["proxychains4"] + cmd
     t0 = time.monotonic()
     log_path.parent.mkdir(parents=True, exist_ok=True)
     with log_path.open("wb") as logf:
@@ -342,7 +345,7 @@ async def _run(name: str, cmd: List[str], timeout: int, outdir: Path, note: str 
         return StepResult(name, [], 0, 0.0, logp, note=note or "skipped")
     log("info", f"{name}  $ {cmd[0]} {(' '.join(cmd[1:3]))}{' …' if len(cmd) > 3 else ''}")
     rc, dur = await asyncio.to_thread(_run_blocking, cmd, timeout, outdir, logp)
-    lvl = "ok" if rc == 0 else "warn" if rc in (124, 127) else "err"
+    lvl = "ok" if rc == 0 else "warn" if rc in (1, 124, 127) else "err"
     log(lvl, f"{name} → rc={rc} in {dur:.1f}s")
     return StepResult(name, cmd, rc, dur, logp, note=note)
 
@@ -351,6 +354,9 @@ async def _run(name: str, cmd: List[str], timeout: int, outdir: Path, note: str 
 # does not fork-bomb the host. Defaults to 2× CPU count (auto-scaled);
 # pass -j/--jobs to override.
 MAX_PARALLEL_JOBS = max(4, (os.cpu_count() or 4) * 2)
+# Process-wide flag to wrap commands with proxychains4 when tor is enabled.
+_USE_PROXYCHAINS = False
+
 # Process-wide job semaphore. When several independent phases run concurrently
 # (see STAGES), they all draw from this single semaphore so the total number of
 # live external processes stays bounded by MAX_PARALLEL_JOBS regardless of how
@@ -407,7 +413,7 @@ def read_lines(p: Path) -> List[str]:
     return [
         ln.strip()
         for ln in p.read_text(errors="ignore").splitlines()
-        if ln.strip() and not ln.startswith("#")
+        if ln.strip() and not ln.lstrip().startswith("#")
     ]
 
 
@@ -442,9 +448,21 @@ def merge_unique(
                 continue
             if ln not in seen:
                 seen[ln] = None
+    if not seen:
+        return 0
     ensure(dst)
-    dst.write_text("\n".join(seen) + ("\n" if seen else ""))
+    dst.write_text("\n".join(seen) + "\n")
     return len(seen)
+
+
+def _downsample_file(path: Path, n: int = 1) -> None:
+    """Keep only the first `n` non-blank, non-comment lines of a text file (in-place)."""
+    if not path.is_file():
+        return
+    lines = [ln for ln in path.read_text(errors="ignore").splitlines()
+             if ln.strip() and not ln.lstrip().startswith("#")]
+    if len(lines) > n:
+        path.write_text("\n".join(lines[:n]) + "\n")
 
 
 def safe_suffix(s: str) -> str:
@@ -672,6 +690,7 @@ async def phase_A1(
         jobs.append(("assetfinder", ["bash", str(runner)], 600))
     if not jobs:
         log("warn", "A1: no subdomain tools available")
+        ensure(out)
         return {"A1": str(out), "count": 0}
 
     # Incremental merge: while tools run, merge partial results into all_subs.txt
@@ -710,6 +729,8 @@ async def phase_A1(
 
     # Final merge
     n = merge_unique(_a1_sources, out, validator=_under_domain)
+    if n == 0:
+        ensure(out)  # Empty file signals A1 completed (no subs found)
     log("ok", f"A1: {n} unique subdomains → {out}")
     ret: Dict[str, Any] = {"A1": str(out), "count": n}
     if failures:
@@ -737,14 +758,14 @@ async def phase_A2(
     subs_file = Path(prev.get("A1") or outdir / "all_subs.txt")
 
     # Streaming: poll for input from A1 (which may be writing incrementally)
-    if not subs_file.exists() or subs_file.stat().st_size == 0:
+    if not read_lines(subs_file):
         log("info", "A2: waiting for subdomains from A1…")
-        for _ in range(60):  # up to ~5 min
+        for _ in range(12):  # up to ~1 min
             await asyncio.sleep(5)
-            if subs_file.exists() and subs_file.stat().st_size > 0:
+            if read_lines(subs_file):
                 break
-        else:
-            log("warn", "A2: A1 produced no subdomains within timeout; skipping")
+        if not read_lines(subs_file):
+            log("warn", "A2: A1 produced no subdomains; skipping")
             return {"A2": str(out), "count": 0}
 
     log("info", "Phase A2: dnsx resolution (streaming)")
@@ -762,6 +783,7 @@ async def phase_A2(
         tmp.write_text("\n".join(batch) + "\n")
         if not t.has("dnsx"):
             merge_unique([tmp], out)
+            tmp.unlink(missing_ok=True)
             return len(batch)
         full_batch = outdir / ".a2_full_batch.txt"
         res = await _run(
@@ -772,8 +794,11 @@ async def phase_A2(
         )
         if full_batch.exists() and read_lines(full_batch):
             _merge_dnsx_output(full_batch, out, full)
+            cnt = count_nonblank(full_batch) if full_batch.exists() else 0
             full_batch.unlink(missing_ok=True)
-            return count_nonblank(full_batch) if full_batch.exists() else 0
+            tmp.unlink(missing_ok=True)
+            return cnt
+        full_batch.unlink(missing_ok=True)
         tmp.unlink(missing_ok=True)
         return 0
 
@@ -813,8 +838,14 @@ async def phase_A3(
     # Input: all discovered subdomains from A1
     subs_in = Path(prev.get("A1") or outdir / "all_subs.txt")
     if not subs_in.exists() or not read_lines(subs_in):
-        log("warn", "A3: no subdomains to permute; skipping")
-        return {}
+        log("info", "A3: waiting for subdomains from A1…")
+        for _ in range(60):
+            await asyncio.sleep(5)
+            if subs_in.exists() and read_lines(subs_in):
+                break
+        else:
+            log("warn", "A3: no subdomains to permute; skipping")
+            return {}
     permuted = outdir / "subs_permuted.txt"
     resolved = outdir / "subs_permuted_resolved.txt"
     merged = outdir / "subs_merged.txt"
@@ -858,7 +889,9 @@ async def phase_A3(
         if clean:
             ensure(resolved_hosts).write_text("\n".join(set(clean)) + "\n")
             merge_srcs.append(resolved_hosts)
-    n = merge_unique(merge_srcs, all_subs, _is_under_domain)
+    n = merge_unique(merge_srcs, all_subs, lambda h: _is_under_domain(h, domain))
+    permuted.unlink(missing_ok=True)
+    resolved.unlink(missing_ok=True)
     log("ok", f"A3: {n} total subdomains (after permutation)")
     return {"A1": str(all_subs), "A3": str(all_subs), "count": n}
 
@@ -890,13 +923,21 @@ async def phase_B1(
     have_hosts = hosts.exists() and bool(read_lines(hosts))
     have_subs = subs.exists() and bool(read_lines(subs))
     if not have_hosts and not have_subs:
-        log("warn", "B1: no host or subdomain input; skipping")
-        return {
-            "B1.ports": str(ports_file),
-            "B1.hosts": str(outdir / "hosts.txt"),
-            "B1.targets": str(outdir / "host_targets.txt"),
-            "B1.takeover": str(outdir / "takeover.txt"),
-        }
+        log("info", "B1: waiting for hosts/subdomains from A1/A2…")
+        for _ in range(120):
+            await asyncio.sleep(5)
+            have_hosts = hosts.exists() and bool(read_lines(hosts))
+            have_subs = subs.exists() and bool(read_lines(subs))
+            if have_hosts or have_subs:
+                break
+        if not have_hosts and not have_subs:
+            log("warn", "B1: no host or subdomain input; skipping")
+            return {
+                "B1.ports": str(ports_file),
+                "B1.hosts": str(outdir / "hosts.txt"),
+                "B1.targets": str(outdir / "host_targets.txt"),
+                "B1.takeover": str(outdir / "takeover.txt"),
+            }
     if have_hosts and t.has("naabu"):
         jobs.append(
             (
@@ -1045,6 +1086,8 @@ async def phase_B1(
             if sv_findings:
                 ensure(services_file).write_text("\n".join(sv_findings) + "\n")
                 log("ok", f"B1: {len(sv_findings)} service detections → {services_file}")
+            for svp in outdir.glob("services_*.gnmap"):
+                svp.unlink(missing_ok=True)
     # If nmap was used instead of naabu, synthesize ports.txt from the
     # greppable output so downstream phases see a consistent artifact.
     if not ports_file.exists():
@@ -1086,18 +1129,32 @@ async def phase_C1(
     if _c1_out.exists() and not force and not (only & {"C1"}):
         return {"C1": str(_c1_out), "count": count_nonblank(_c1_out)}
     log("info", "Phase C1: URL harvesting (parallel groups)")
-    hosts = Path(prev.get("B1.targets") or outdir / "host_targets.txt")
-    if not hosts.exists() or not read_lines(hosts):
-        hosts = Path(prev.get("B1.hosts") or outdir / "hosts.txt")
-    if hosts.exists() and read_lines(hosts) and hosts.name == "hosts.txt":
-        normalized = outdir / "host_targets.txt"
-        _write_target_tokens(hosts, normalized)
-        hosts = normalized
-    if not hosts.exists() or not read_lines(hosts):
-        hosts = Path(prev.get("A2") or outdir / "resolved.txt")
-    if not hosts.exists() or not read_lines(hosts):
-        log("warn", "C1: no host input; skipping")
-        return {}
+
+    async def _c1_resolve_hosts() -> Optional[Path]:
+        h = Path(prev.get("B1.targets") or outdir / "host_targets.txt")
+        if not h.exists() or not read_lines(h):
+            h = Path(prev.get("B1.hosts") or outdir / "hosts.txt")
+        if h.exists() and read_lines(h) and h.name == "hosts.txt":
+            normalized = outdir / "host_targets.txt"
+            _write_target_tokens(h, normalized)
+            h = normalized
+        if not h.exists() or not read_lines(h):
+            h = Path(prev.get("A2") or outdir / "resolved.txt")
+        if h.exists() and read_lines(h):
+            return h
+        return None
+
+    hosts = await _c1_resolve_hosts()
+    if hosts is None:
+        log("info", "C1: waiting for host input from A2/B1…")
+        for _ in range(120):
+            await asyncio.sleep(5)
+            hosts = await _c1_resolve_hosts()
+            if hosts is not None:
+                break
+        if hosts is None:
+            log("warn", "C1: no host input; skipping")
+            return {}
     g1: List[Tuple[str, List[str], int]] = []
     # gau v2 supports -l <file> for a list of domains; if the local
     # build doesn't, fall back to a per-host loop (also avoids ARG_MAX).
@@ -1443,10 +1500,14 @@ def _merge_dnsx_output(src: Path, hosts_out: Path, full_out: Path) -> None:
         seen_hosts.update(l.strip().lower() for l in read_lines(hosts_out) if l.strip())
     new_hosts: List[str] = []
     if full_out.exists():
-        new_hosts.extend(read_lines(full_out))
+        for l in read_lines(full_out):
+            h = l.strip().split()[0].rstrip(".").lower()
+            if h:
+                seen_hosts.add(h)
+                new_hosts.append(l.strip())
     for ln in read_lines(src):
         ln = ln.strip()
-        if not ln or ln.startswith("#"):
+        if not ln or ln.lstrip().startswith("#"):
             continue
         host = ln.split()[0].rstrip(".")
         if _is_valid_hostname(host) and host.lower() not in seen_hosts:
@@ -1486,6 +1547,10 @@ async def phase_E(outdir: Path, t: Tools, only: PhaseSet, skip: PhaseSet, force:
     deduped = _dedupe_by_host_path(all_urls)
     sample = deduped[:_PIPELINE_CFG.sample_urls_fuzz]
     log("info", f"E: {len(all_urls)} raw URLs → {len(deduped)} unique paths, sampling {len(sample)}")
+    _proxy_opt = []
+    _proxy = os.environ.get("PROXY", "")
+    if _proxy:
+        _proxy_opt = ["-proxy", _proxy]
     wordlist = os.environ.get(
         "FFUF_WORDLIST",
         "/usr/share/seclists/Discovery/Web-Content/raft-medium-directories.txt",
@@ -1619,6 +1684,12 @@ async def phase_E(outdir: Path, t: Tools, only: PhaseSet, skip: PhaseSet, force:
         normalized.append(norm)
     normalized.extend(outdir.glob("fb_*.txt"))
     n = merge_unique(normalized, outdir / "fuzz.txt")
+    for p in normalized:
+        p.unlink(missing_ok=True)
+    for p in outdir.glob("ffuf_*.json"):
+        p.unlink(missing_ok=True)
+    for p in outdir.glob("kr_*.jsonl"):
+        p.unlink(missing_ok=True)
     if n == 0:
         log("warn", "E: fuzzers produced no hits")
     return {"E": str(outdir / "fuzz.txt"), "count": n}
@@ -1705,7 +1776,7 @@ async def phase_F1(outdir: Path, t: Tools, only: PhaseSet, skip: PhaseSet, force
             (
                 "nuclei-headless",
                 nuclei_base
-                + ["-tags", "headless", "-severity", "medium,high,critical",
+                + ["-headless", "-tags", "headless", "-severity", "medium,high,critical",
                    "-o", str(outdir / "nuclei_headless.txt")]
                 + _proxy_opt,
                 3600,
@@ -1791,7 +1862,7 @@ async def phase_F2(outdir: Path, t: Tools, only: PhaseSet, skip: PhaseSet, force
         '                ver = ssock.version()\n'
         '                cipher = ssock.cipher()\n'
         '                cert = ssock.getpeercert()\n'
-        '                cn = dict(cert.get("subject", [])).get("commonName", "")\n'
+        '                cn = next((v for part in cert.get("subject", []) for k, v in part if k == "commonName"), "")\n'
         '                san = [v for _, v in cert.get("subjectAltName", [])]\n'
         '                results.append({\n'
         '                    "host": h, "tls_version": ver,\n'
@@ -1800,7 +1871,7 @@ async def phase_F2(outdir: Path, t: Tools, only: PhaseSet, skip: PhaseSet, force
         '                })\n'
         '    except Exception as e:\n'
         '        results.append({"host": h, "error": str(e)})\n'
-        f'with open({shlex.quote(str(outdir / "tls_check.json"))}, "w") as f:\n'
+        f'with open({json.dumps(str(outdir / "tls_check.json"))}, "w") as f:\n'
         '    json.dump(results, f, indent=2)\n'
     )
     tls_script.chmod(0o755)
@@ -1857,6 +1928,10 @@ async def phase_F2(outdir: Path, t: Tools, only: PhaseSet, skip: PhaseSet, force
         list(outdir.glob("testssl_*.txt")) + list(outdir.glob("wpscan_*.txt")),
         outdir / "tls_wp.txt",
     )
+    for p in outdir.glob("testssl_*.txt"):
+        p.unlink(missing_ok=True)
+    for p in outdir.glob("wpscan_*.txt"):
+        p.unlink(missing_ok=True)
     return {"F2": str(outdir / "tls_wp.txt"), "count": n}
 
 
@@ -2494,6 +2569,9 @@ async def phase_K(outdir: Path, t: Tools, only: PhaseSet, skip: PhaseSet, force:
                 body = resp.read().decode("utf-8", errors="ignore")
         except Exception:
             continue
+        # Save raw JS file for gitleaks scanning
+        js_raw = ensure(outdir / f"js_raw_{safe_suffix(js_url)}.js")
+        js_raw.write_text(body)
         # Custom regex patterns
         for name, pattern in _JS_SECRET_PATTERNS:
             for m in re.finditer(pattern, body):
@@ -2516,7 +2594,7 @@ async def phase_K(outdir: Path, t: Tools, only: PhaseSet, skip: PhaseSet, force:
             for f in freq:
                 if f > 0:
                     p = f / len(val)
-                    entropy -= p * (p and __import__("math").log2(p) or 0.0)
+                    entropy -= p * math.log2(p) if p > 0 else 0.0
             if entropy > 4.5:
                 seen_secrets.add(val)
                 findings.append(f"[high-entropy] {val[:60]}… (entropy={entropy:.2f})  ({js_url})")
@@ -3151,7 +3229,12 @@ async def run_pipeline(args: argparse.Namespace) -> int:
             t.seed_missing([m])
     # Bind the process-wide job semaphore to THIS event loop so every phase's
     # run_parallel() shares one budget of live external processes.
-    global _JOB_SEM, _PIPELINE_CFG
+    global _JOB_SEM, _PIPELINE_CFG, _USE_PROXYCHAINS
+
+    # Auto-detect proxychains4 for tor routing
+    if shutil.which("proxychains4"):
+        _USE_PROXYCHAINS = True
+        log("info", "proxychains4 detected — wrapping all commands")
 
     proxy = getattr(args, 'proxy', '')
     if not proxy:
@@ -3273,6 +3356,12 @@ async def run_pipeline(args: argparse.Namespace) -> int:
             results = await asyncio.gather(*(_run_phase(n) for n in run_now))
             for name, result in zip(run_now, results):
                 _apply(name, result)
+                # Downsample each new artifact to 1 entry so downstream phases
+                # test functionality with minimal input (unless --keep-all).
+                if not getattr(args, 'keep_all', False):
+                    for k, v in (result or {}).items():
+                        if isinstance(v, str) and v.endswith(".txt"):
+                            _downsample_file(Path(v), n=1)
             try:
                 _atomic_write_json(state_path, state)
             except Exception as e:
@@ -3318,7 +3407,7 @@ _RECON_LEVELS = {
     "full": {
         "name": "Full audit",
         "desc": "Standard + SSTI + origin bypass + deep JS + auth bypass/mass assignment",
-        "phases": VALID_PHASES - {"H"},
+        "phases": VALID_PHASES,
     },
 }
 
@@ -3351,17 +3440,12 @@ def _prompt_yes_no(prompt_text: str, default: bool = True) -> bool:
 
 def _banner() -> None:
     banner = f"""
-{C["red"]}    ▄▄▄▄▄▄▄▄▄▄▄  ▄▄▄▄▄▄▄▄▄▄▄  ▄▄▄▄▄▄▄▄▄▄▄  ▄▄▄▄▄▄▄▄▄▄▄
-{C["c"]}   ▐░░░░░░░░░░░▌▐░░░░░░░░░░░▌▐░░░░░░░░░░░▌▐░░░░░░░░░░░▌
-{C["y"]}   ▐░█▀▀▀▀▀▀▀▀▀ ▐░█▀▀▀▀▀▀▀█░▌▐░█▀▀▀▀▀▀▀█░▌▐░█▀▀▀▀▀▀▀▀▀
-{C["g"]}   ▐░▌          ▐░▌       ▐░▌▐░▌       ▐░▌▐░▌
-{C["b"]}   ▐░▌ ▄▄▄▄▄▄▄▄ ▐░█▄▄▄▄▄▄▄█░▌▐░▌       ▐░▌▐░▌ ▄▄▄▄▄▄▄▄
-{C["m"]}   ▐░▌▐░░░░░░░░▌▐░░░░░░░░░░░▌▐░▌       ▐░▌▐░▌▐░░░░░░░░▌
-{C["red"]}   ▐░▌ ▀▀▀▀▀▀▀▀ ▐░█▀▀▀▀▀▀▀█░▌▐░▌       ▐░▌▐░▌ ▀▀▀▀▀▀▀▀
-{C["c"]}   ▐░▌          ▐░▌       ▐░▌▐░▌       ▐░▌▐░▌
-{C["y"]}   ▐░█▄▄▄▄▄▄▄▄▄ ▐░▌       ▐░▌▐░█▄▄▄▄▄▄▄█░▌▐░█▄▄▄▄▄▄▄▄▄
-{C["g"]}   ▐░░░░░░░░░░░▌▐░▌       ▐░▌▐░░░░░░░░░░░▌▐░░░░░░░░░░░▌
-{C["b"]}    ▀▀▀▀▀▀▀▀▀▀▀  ▀         ▀  ▀▀▀▀▀▀▀▀▀▀▀  ▀▀▀▀▀▀▀▀▀▀▀
+{C["c"]}    ██████╗ ██████╗ ████████╗
+{C["c"]}    ██╔══██╗██╔══██╗╚══██╔══╝
+{C["c"]}    ██████╔╝██████╔╝   ██║
+{C["c"]}    ██╔══██╗██╔══██╗   ██║
+{C["c"]}    ██████╔╝██████╔╝   ██║
+{C["c"]}    ╚═════╝ ╚═════╝    ╚═╝
 {C["r"]}
 {C["g"]}   ╔══════════════════════════════════════════════════════╗
 {C["g"]}   ║  {C["c"]}ReconChain v{__version__}{C["g"]}  —  {C["y"]}Bug Bounty Recon & Vuln Pipeline{C["g"]}   ║
@@ -3422,17 +3506,26 @@ def interactive_setup() -> argparse.Namespace:
         validator=lambda v: v.replace(".", "", 1).isdigit(),
         error_msg="Enter a number (e.g. 0, 0.5, 2)",
     )
+    def _validate_count(v: str) -> bool:
+        return v.lower() == "all" or (v.isdigit() and int(v) > 0)
+
     sample_fuzz = _prompt(
-        "Number of URLs to fuzz (more = thorough but slow)",
+        "Number of URLs to fuzz (enter 'all' for every URL, more = thorough but slow)",
         default="5",
-        validator=lambda v: v.isdigit() and int(v) > 0,
-        error_msg="Enter a positive number",
+        validator=_validate_count,
+        error_msg="Enter a positive number or 'all'",
     )
     sample_params = _prompt(
-        "Number of URLs for parameter discovery (more = thorough but slow)",
+        "Number of URLs for parameter discovery (enter 'all' for every URL, more = thorough but slow)",
         default="50",
-        validator=lambda v: v.isdigit() and int(v) > 0,
-        error_msg="Enter a positive number",
+        validator=_validate_count,
+        error_msg="Enter a positive number or 'all'",
+    )
+    sample_pspider = _prompt(
+        "Number of URLs for ParamSpider (enter 'all' for every URL)",
+        default="3",
+        validator=_validate_count,
+        error_msg="Enter a positive number or 'all'",
     )
     # 6. Manual testing add-ons (only for level 2 / full)
     extra_phases: Set[str] = set()
@@ -3492,9 +3585,12 @@ def interactive_setup() -> argparse.Namespace:
     ns.sqlmap_risk = int(sqlmap_risk)
     ns.delay = float(delay)
     ns.rate_limit = 0
-    ns.sample_urls_fuzz = int(sample_fuzz)
-    ns.sample_urls_params = int(sample_params)
-    ns.sample_urls_pspider = int(sample_params)
+    def _resolve_count(v: str) -> int:
+        return 10**9 if v.lower() == "all" else int(v)
+
+    ns.sample_urls_fuzz = _resolve_count(sample_fuzz)
+    ns.sample_urls_params = _resolve_count(sample_params)
+    ns.sample_urls_pspider = _resolve_count(sample_pspider)
     return ns
 
 
@@ -3547,6 +3643,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--force",
         action="store_true",
         help="re-run all phases even if output files already exist",
+    )
+    p.add_argument(
+        "--keep-all",
+        action="store_true",
+        help="disable downsampling (keep all results instead of truncating to 1 entry per artifact)",
     )
     p.add_argument("-q", "--quiet", action="store_true", help="suppress info-level logs")
     p.add_argument("--no-color", action="store_true", help="disable ANSI color output")

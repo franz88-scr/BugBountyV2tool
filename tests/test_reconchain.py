@@ -21,9 +21,9 @@ def test_hostname_validation_rejects_bad_labels() -> None:
 
 
 def test_phase_csv_validation() -> None:
-    assert reconchain._parse_phase_csv("a1, F2,g") == {"A1", "F2", "G"}
+    assert reconchain._parse_phase_csv("01-recon, 10-tlscms,11-inject") == {"01-RECON", "10-TLSCMS", "11-INJECT"}
     with pytest.raises(argparse.ArgumentTypeError):
-        reconchain._parse_phase_csv("A1,NOPE")
+        reconchain._parse_phase_csv("01-RECON,NOPE")
 
 
 def test_parser_help_returns_0() -> None:
@@ -144,12 +144,12 @@ def test_phase_f2_produces_tls_wp_file(tmp_path: Path) -> None:
     (tmp_path / "host_targets.txt").write_text("https://a.example.com\n")
     tools = reconchain.Tools()
 
-    result = asyncio.run(reconchain.phase_F2(tmp_path, tools, set(), set()))
+    result = asyncio.run(reconchain.phase_10_TLSCMS(tmp_path, tools, set(), set()))
 
     tls_wp = tmp_path / "tls_wp.txt"
     assert tls_wp.exists()
     assert result["count"] >= 0
-    assert result["F2"] is not None
+    assert result["10-TLSCMS"] is not None
 
 
 def test_no_tool_pipeline_generates_reports_without_oast(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -158,13 +158,13 @@ def test_no_tool_pipeline_generates_reports_without_oast(monkeypatch: pytest.Mon
     monkeypatch.setattr(reconchain.Tools, "have", _no_tools)
 
     def fail_start(self: reconchain.Interactsh) -> bool:
-        raise AssertionError("OAST should not start for --only A1,A2")
+        raise AssertionError("OAST should not start for --only 01-RECON,02-RESOLVE")
 
     monkeypatch.setattr(reconchain.Interactsh, "start", fail_start)
     args = argparse.Namespace(
         domain="example.com",
         out=str(tmp_path),
-        only={"A1", "A2"},
+        only={"01-RECON", "02-RESOLVE"},
         skip=set(),
         resume=False,
         quiet=True,
@@ -194,11 +194,11 @@ def test_stages_cover_pipeline_exactly_once() -> None:
 def test_stage_order_respects_dependencies() -> None:
     # phase -> first stage index it appears in
     stage_of = {name: i for i, stage in enumerate(reconchain.STAGES) for name in stage}
-    # A1-A2-B1-C1 are all in the same streaming stage now; fan-out phases
-    # (which consume C1/B1 output) must come no earlier than C1.
-    assert stage_of["A1"] == stage_of["A2"] == stage_of["B1"] == stage_of["C1"]
-    for fanout in ("C2", "D", "E", "F1", "F2", "G"):
-        assert stage_of[fanout] >= stage_of["C1"]
+    # 01-RECON-02-RESOLVE-04-SCAN-05-HARVEST are all in the same streaming stage now; fan-out phases
+    # (which consume 05-HARVEST/04-SCAN output) must come no earlier than 05-HARVEST.
+    assert stage_of["01-RECON"] == stage_of["02-RESOLVE"] == stage_of["04-SCAN"] == stage_of["05-HARVEST"]
+    for fanout in ("06-JSINTEL", "07-PARAMS", "08-FUZZ", "09-VULNSCAN", "10-TLSCMS", "11-INJECT"):
+        assert stage_of[fanout] >= stage_of["05-HARVEST"]
 
 
 def test_independent_phases_run_concurrently(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -225,7 +225,7 @@ def test_independent_phases_run_concurrently(monkeypatch: pytest.MonkeyPatch, tm
         fast=False, no_color=False, interactive=False, jobs=16, proxy="",
     )
     assert asyncio.run(reconchain.run_pipeline(args)) == 0
-    # The fan-out stage has 6 independent phases, so peak concurrency must be >1.
+    # Multiple stages with concurrent phases, so peak concurrency must be >1.
     assert state["peak"] > 1
 
 
@@ -244,14 +244,14 @@ def test_cli_help_subprocess() -> None:
 # ──────────────────── Vulnerability phase tests ──────────────────────────
 
 def test_phase_g_no_urls_returns_zero(tmp_path: Path) -> None:
-    """Phase G (dalfox/sqlmap/SSRF) should return count 0 when no URLs exist."""
+    """Phase 11-INJECT (dalfox/sqlmap/SSRF) should return count 0 when no URLs exist."""
     tools = reconchain.Tools()
-    result = asyncio.run(reconchain.phase_G(tmp_path, tools, set(), set(), None))
+    result = asyncio.run(reconchain.phase_11_INJECT(tmp_path, tools, set(), set(), None))
     assert result["count"] == 0
 
 
 def test_phase_g_creates_xss_urls_and_ssrf_urls(tmp_path: Path) -> None:
-    """Phase G should partition URLs into XSS candidates (have '=') and SSRF candidates."""
+    """Phase 11-INJECT should partition URLs into XSS candidates (have '=') and SSRF candidates."""
     urls = tmp_path / "urls_all.txt"
     urls.write_text(
         "https://example.com/page?foo=1\n"
@@ -259,7 +259,7 @@ def test_phase_g_creates_xss_urls_and_ssrf_urls(tmp_path: Path) -> None:
         "https://example.com/api\n"
     )
     tools = reconchain.Tools()
-    asyncio.run(reconchain.phase_G(tmp_path, tools, set(), set(), None))
+    asyncio.run(reconchain.phase_11_INJECT(tmp_path, tools, set(), set(), None))
 
     xss = tmp_path / "urls_xss.txt"
     assert xss.exists()
@@ -272,27 +272,27 @@ def test_phase_g_creates_xss_urls_and_ssrf_urls(tmp_path: Path) -> None:
 
 
 def test_phase_g_skips_when_urls_file_missing(tmp_path: Path) -> None:
-    """Phase G should gracefully return 0 if urls_all.txt does not exist."""
+    """Phase 11-INJECT should gracefully return 0 if urls_all.txt does not exist."""
     tools = reconchain.Tools()
-    result = asyncio.run(reconchain.phase_G(tmp_path, tools, set(), set(), "oast.example.com"))
+    result = asyncio.run(reconchain.phase_11_INJECT(tmp_path, tools, set(), set(), "oast.example.com"))
     assert result["count"] == 0
 
 
 def test_phase_g2_no_urls_returns_zero(tmp_path: Path) -> None:
-    """Phase G2 (SSTI) should return count 0 when no URLs exist."""
+    """Phase 12-SSTI (SSTI) should return count 0 when no URLs exist."""
     tools = reconchain.Tools()
-    prev = {"C1": str(tmp_path / "urls_all.txt")}
-    result = asyncio.run(reconchain.phase_G2(tmp_path, tools, set(), set(), prev))
+    prev = {"05-HARVEST": str(tmp_path / "urls_all.txt")}
+    result = asyncio.run(reconchain.phase_12_SSTI(tmp_path, tools, set(), set(), prev))
     assert result["count"] == 0
 
 
 def test_phase_g2_generates_ssti_payloads(tmp_path: Path) -> None:
-    """Phase G2 should test SSTI payloads against parameterized URLs."""
+    """Phase 12-SSTI should test SSTI payloads against parameterized URLs."""
     urls = tmp_path / "urls_all.txt"
     urls.write_text("https://example.com/page?q=1\n")
     tools = reconchain.Tools()
-    prev = {"C1": str(urls)}
-    asyncio.run(reconchain.phase_G2(tmp_path, tools, set(), set(), prev))
+    prev = {"05-HARVEST": str(urls)}
+    asyncio.run(reconchain.phase_12_SSTI(tmp_path, tools, set(), set(), prev))
 
     ssti_file = tmp_path / "ssti.txt"
     # ssti.txt may be empty (no actual SSTI found against localhost) but the
@@ -301,12 +301,12 @@ def test_phase_g2_generates_ssti_payloads(tmp_path: Path) -> None:
 
 
 def test_phase_g2_handles_non_param_urls(tmp_path: Path) -> None:
-    """Phase G2 should handle URLs without parameters gracefully."""
+    """Phase 12-SSTI should handle URLs without parameters gracefully."""
     urls = tmp_path / "urls_all.txt"
     urls.write_text("https://example.com/api\n")
     tools = reconchain.Tools()
-    prev = {"C1": str(urls)}
-    asyncio.run(reconchain.phase_G2(tmp_path, tools, set(), set(), prev))
+    prev = {"05-HARVEST": str(urls)}
+    asyncio.run(reconchain.phase_12_SSTI(tmp_path, tools, set(), set(), prev))
 
     ssti_file = tmp_path / "ssti.txt"
     assert ssti_file.exists()
@@ -332,30 +332,30 @@ def test_mmh3_hash_known_value() -> None:
 
 
 def test_phase_j_no_hosts_uses_favicon_fallback(tmp_path: Path) -> None:
-    """Phase J should attempt favicon for the domain even without hosts."""
+    """Phase 14-ORIGIN should attempt favicon for the domain even without hosts."""
     tools = reconchain.Tools()
-    prev = {"A2": str(tmp_path / "resolved.txt")}
+    prev = {"02-RESOLVE": str(tmp_path / "resolved.txt")}
     # no files exist, so it should fall through gracefully
-    result = asyncio.run(reconchain.phase_J("www.agoda.com", tmp_path, tools, set(), set(), prev))
+    result = asyncio.run(reconchain.phase_14_ORIGIN("www.agoda.com", tmp_path, tools, set(), set(), prev))
     origin_file = tmp_path / "origin.txt"
     assert origin_file.exists()
     assert isinstance(result["count"], int)
 
 
 def test_phase_j_crt_subs_parsing(tmp_path: Path) -> None:
-    """Phase J crt.sh section should handle resolved file output."""
+    """Phase 14-ORIGIN crt.sh section should handle resolved file output."""
     crt_resolved = tmp_path / "crt_resolved.txt"
     crt_resolved.write_text("sub.example.com [A] [1.2.3.4]\n")
     tools = reconchain.Tools()
-    prev = {"A2": str(tmp_path / "resolved.txt")}
-    result = asyncio.run(reconchain.phase_J("example.com", tmp_path, tools, set(), set(), prev))
+    prev = {"02-RESOLVE": str(tmp_path / "resolved.txt")}
+    result = asyncio.run(reconchain.phase_14_ORIGIN("example.com", tmp_path, tools, set(), set(), prev))
     assert result["count"] >= 0
 
 
 def test_phase_k_no_js_urls_returns_zero(tmp_path: Path) -> None:
-    """Phase K should return count 0 with no JS URLs."""
+    """Phase 15-SECRETS should return count 0 with no JS URLs."""
     tools = reconchain.Tools()
-    result = asyncio.run(reconchain.phase_K(tmp_path, tools, set(), set()))
+    result = asyncio.run(reconchain.phase_15_SECRETS(tmp_path, tools, set(), set()))
     assert result["count"] == 0
 
 
@@ -399,14 +399,14 @@ def test_phase_k_source_map_regex() -> None:
 
 
 def test_phase_l_no_endpoints_returns_zero(tmp_path: Path) -> None:
-    """Phase L should return count 0 when no endpoints exist."""
+    """Phase 16-AUTHZ should return count 0 when no endpoints exist."""
     tools = reconchain.Tools()
-    result = asyncio.run(reconchain.phase_L(tmp_path, tools, set(), set()))
+    result = asyncio.run(reconchain.phase_16_AUTHZ(tmp_path, tools, set(), set()))
     assert result["count"] == 0
 
 
 def test_phase_l_extracts_api_endpoints_from_urls(tmp_path: Path) -> None:
-    """Phase L should detect API-like endpoints from urls_all.txt."""
+    """Phase 16-AUTHZ should detect API-like endpoints from urls_all.txt."""
     urls = tmp_path / "urls_all.txt"
     urls.write_text(
         "https://example.com/api/v1/users\n"
@@ -414,7 +414,7 @@ def test_phase_l_extracts_api_endpoints_from_urls(tmp_path: Path) -> None:
         "https://example.com/admin\n"
     )
     tools = reconchain.Tools()
-    asyncio.run(reconchain.phase_L(tmp_path, tools, set(), set()))
+    asyncio.run(reconchain.phase_16_AUTHZ(tmp_path, tools, set(), set()))
 
     auth = tmp_path / "auth_bypass.txt"
     content = auth.read_text()
@@ -439,13 +439,13 @@ def test_phase_l_mass_assignment_fields_defined() -> None:
 
 
 def test_vuln_txt_merge_includes_existing_files(tmp_path: Path) -> None:
-    """Phase G merge should include xss.txt and sqlmap.log when they exist."""
+    """Phase 11-INJECT merge should include xss.txt and sqlmap.log when they exist."""
     urls_all = tmp_path / "urls_all.txt"
     urls_all.write_text("https://example.com/page?q=1\n")
     (tmp_path / "xss.txt").write_text("xss finding\n")
     (tmp_path / "sqlmap.log").write_text("sqlmap finding\n")
     tools = reconchain.Tools()
-    asyncio.run(reconchain.phase_G(tmp_path, tools, set(), set(), None))
+    asyncio.run(reconchain.phase_11_INJECT(tmp_path, tools, set(), set(), None))
 
     vulns = tmp_path / "vulns.txt"
     assert vulns.exists()

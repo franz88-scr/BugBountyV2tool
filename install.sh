@@ -176,7 +176,11 @@ ALL_TOOLS=(subfinder amass assetfinder dnsx naabu nmap httpx subjack nuclei
 
            wpscan dalfox sqlmap interactsh-client kr x8
 
-           kxss dnsgen gitleaks)
+           kxss dnsgen gitleaks httprobe trufflehog unfurl qsreplace
+
+           Gxss cdncheck puredns gowitness wafw00f inql cloud_enum gitdumper)
+
+
 
 
 if [[ "$MODE" == "check" ]]; then
@@ -206,7 +210,10 @@ install_system() {
 
         ruby ruby-dev build-essential libcurl4-openssl-dev libssl-dev \
 
-        jq seclists cargo 2>/dev/null || warn "some apt packages failed (non-fatal)"
+        jq seclists cargo \
+        libatk-1.0-0 libatk-bridge2.0-0 libcups2 libdrm2 libxdamage1 \
+        libxkbcommon0 libpango-1.0-0 libcairo2 libasound2 \
+        2>/dev/null || warn "some apt packages failed (non-fatal)"
 
       ;;
 
@@ -278,6 +285,22 @@ GO_TOOLS=(
   "github.com/tomnomnom/hacks/kxss"
 
   "github.com/zricethezav/gitleaks/v8"
+
+  "github.com/tomnomnom/httprobe"
+
+  "github.com/trufflesecurity/trufflehog/v3"
+
+  "github.com/tomnomnom/unfurl"
+
+  "github.com/tomnomnom/qsreplace"
+
+  "github.com/KathanP19/Gxss"
+
+  "github.com/projectdiscovery/cdncheck/cmd/cdncheck"
+
+  "github.com/d3mondev/puredns/v2"
+
+  "github.com/sensepost/gowitness"
 
 )
 
@@ -432,6 +455,37 @@ EOF
     ok "assetfinder"
 
   fi
+
+  # wafw00f — WAF detection
+  if ! python3 -c "import wafw00f" 2>/dev/null && ! command -v wafw00f >/dev/null 2>&1; then
+    pip3 install --user wafw00f 2>/dev/null || pip3 install --user --break-system-packages wafw00f 2>/dev/null || warn "wafw00f install failed"
+  fi
+  command -v wafw00f >/dev/null 2>&1 && ok "wafw00f" || dim "wafw00f not installed (will use Python fallback)"
+
+  # inql — GraphQL introspection
+  if ! command -v inql >/dev/null 2>&1; then
+    pip3 install --user inql 2>/dev/null || pip3 install --user --break-system-packages inql 2>/dev/null || warn "inql install failed"
+  fi
+  command -v inql >/dev/null 2>&1 && ok "inql" || dim "inql not installed (will use Python fallback)"
+
+  # cloud_enum — multi-cloud bucket enumeration
+  if ! command -v cloud_enum >/dev/null 2>&1; then
+    pip3 install --user cloud_enum 2>/dev/null || pip3 install --user --break-system-packages cloud_enum 2>/dev/null || warn "cloud_enum install failed"
+  fi
+  command -v cloud_enum >/dev/null 2>&1 && ok "cloud_enum" || dim "cloud_enum not installed (will use Python fallback)"
+
+  # gitdumper — .git repo downloader
+  if ! command -v gitdumper >/dev/null 2>&1; then
+    if [[ ! -d /opt/gitdumper ]]; then
+      sudo git clone --depth 1 https://github.com/arthaud/git-dumper.git /opt/gitdumper 2>/dev/null || true
+    fi
+    cat <<'GITEOF' | sudo tee /usr/local/bin/gitdumper >/dev/null
+#!/usr/bin/env bash
+exec python3 /opt/gitdumper/git_dumper.py "$@"
+GITEOF
+    sudo chmod +x /usr/local/bin/gitdumper
+  fi
+  command -v gitdumper >/dev/null 2>&1 && ok "gitdumper" || dim "gitdumper not installed"
 
 }
 

@@ -342,11 +342,15 @@ def _run_blocking(
             proc = subprocess.Popen(
                 cmd,
                 cwd=str(cwd) if cwd else None,
+                stdin=subprocess.DEVNULL,
                 stdout=logf,
                 stderr=subprocess.STDOUT,
                 start_new_session=True,
             )
+            _register_proc(proc)
             proc.wait(timeout=timeout)
+            with contextlib.suppress(ValueError):
+                _SPAWNED_PIDS.remove(proc.pid)
             return proc.returncode, time.monotonic() - t0
         except subprocess.TimeoutExpired:
             if proc is not None and proc.poll() is None:
@@ -359,12 +363,19 @@ def _run_blocking(
                         os.killpg(proc.pid, signal.SIGKILL)
                     with contextlib.suppress(Exception):
                         proc.wait(timeout=5)
+            if proc is not None and proc.pid in _SPAWNED_PIDS:
+                with contextlib.suppress(ValueError):
+                    _SPAWNED_PIDS.remove(proc.pid)
             with log_path.open("ab") as f:
                 f.write(f"\n[timeout after {timeout}s]\n".encode("utf-8"))
             return 124, time.monotonic() - t0
         except FileNotFoundError as e:
             with log_path.open("ab") as f:
                 f.write(f"\n[binary not found: {e}]\n".encode("utf-8"))
+            return 127, time.monotonic() - t0
+        except (PermissionError, OSError) as e:
+            with log_path.open("ab") as f:
+                f.write(f"\n[exec error: {e}]\n".encode("utf-8"))
             return 127, time.monotonic() - t0
 
 
@@ -386,6 +397,20 @@ async def _run(name: str, cmd: List[str], timeout: int, outdir: Path, note: str 
 MAX_PARALLEL_JOBS = max(4, (os.cpu_count() or 4) * 2)
 # Process-wide flag to wrap commands with proxychains4 when tor is enabled.
 _USE_PROXYCHAINS = False
+# Track all spawned subprocess PIDs so we can clean them up on shutdown.
+_SPAWNED_PIDS: List[int] = []
+
+
+def _cleanup_child_procs() -> None:
+    """Kill all tracked child process groups on shutdown."""
+    for pid in list(_SPAWNED_PIDS):
+        with contextlib.suppress(ProcessLookupError, OSError):
+            os.killpg(pid, signal.SIGTERM)
+    _SPAWNED_PIDS.clear()
+
+
+def _register_proc(proc: subprocess.Popen) -> None:
+    _SPAWNED_PIDS.append(proc.pid)
 
 # Process-wide job semaphore. When several independent phases run concurrently
 # (see STAGES), they all draw from this single semaphore so the total number of
@@ -398,11 +423,24 @@ _PIPELINE_CFG: PipelineConfig = PipelineConfig()
 
 
 class Progress:
-    def __init__(self, total: int):
-        self.bar = tqdm(total=total, desc="Pipeline", position=0)
+    def __init__(self, total: int, stages: Optional[List[List[str]]] = None):
+        self.bar = tqdm(total=total, desc="Scan", position=0)
+        self.stages = stages or []
+        self._completed = 0
 
     def next(self, name: str):
-        self.bar.set_description(f"Phase {name}")
+        self._completed += 1
+        stage_idx = 0
+        if self.stages:
+            phase_count = 0
+            for i, stage in enumerate(self.stages):
+                phase_count += len(stage)
+                if self._completed <= phase_count:
+                    stage_idx = i
+                    break
+        pct = (self._completed / self.bar.total) * 100
+        stage_info = f"Stage {stage_idx + 1}/{len(self.stages)} " if self.stages else ""
+        self.bar.set_description(f"{stage_info}[{pct:.0f}%] {name}")
         self.bar.update(1)
 
     def close(self):
@@ -502,6 +540,12 @@ def safe_suffix(s: str) -> str:
     return hashlib.sha1(s.encode("utf-8", errors="ignore")).hexdigest()[:12]
 
 
+def _safe_name(s: str, maxlen: int = 32) -> str:
+    """Sanitize a string for use as a log filename (no path separators)."""
+    safe = s.replace("/", "_").replace(":", "_")
+    return safe[:maxlen]
+
+
 def read_jsonl(p: Path) -> List[Any]:
     """Read a JSON-Lines file. Falls back to a single JSON object/array
     if the file isn't line-delimited. Never raises on bad input."""
@@ -581,7 +625,7 @@ class Interactsh:
             cmd += ["-t", token]
         try:
             self._log_fh = self.log.open("ab")
-            self.proc = subprocess.Popen(cmd, stdout=self._log_fh, stderr=subprocess.STDOUT)
+            self.proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=self._log_fh, stderr=subprocess.STDOUT)
         except FileNotFoundError:
             return False
         except Exception as e:
@@ -693,7 +737,7 @@ async def phase_01_RECON(
         ensure(runner)
         runner.write_text(
             "#!/usr/bin/env bash\n"
-            "set -u\n"
+            "set -eu\n"
             f"OUT={shlex.quote(str(outdir / 'subs_amass.txt'))}\n"
             f"DOMAIN={shlex.quote(domain)}\n"
             ': > "$OUT"\n'
@@ -710,7 +754,7 @@ async def phase_01_RECON(
         ensure(runner)
         runner.write_text(
             "#!/usr/bin/env bash\n"
-            "set -u\n"
+            "set -eu\n"
             f"OUT={shlex.quote(str(outdir / 'subs_assetfinder.txt'))}\n"
             f"DOMAIN={shlex.quote(domain)}\n"
             ': > "$OUT"\n'
@@ -739,18 +783,21 @@ async def phase_01_RECON(
         _last_size = 0
         while True:
             await asyncio.sleep(30)
-            if all(p.exists() for p in _a1_sources):
-                current = sum(len(read_lines(p)) for p in _a1_sources)
-                if current > _last_size:
+        existing = [p for p in _a1_sources if p.exists()]
+        if existing:
+            current = sum(len(read_lines(p)) for p in existing)
+            if current > _last_size:
                     merge_unique(_a1_sources, out, validator=_under_domain)
                     _last_size = current
                     log("info", f"01-RECON: incremental merge — {count_nonblank(out)} subdomains so far")
 
     merge_task = asyncio.create_task(_incremental_merge())
-    results = await run_parallel(jobs, outdir)
-    merge_task.cancel()
-    with contextlib.suppress(asyncio.CancelledError):
-        await merge_task
+    try:
+        results = await run_parallel(jobs, outdir)
+    finally:
+        merge_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await merge_task
 
     # Surface partial tool failures in summary.json (BUG-5). rc==0 and
     # skipped are not failures; anything else (timeouts, crash, signal)
@@ -861,8 +908,9 @@ async def phase_03_PERMUTE(
 ) -> Dict[str, Any]:
     if skip & {"03-PERMUTE"}:
         return {}
-    _a3_out = outdir / "all_subs.txt"
-    if _a3_out.exists() and not force and not (only & {"03-PERMUTE"}):
+    _a3_stamp = outdir / ".phase_03.stamp"
+    if _a3_stamp.exists() and not force:
+        _a3_out = outdir / "all_subs.txt"
         return {"01-RECON": str(_a3_out), "03-PERMUTE": str(_a3_out), "count": count_nonblank(_a3_out)}
     log("info", "Phase 03-PERMUTE: subdomain permutation (dnsgen → dnsx)")
     # Input: all discovered subdomains from 01-RECON
@@ -886,7 +934,7 @@ async def phase_03_PERMUTE(
         ensure(runner)
         runner.write_text(
             "#!/usr/bin/env bash\n"
-            "set -u\n"
+            "set -eu\n"
             f"IN={shlex.quote(str(subs_in))}\n"
             f"OUT={shlex.quote(str(permuted))}\n"
             "dnsgen \"$IN\" 2>/dev/null | sort -u > \"$OUT\" || true\n"
@@ -923,6 +971,7 @@ async def phase_03_PERMUTE(
     permuted.unlink(missing_ok=True)
     resolved.unlink(missing_ok=True)
     log("ok", f"03-PERMUTE: {n} total subdomains (after permutation)")
+    _a3_stamp.write_text("")
     return {"01-RECON": str(all_subs), "03-PERMUTE": str(all_subs), "count": n}
 
 
@@ -934,7 +983,7 @@ async def phase_04_SCAN(
     if all(
         (outdir / f).exists()
         for f in ("ports.txt", "hosts.txt", "host_targets.txt", "takeover.txt")
-    ) and not force and not (only & {"04-SCAN"}):
+    ) and not force:
         ports_file = outdir / "ports.txt"
         return {
             "04-SCAN.ports": str(ports_file),
@@ -1095,7 +1144,7 @@ async def phase_04_SCAN(
             out_sv = outdir / f"services_{safe_suffix(h)}.gnmap"
             sv_jobs.append(
                 (
-                    f"nmap-sv-{h[:32]}",
+                    f"nmap-sv-{_safe_name(h)}",
                     [
                         "nmap", "-Pn", "-sV", "--open",
                         "-p", ports_csv, str(h),
@@ -1156,7 +1205,7 @@ async def phase_05_HARVEST(
     if skip & {"05-HARVEST"}:
         return {}
     _c1_out = outdir / "urls_all.txt"
-    if _c1_out.exists() and not force and not (only & {"05-HARVEST"}):
+    if _c1_out.exists() and not force:
         return {"05-HARVEST": str(_c1_out), "count": count_nonblank(_c1_out)}
     log("info", "Phase 05-HARVEST: URL harvesting (parallel groups)")
 
@@ -1193,7 +1242,7 @@ async def phase_05_HARVEST(
         ensure(runner)
         runner.write_text(
             "#!/usr/bin/env bash\n"
-            "set -u\n"
+            "set -eu\n"
             f"OUT={shlex.quote(str(outdir / 'urls_gau.txt'))}\n"
             f"IN={shlex.quote(str(hosts))}\n"
             ': > "$OUT"\n'
@@ -1219,7 +1268,7 @@ async def phase_05_HARVEST(
         ensure(runner)
         runner.write_text(
             "#!/usr/bin/env bash\n"
-            "set -u\n"
+            "set -eu\n"
             f"OUT={shlex.quote(str(outdir / 'urls_wayback.txt'))}\n"
             f"IN={shlex.quote(str(hosts))}\n"
             ': > "$OUT"\n'
@@ -1238,7 +1287,7 @@ async def phase_05_HARVEST(
         ensure(runner)
         runner.write_text(
             "#!/usr/bin/env bash\n"
-            "set -u\n"
+            "set -eu\n"
             f"OUT={shlex.quote(str(outdir / 'urls_gospider.txt'))}\n"
             f"IN={shlex.quote(str(hosts))}\n"
             'gospider -q -j -t 3 -S "$IN" 2>/dev/null '
@@ -1273,7 +1322,7 @@ async def phase_05_HARVEST(
         ensure(runner)
         runner.write_text(
             "#!/usr/bin/env bash\n"
-            "set -u\n"
+            "set -eu\n"
             f"OUT={shlex.quote(str(outdir / 'urls_subjs.txt'))}\n"
             f"IN={shlex.quote(str(hosts))}\n"
             ': > "$OUT"\n'
@@ -1318,7 +1367,7 @@ async def phase_06_JSINTEL(outdir: Path, t: Tools, only: PhaseSet, skip: PhaseSe
     if skip & {"06-JSINTEL"}:
         return {}
     _c2_out = outdir / "js_secrets.txt"
-    if _c2_out.exists() and not force and not (only & {"06-JSINTEL"}):
+    if _c2_out.exists() and not force:
         return {"06-JSINTEL": str(_c2_out), "count": count_nonblank(_c2_out)}
     log("info", "Phase 06-JSINTEL: JS analysis (LinkFinder + SecretFinder)")
     urls = outdir / "urls_all.txt"
@@ -1343,7 +1392,7 @@ async def phase_06_JSINTEL(outdir: Path, t: Tools, only: PhaseSet, skip: PhaseSe
         ensure(runner)
         runner.write_text(
             "#!/usr/bin/env bash\n"
-            "set -u\n"
+            "set -eu\n"
             f"OUT={shlex.quote(str(outdir / 'links.txt'))}\n"
             f"IN={shlex.quote(str(js_urls))}\n"
             'linkfinder -i "$IN" -o "$OUT" </dev/null >/dev/null 2>&1 || true\n'
@@ -1355,7 +1404,7 @@ async def phase_06_JSINTEL(outdir: Path, t: Tools, only: PhaseSet, skip: PhaseSe
         ensure(runner)
         runner.write_text(
             "#!/usr/bin/env bash\n"
-            "set -u\n"
+            "set -eu\n"
             f"OUT={shlex.quote(str(outdir / 'secrets.txt'))}\n"
             f"IN={shlex.quote(str(js_urls))}\n"
             'secretfinder -i "$IN" -o "$OUT" </dev/null >/dev/null 2>&1 || true\n'
@@ -1407,7 +1456,7 @@ async def phase_07_PARAMS(
     if skip & {"07-PARAMS"}:
         return {}
     _d_out = outdir / "params.txt"
-    if _d_out.exists() and not force and not (only & {"07-PARAMS"}):
+    if _d_out.exists() and not force:
         return {"07-PARAMS": str(_d_out), "count": count_nonblank(_d_out)}
     log("info", "Phase 07-PARAMS: parameter discovery")
     urls = outdir / "urls_all.txt"
@@ -1426,7 +1475,7 @@ async def phase_07_PARAMS(
             ensure(runner)
             runner.write_text(
                 "#!/usr/bin/env bash\n"
-                "set -u\n"
+                "set -eu\n"
                 f"OUT={shlex.quote(str(out_part))}\n"
                 f"URL={shlex.quote(u)}\n"
                 f"DOMAIN={shlex.quote(domain_for_ps)}\n"
@@ -1434,7 +1483,7 @@ async def phase_07_PARAMS(
                 'paramspider -d "$DOMAIN" --quiet >> "$OUT" 2>/dev/null || true\n'
             )
             runner.chmod(0o755)
-            jobs.append((f"paramspider-{u[:40]}", ["bash", str(runner)], 1800))
+            jobs.append((f"paramspider-{_safe_name(u, 40)}", ["bash", str(runner)], 1800))
     # arjun and x8 write JSON, NOT plain text. We capture the JSON and
     # normalize to one URL per line in the .txt sibling below.
     # Over Tor these are very slow — sample URLs heavily
@@ -1534,7 +1583,6 @@ def _merge_dnsx_output(src: Path, hosts_out: Path, full_out: Path) -> None:
             h = l.strip().split()[0].rstrip(".").lower()
             if h:
                 seen_hosts.add(h)
-                new_hosts.append(l.strip())
     for ln in read_lines(src):
         ln = ln.strip()
         if not ln or ln.lstrip().startswith("#"):
@@ -1566,6 +1614,9 @@ def _dedupe_by_host_path(urls: List[str]) -> List[str]:
 async def phase_08_FUZZ(outdir: Path, t: Tools, only: PhaseSet, skip: PhaseSet, force: bool = False) -> Dict[str, Any]:
     if skip & {"08-FUZZ"}:
         return {}
+    _f_out = outdir / "fuzz.txt"
+    if _f_out.exists() and not force:
+        return {"08-FUZZ": str(_f_out), "count": count_nonblank(_f_out)}
     log("info", "Phase 08-FUZZ: fuzzing")
     urls = outdir / "urls_all.txt"
     all_urls = read_lines(urls) if urls.exists() else []
@@ -1581,26 +1632,39 @@ async def phase_08_FUZZ(outdir: Path, t: Tools, only: PhaseSet, skip: PhaseSet, 
     _proxy = os.environ.get("PROXY", "")
     if _proxy:
         _proxy_opt = ["-proxy", _proxy]
+    # When operating over proxychains/tor, use smaller wordlists and
+    # shorter timeouts — each request is ~1-5s vs ~50ms on a direct link.
+    _is_slow_network = _USE_PROXYCHAINS
+    _ffuf_timeout = 1200 if _is_slow_network else 3000
+    _ffuf_ext_timeout = 300 if _is_slow_network else 600
     wordlist = os.environ.get(
         "FFUF_WORDLIST",
-        "/usr/share/seclists/Discovery/Web-Content/raft-medium-directories.txt",
+        (
+            "/usr/share/seclists/Discovery/Web-Content/common.txt"
+            if _is_slow_network
+            else "/usr/share/seclists/Discovery/Web-Content/raft-medium-directories.txt"
+        ),
     )
     if not Path(wordlist).exists():
-        log("warn", f"08-FUZZ: FFUF_WORDLIST '{wordlist}' missing, ffuf disabled")
         wordlist = ""
     jobs: List[Tuple[str, List[str], int]] = []
-    if not Path(wordlist).exists():
+    if not wordlist or not Path(wordlist).exists():
         # fallback to any wordlist under /usr/share
-        alt = sorted(Path("/usr/share/seclists/Discovery/Web-Content").glob("raft*.txt"))
+        alt = sorted(Path("/usr/share/seclists/Discovery/Web-Content").glob("common.txt"))
+        if not alt:
+            alt = sorted(Path("/usr/share/seclists/Discovery/Web-Content").glob("*.txt"))
         if alt:
             wordlist = str(alt[0])
             log("info", f"08-FUZZ: using fallback wordlist: {wordlist}")
+    if not wordlist or not Path(wordlist).exists():
+        log("warn", "08-FUZZ: no wordlist found, ffuf disabled")
+        wordlist = ""
     if t.has("ffuf") and wordlist:
         for u in sample:
             out_json = outdir / f"ffuf_{safe_suffix(u)}.json"
             jobs.append(
                 (
-                    f"ffuf-{u[:32]}",
+                    f"ffuf-{_safe_name(u)}",
                     [
                         "ffuf",
                         "-s",
@@ -1614,7 +1678,7 @@ async def phase_08_FUZZ(outdir: Path, t: Tools, only: PhaseSet, skip: PhaseSet, 
                         str(out_json),
                     ]
                     + _proxy_opt + _extra_http_args(),
-                    3000,
+                    _ffuf_timeout,
                 )
             )
         # Extension fuzzing pass — find .php, .json, .bak, .old, .swp files
@@ -1628,7 +1692,7 @@ async def phase_08_FUZZ(outdir: Path, t: Tools, only: PhaseSet, skip: PhaseSet, 
                 out_json = outdir / f"ffuf_ext_{safe_suffix(u)}.json"
                 jobs.append(
                     (
-                        f"ffuf-ext-{u[:32]}",
+                        f"ffuf-ext-{_safe_name(u)}",
                         [
                             "ffuf", "-s",
                             "-u", u.rstrip("/") + "/FUZZ",
@@ -1638,7 +1702,7 @@ async def phase_08_FUZZ(outdir: Path, t: Tools, only: PhaseSet, skip: PhaseSet, 
                             "-o", str(out_json),
                         ]
                         + _proxy_opt + _extra_http_args(),
-                        600,
+                        _ffuf_ext_timeout,
                     )
                 )
     if t.has("kr"):
@@ -1665,10 +1729,16 @@ async def phase_08_FUZZ(outdir: Path, t: Tools, only: PhaseSet, skip: PhaseSet, 
                     "convert",
                     str(src_wordlist),
                     kite_file,
+                    stdin=asyncio.subprocess.DEVNULL,
                     stdout=asyncio.subprocess.DEVNULL,
                     stderr=asyncio.subprocess.DEVNULL,
                 )
-                await proc.wait()
+                try:
+                    await asyncio.wait_for(proc.wait(), timeout=120)
+                except asyncio.TimeoutError:
+                    proc.kill()
+                    log("warn", "08-FUZZ: kite wordlist generation timed out")
+                    kite_file = ""
                 if not Path(kite_file).exists():
                     kite_file = ""
                     log("warn", "08-FUZZ: failed to generate kite wordlist")
@@ -1681,7 +1751,7 @@ async def phase_08_FUZZ(outdir: Path, t: Tools, only: PhaseSet, skip: PhaseSet, 
                 out_jsonl = outdir / f"kr_{safe_suffix(u)}.jsonl"
                 jobs.append(
                     (
-                        f"kiterunner-{u[:32]}",
+                        f"kiterunner-{_safe_name(u)}",
                         ["kr", "scan", u, "-w", kite_file, "-o", str(out_jsonl)],
                         3000,
                     )
@@ -1691,7 +1761,7 @@ async def phase_08_FUZZ(outdir: Path, t: Tools, only: PhaseSet, skip: PhaseSet, 
             out_txt = outdir / f"fb_{safe_suffix(u)}.txt"
             jobs.append(
                 (
-                    f"feroxbuster-{u[:32]}",
+                    f"feroxbuster-{_safe_name(u)}",
                     ["feroxbuster", "-q", "-u", u, "--no-state", "-o", str(out_txt)] + _extra_http_args(),
                     3600,
                 )
@@ -1702,6 +1772,8 @@ async def phase_08_FUZZ(outdir: Path, t: Tools, only: PhaseSet, skip: PhaseSet, 
     for old in outdir.glob("ffuf_*.txt"):
         old.unlink(missing_ok=True)
     for old in outdir.glob("kr_*.txt"):
+        old.unlink(missing_ok=True)
+    for old in outdir.glob("fb_*.txt"):
         old.unlink(missing_ok=True)
     normalized: List[Path] = []
     for ffp in outdir.glob("ffuf_*.json"):
@@ -1742,6 +1814,7 @@ async def _update_nuclei_templates(outdir: Path) -> None:
     log("info", "09-VULNSCAN: updating nuclei templates…")
     proc = await asyncio.create_subprocess_exec(
         "nuclei", "-update-templates", "-silent",
+        stdin=asyncio.subprocess.DEVNULL,
         stdout=asyncio.subprocess.DEVNULL,
         stderr=asyncio.subprocess.DEVNULL,
     )
@@ -1757,7 +1830,7 @@ async def phase_09_VULNSCAN(outdir: Path, t: Tools, only: PhaseSet, skip: PhaseS
     if skip & {"09-VULNSCAN"}:
         return {}
     _f1_out = outdir / "nuclei_combined.txt"
-    if _f1_out.exists() and not force and not (only & {"09-VULNSCAN"}):
+    if _f1_out.exists() and not force:
         return {"09-VULNSCAN": str(_f1_out), "count": count_nonblank(_f1_out)}
     log("info", "Phase 09-VULNSCAN: nuclei (full) + tech-scanner")
     await _update_nuclei_templates(outdir)
@@ -1835,7 +1908,7 @@ async def phase_10_TLSCMS(outdir: Path, t: Tools, only: PhaseSet, skip: PhaseSet
     if skip & {"10-TLSCMS"}:
         return {}
     _f2_out = outdir / "tls_wp.txt"
-    if _f2_out.exists() and not force and not (only & {"10-TLSCMS"}):
+    if _f2_out.exists() and not force:
         return {"10-TLSCMS": str(_f2_out), "count": count_nonblank(_f2_out)}
     log("info", "Phase 10-TLSCMS: testssl + wpscan")
     hosts = outdir / "host_targets.txt"
@@ -1859,14 +1932,14 @@ async def phase_10_TLSCMS(outdir: Path, t: Tools, only: PhaseSet, skip: PhaseSet
             ensure(runner)
             runner.write_text(
                 "#!/usr/bin/env bash\n"
-                "set -u\n"
+                "set -eu\n"
                 f"OUT={shlex.quote(str(per_host))}\n"
                 f"H={shlex.quote(h)}\n"
                 f"BIN={shlex.quote(testssl_bin)}\n"
                 '"$BIN" --quiet --color 0 "$H" > "$OUT" 2>&1 || true\n'
             )
             runner.chmod(0o755)
-            testssl_jobs.append((f"testssl-{h[:32]}", ["bash", str(runner)], 3600))
+            testssl_jobs.append((f"testssl-{_safe_name(h)}", ["bash", str(runner)], 3600))
     # Python TLS fallback (works with proxychains, unlike testssl.sh's /dev/tcp)
     tls_script = outdir / "tls_check.py"
     tls_script.write_text(
@@ -1956,7 +2029,7 @@ async def phase_10_TLSCMS(outdir: Path, t: Tools, only: PhaseSet, skip: PhaseSet
                 wpscan_cmd.extend(["--api-token", wpscan_token])
             wpscan_jobs.append(
                 (
-                    f"wpscan-{h[:32]}",
+                    f"wpscan-{_safe_name(h)}",
                     wpscan_cmd,
                     1800,
                 )
@@ -1980,7 +2053,7 @@ async def phase_11_INJECT(
     if skip & {"11-INJECT"}:
         return {}
     _g_out = outdir / "vulns.txt"
-    if _g_out.exists() and not force and not (only & {"11-INJECT"}):
+    if _g_out.exists() and not force:
         return {"11-INJECT": str(_g_out), "count": count_nonblank(_g_out)}
     log("info", "Phase 11-INJECT: dalfox → sqlmap → SSRF probes")
     urls = outdir / "urls_all.txt"
@@ -2051,7 +2124,7 @@ async def phase_11_INJECT(
             _sql_extra += " --headers=" + shlex.quote(_sql_headers)
         runner.write_text(
             "#!/usr/bin/env bash\n"
-            "set -u\n"
+            "set -eu\n"
             f"OUT={shlex.quote(str(outdir / 'sqlmap.log'))}\n"
             f"IN={shlex.quote(str(xss_in))}\n"
             f"DIR={shlex.quote(str(sqlmap_dir))}\n"
@@ -2191,7 +2264,7 @@ async def phase_12_SSTI(
     if skip & {"12-SSTI"}:
         return {}
     _g2_out = outdir / "ssti.txt"
-    if _g2_out.exists() and not force and not (only & {"12-SSTI"}):
+    if _g2_out.exists() and not force:
         return {"12-SSTI": str(_g2_out), "count": count_nonblank(_g2_out)}
     log("info", "Phase 12-SSTI: SSTI + deep XSS/SQLi fuzzing")
     urls = outdir / "urls_all.txt"
@@ -2310,7 +2383,7 @@ async def phase_13_OOB(outdir: Path, t: Tools, only: PhaseSet, skip: PhaseSet, o
     if skip & {"13-OOB"}:
         return {}
     _h_out = outdir / "oast" / "callbacks.txt"
-    if _h_out.exists() and not force and not (only & {"13-OOB"}):
+    if _h_out.exists() and not force:
         return {"13-OOB": str(_h_out), "count": count_nonblank(_h_out)}
     log("info", "Phase 13-OOB: OAST callback collection")
     out = oast.stop()
@@ -2328,7 +2401,7 @@ async def phase_14_ORIGIN(
     if skip & {"14-ORIGIN"}:
         return {}
     _j_out = outdir / "origin.txt"
-    if _j_out.exists() and not force and not (only & {"14-ORIGIN"}):
+    if _j_out.exists() and not force:
         return {"14-ORIGIN": str(_j_out), "count": count_nonblank(_j_out)}
     log("info", "Phase 14-ORIGIN: origin IP bypass enumeration")
     findings: List[str] = []
@@ -2437,6 +2510,7 @@ async def phase_14_ORIGIN(
             _DNS_RESOLVER,
             "mx",
             domain,
+            stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.DEVNULL,
         )
@@ -2461,6 +2535,7 @@ async def phase_14_ORIGIN(
                                 "+short",
                                 _DNS_RESOLVER,
                                 mx_host.rstrip("."),
+                                stdin=asyncio.subprocess.DEVNULL,
                                 stdout=asyncio.subprocess.PIPE,
                                 stderr=asyncio.subprocess.DEVNULL,
                             )
@@ -2477,6 +2552,7 @@ async def phase_14_ORIGIN(
         try:
             ns_proc = await asyncio.create_subprocess_exec(
                 "dig", "+short", _DNS_RESOLVER, "ns", domain,
+                stdin=asyncio.subprocess.DEVNULL,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.DEVNULL,
             )
@@ -2488,6 +2564,7 @@ async def phase_14_ORIGIN(
                 try:
                     axfr_proc = await asyncio.create_subprocess_exec(
                         "dig", "axfr", f"@{ns}", domain,
+                        stdin=asyncio.subprocess.DEVNULL,
                         stdout=asyncio.subprocess.PIPE,
                         stderr=asyncio.subprocess.DEVNULL,
                     )
@@ -2509,6 +2586,7 @@ async def phase_14_ORIGIN(
             try:
                 sp_proc = await asyncio.create_subprocess_exec(
                     "dig", "+short", _DNS_RESOLVER, rec, query,
+                    stdin=asyncio.subprocess.DEVNULL,
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.DEVNULL,
                 )
@@ -2618,7 +2696,7 @@ async def phase_15_SECRETS(outdir: Path, t: Tools, only: PhaseSet, skip: PhaseSe
     if skip & {"15-SECRETS"}:
         return {}
     _k_out = outdir / "js_secrets_deep.txt"
-    if _k_out.exists() and not force and not (only & {"15-SECRETS"}):
+    if _k_out.exists() and not force:
         return {"15-SECRETS": str(_k_out), "count": count_nonblank(_k_out)}
     log("info", "Phase 15-SECRETS: deep JS secret scanning (custom regex + entropy + source maps)")
     _k_extra_headers = _extra_headers_dict()
@@ -2742,6 +2820,11 @@ async def phase_15_SECRETS(outdir: Path, t: Tools, only: PhaseSet, skip: PhaseSe
                         continue
     out = ensure(outdir / "js_secrets_deep.txt")
     out.write_text("\n".join(findings) + ("\n" if findings else ""))
+    # Clean up raw JS and intermediate gitleaks files
+    for p in outdir.glob("js_raw_*.js"):
+        p.unlink(missing_ok=True)
+    for p in outdir.glob("gitleaks_*.json"):
+        p.unlink(missing_ok=True)
     log("ok", f"15-SECRETS: {len(findings)} deep JS findings → {out}")
     return {"15-SECRETS": str(out), "count": len(findings)}
 
@@ -2790,7 +2873,7 @@ async def phase_16_AUTHZ(outdir: Path, t: Tools, only: PhaseSet, skip: PhaseSet,
     if skip & {"16-AUTHZ"}:
         return {}
     _l_out = outdir / "auth_bypass.txt"
-    if _l_out.exists() and not force and not (only & {"16-AUTHZ"}):
+    if _l_out.exists() and not force:
         return {"16-AUTHZ": str(_l_out), "count": count_nonblank(_l_out)}
     log("info", "Phase 16-AUTHZ: auth bypass headers + mass assignment probes")
     findings: List[str] = []
@@ -3351,7 +3434,7 @@ async def run_pipeline(args: argparse.Namespace) -> int:
         return (not only or name in only) and name not in skip
 
     phases_to_run = [name for name, _, _ in PIPELINE if _selected(name)]
-    progress = Progress(len(phases_to_run))
+    progress = Progress(len(phases_to_run), stages=STAGES)
     active_needs_oast = any(name in {"08-FUZZ", "09-VULNSCAN", "10-TLSCMS", "11-INJECT"} for name in phases_to_run)
     h_selected = _selected("13-OOB")
     if active_needs_oast and h_selected:
@@ -3421,6 +3504,11 @@ async def run_pipeline(args: argparse.Namespace) -> int:
         progress.next(name)
         return result or {}
 
+    # Register signal handlers so child processes are cleaned up when
+    # the script is killed externally (e.g. timeout command, Ctrl+C).
+    _orig_sigint = signal.signal(signal.SIGINT, lambda s, f: (_cleanup_child_procs(), sys.exit(130)))
+    _orig_sigterm = signal.signal(signal.SIGTERM, lambda s, f: (_cleanup_child_procs(), sys.exit(143)))
+
     try:
         prev: Dict[str, Any] = dict(state.get("artifacts", {}))
         for stage in STAGES:
@@ -3435,9 +3523,9 @@ async def run_pipeline(args: argparse.Namespace) -> int:
             results = await asyncio.gather(*(_run_phase(n) for n in run_now))
             for name, result in zip(run_now, results):
                 _apply(name, result)
-                # Downsample each new artifact to 1 entry so downstream phases
-                # test functionality with minimal input (unless --keep-all).
-                if not getattr(args, 'keep_all', False):
+                # Downsample artifacts to 1 entry per file when --sample is used,
+                # otherwise keep all results so real scans produce complete output.
+                if getattr(args, 'sample', False):
                     for k, v in (result or {}).items():
                         if isinstance(v, str) and v.endswith(".txt"):
                             _downsample_file(Path(v), n=1)
@@ -3446,6 +3534,9 @@ async def run_pipeline(args: argparse.Namespace) -> int:
             except Exception as e:
                 log("warn", f"state.json write failed: {e}")
     finally:
+        _cleanup_child_procs()
+        signal.signal(signal.SIGINT, _orig_sigint)
+        signal.signal(signal.SIGTERM, _orig_sigterm)
         if oast_started and not h_selected:
             oast.stop()
         _JOB_SEM = None
@@ -3500,10 +3591,8 @@ def _prompt(
     while True:
         suffix = f" [{default}]" if default else ""
         val = input(f"  {prompt_text}{suffix}: ").strip()
-        if not val and default:
-            return default
         if not val:
-            continue
+            return default
         if validator is None or validator(val):
             return val
         log("err", error_msg or "invalid input")
@@ -3739,9 +3828,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="re-run all phases even if output files already exist",
     )
     p.add_argument(
+        "--sample",
+        action="store_true",
+        help="downsample artifacts to 1 entry for faster downstream testing (default: keep all results)",
+    )
+    p.add_argument(
         "--keep-all",
         action="store_true",
-        help="disable downsampling (keep all results instead of truncating to 1 entry per artifact)",
+        help=argparse.SUPPRESS,
     )
     p.add_argument("-q", "--quiet", action="store_true", help="suppress info-level logs")
     p.add_argument("--no-color", action="store_true", help="disable ANSI color output")

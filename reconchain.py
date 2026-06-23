@@ -432,6 +432,11 @@ _USE_PROXYCHAINS = False
 _SPAWNED_PIDS: List[int] = []
 
 
+def _maybe_timeout(base: int) -> int:
+    """Scale up timeouts when running over proxychains/Tor (slow network)."""
+    return base * 3 if _USE_PROXYCHAINS else base
+
+
 def _cleanup_child_procs() -> None:
     """Kill all tracked child process groups on shutdown."""
     for pid in list(_SPAWNED_PIDS):
@@ -780,7 +785,7 @@ async def phase_01_RECON(
             "| sed 's/ (FQDN)$//' >> \"$OUT\" || true\n"
         )
         runner.chmod(0o755)
-        jobs.append(("amass", ["bash", str(runner)], 1800))
+        jobs.append(("amass", ["bash", str(runner)], _maybe_timeout(1800)))
 
     if not jobs:
         log("warn", "01-RECON: no subdomain tools available")
@@ -959,7 +964,7 @@ async def phase_03_PERMUTE(
         )
         runner.chmod(0o755)
         jobs.append(("dnsgen", ["bash", str(runner)], 600))
-    await run_parallel(jobs, outdir)
+        await run_parallel(jobs, outdir)
     # Resolve permuted subdomains with dnsx
     if permuted.exists() and read_lines(permuted) and t.has("dnsx"):
         resolved_job = (
@@ -967,9 +972,19 @@ async def phase_03_PERMUTE(
             ["dnsx", "-silent", "-l", str(permuted),
              "-o", str(resolved),
              "-resp", "-a", "-aaaa"],
-            600,
+            _maybe_timeout(600),
         )
         await run_parallel([resolved_job], outdir)
+        # Fallback: some dnsx versions write to stdout (captured in log) instead of -o
+        if not resolved.exists() or not read_lines(resolved):
+            log_path = outdir / "logs" / "dnsx-permuted.log"
+            if log_path.exists():
+                log_lines = read_lines(log_path)
+                dnsx_lines = [ln for ln in log_lines
+                              if '[' in ln and any(ext in ln for ext in [' [A] ', ' [AAAA] ', ' [CNAME] '])]
+                if dnsx_lines:
+                    ensure(resolved).write_text("\n".join(dnsx_lines) + "\n")
+                    log("info", f"03-PERMUTE: recovered {len(dnsx_lines)} hosts from dnsx log fallback")
     # Merge permuted results into the existing subdomain list
     merge_srcs = [subs_in]
     if resolved.exists() and read_lines(resolved):
@@ -1043,7 +1058,7 @@ async def phase_04_SCAN(
                     "naabu", "-silent", "-l", str(hosts), "-o", str(ports_file),
                     "-top-ports", "1000",
                 ],
-                1800,
+                _maybe_timeout(1800),
             )
         )
         # UDP port scan (top-100 UDP ports)
@@ -1055,7 +1070,7 @@ async def phase_04_SCAN(
                     "naabu", "-silent", "-l", str(hosts), "-o", str(udp_ports_file),
                     "-top-ports", "100", "-udp",
                 ],
-                1800,
+                _maybe_timeout(1800),
             )
         )
     elif have_hosts and t.has("nmap"):
@@ -1073,7 +1088,7 @@ async def phase_04_SCAN(
                     "-oG",
                     str(outdir / "ports.gnmap"),
                 ],
-                1800,
+                _maybe_timeout(1800),
             )
         )
     # DNS takeover check via nuclei (separate from http/takeovers)
@@ -1086,7 +1101,7 @@ async def phase_04_SCAN(
                     "-t", "dns/takeovers",
                     "-o", str(outdir / "takeover_dns.txt"),
                 ],
-                1800,
+                _maybe_timeout(1800),
             )
         )
     if have_hosts and t.has("httpx"):
@@ -1123,7 +1138,7 @@ async def phase_04_SCAN(
                     "-o",
                     str(outdir / "takeover.txt"),
                 ] + _extra_http_args(),
-                1800,
+                _maybe_timeout(1800),
             )
         )
     await run_parallel(jobs, outdir)
@@ -1247,7 +1262,7 @@ async def phase_05_HARVEST(
             f"OUT={shlex.quote(str(outdir / 'urls_gau.txt'))}\n"
             f"IN={shlex.quote(str(hosts))}\n"
             ': > "$OUT"\n'
-            'if gau -l "$IN" -o "$OUT" --subs --threads 5 '
+            'if gau -l "$IN" -o "$OUT" --subs --threads 2 '
             "--blacklist ttf,woff,svg,png,jpg,gif,ico,css >/dev/null 2>&1 "
             '&& [ -s "$OUT" ]; then\n'
             "  :\n"
@@ -1255,18 +1270,21 @@ async def phase_05_HARVEST(
             '  : > "$OUT"\n'
             '  while IFS= read -r h || [[ -n "$h" ]]; do\n'
             '    [ -z "$h" ] && continue\n'
-            "    gau --subs --threads 5 --blacklist "
+            "    timeout 120 gau --subs --threads 2 --blacklist "
             'ttf,woff,svg,png,jpg,gif,ico,css "$h" >> "$OUT" 2>/dev/null || true\n'
             '  done < "$IN"\n'
             "fi\n"
         )
         runner.chmod(0o755)
-        g1.append(("gau", ["bash", str(runner)], 1800))
+        g1.append(("gau", ["bash", str(runner)], _maybe_timeout(1800)))
 
     if t.has("gospider"):
         # gospider's -o is an output *folder* (one file per site), not a file,
         # so we don't use it: run via a runner that captures stdout and extracts
         # the URL token from each line into a flat urls_gospider.txt.
+        # Over Tor (proxychains), reduce concurrency and depth to avoid hanging.
+        _gs_threads = 1 if _USE_PROXYCHAINS else 3
+        _gs_depth = 1 if _USE_PROXYCHAINS else 3
         runner = outdir / "logs" / "gospider_runner.sh"
         ensure(runner)
         runner.write_text(
@@ -1274,11 +1292,11 @@ async def phase_05_HARVEST(
             "set -eu\n"
             f"OUT={shlex.quote(str(outdir / 'urls_gospider.txt'))}\n"
             f"IN={shlex.quote(str(hosts))}\n"
-            'gospider -q -j -t 3 -S "$IN" 2>/dev/null '
+            f'gospider -q -j -t {_gs_threads} -d {_gs_depth} -S "$IN" 2>/dev/null '
             '| grep -oE \'https?://[^[:space:]"]+\' | sort -u > "$OUT" || true\n'
         )
         runner.chmod(0o755)
-        g1.append(("gospider", ["bash", str(runner)], 1800))
+        g1.append(("gospider", ["bash", str(runner)], _maybe_timeout(1800)))
     g2: List[Tuple[str, List[str], int]] = []
     if t.has("katana"):
         g2.append(
@@ -1298,7 +1316,7 @@ async def phase_05_HARVEST(
                     "all",
                     "-duc",
                 ] + _extra_http_args(),
-                1800,
+                _maybe_timeout(1800),
             )
         )
     if t.has("subjs"):
@@ -1313,7 +1331,7 @@ async def phase_05_HARVEST(
             'subjs -i "$IN" > "$OUT" 2>/dev/null || true\n'
         )
         runner.chmod(0o755)
-        g2.append(("subjs", ["bash", str(runner)], 1200))
+        g2.append(("subjs", ["bash", str(runner)], _maybe_timeout(1200)))
     # waymore — modern URL harvester combining gau/wayback/crtsh with caching
     if t.has("waymore"):
         g2.append(
@@ -1325,7 +1343,7 @@ async def phase_05_HARVEST(
                     "-p", str(outdir / "logs" / "waymore"),
                     "-n", "1",
                 ] + _extra_http_args(),
-                1800,
+                _maybe_timeout(1800),
             )
         )
     all_g = g1 + g2
@@ -3425,6 +3443,10 @@ async def run_pipeline(args: argparse.Namespace) -> int:
     _orig_sigterm = signal.signal(signal.SIGTERM, lambda s, f: (_cleanup_child_procs(), sys.exit(143)))
 
     try:
+        # Update nuclei templates before any phase runs so phases that use
+        # nuclei (e.g. 04-SCAN's DNS takeover) don't fail with missing templates.
+        await _update_nuclei_templates(outdir)
+
         prev: Dict[str, Any] = dict(state.get("artifacts", {}))
         for stage in STAGES:
             run_now = [name for name in stage if _selected(name)]

@@ -170,13 +170,13 @@ check() {
 }
 
 
-ALL_TOOLS=(subfinder amass assetfinder dnsx naabu nmap httpx subjack nuclei
+ALL_TOOLS=(subfinder amass dnsx naabu nmap httpx nuclei
 
-           gau waybackurls gospider katana subjs linkfinder secretfinder
+           gau gospider katana subjs secretfinder
 
-           paramspider arjun ffuf feroxbuster testssl.sh
+           arjun ffuf feroxbuster testssl.sh
 
-           wpscan dalfox sqlmap interactsh-client kr x8
+           wpscan dalfox sqlmap interactsh-client
 
            kxss dnsgen gitleaks httprobe trufflehog unfurl qsreplace
 
@@ -260,13 +260,9 @@ GO_TOOLS=(
 
   "github.com/projectdiscovery/httpx/cmd/httpx"
 
-  "github.com/haccer/subjack"
-
   "github.com/projectdiscovery/nuclei/v3/cmd/nuclei"
 
   "github.com/lc/gau/v2/cmd/gau"
-
-  "github.com/tomnomnom/waybackurls"
 
   "github.com/jaeles-project/gospider"
 
@@ -275,8 +271,6 @@ GO_TOOLS=(
   "github.com/lc/subjs"
 
   "github.com/ffuf/ffuf/v2"
-
-  "github.com/assetnote/kiterunner/cmd/kiterunner"
 
   "github.com/hahwul/dalfox/v2"
 
@@ -404,50 +398,6 @@ install_python_tools() {
   fi
   ok "dnsgen"
 
-  # paramspider (git)
-
-  if ! command -v paramspider >/dev/null 2>&1; then
-
-    sudo git clone --depth 1 https://github.com/devanshbatham/paramspider /opt/paramspider || true
-
-    sudo ln -sf /opt/paramspider/paramspider.py /usr/local/bin/paramspider 2>/dev/null || true
-
-    cat <<'EOF' | sudo tee /usr/local/bin/paramspider >/dev/null
-
-#!/usr/bin/env bash
-
-exec python3 /opt/paramspider/paramspider.py "$@"
-
-EOF
-
-    sudo chmod +x /usr/local/bin/paramspider
-
-    ok "paramspider"
-
-  fi
-
-
-  # linkfinder (git)
-
-  if [[ ! -d /opt/LinkFinder ]]; then
-
-    sudo git clone --depth 1 https://github.com/GerbenJavado/LinkFinder.git /opt/LinkFinder
-
-  fi
-
-  if [[ -f /opt/LinkFinder/linkfinder.py ]]; then
-
-    sudo ln -sf /opt/LinkFinder/linkfinder.py /usr/local/bin/linkfinder
-
-    ok "linkfinder"
-
-  else
-
-    warn "linkfinder install failed"
-
-  fi
-
-
   # secretfinder (git) — originally installed by m4ll0k/SecretFinder
   if ! command -v secretfinder >/dev/null 2>&1; then
     if [[ ! -d /opt/SecretFinder ]]; then
@@ -462,16 +412,6 @@ EOF
     else
       warn "secretfinder install failed"
     fi
-  fi
-
-  # assetfinder (go binary but listed here for visibility)
-
-  if ! command -v assetfinder >/dev/null 2>&1; then
-
-    GO111MODULE=on go install -v github.com/tomnomnom/assetfinder@latest
-
-    ok "assetfinder"
-
   fi
 
   # wafw00f — WAF detection
@@ -566,33 +506,6 @@ install_feroxbuster() {
 }
 
 
-# ───────────────────────────── x8 (Rust) ──────────────────────────
-install_x8() {
-  if ! command -v x8 >/dev/null 2>&1; then
-    log "Installing x8 (Rust crate)…"
-    if ! command -v cargo >/dev/null 2>&1; then
-      warn "cargo not found; install Rust/cargo, then run: cargo install x8"
-      return
-    fi
-    cargo install x8 || warn "x8 install failed (try: cargo install x8 --locked)"
-  fi
-  if command -v x8 >/dev/null 2>&1; then
-    ok "x8"
-  fi
-}
-
-# ───────────────────────────── kiterunner kite wordlist ────────────
-install_kr_wordlist() {
-  if command -v kr >/dev/null 2>&1; then
-    local kite="/tmp/common.kite"
-    if [[ ! -f "$kite" ]] && [[ -f /usr/share/seclists/Discovery/Web-Content/common.txt ]]; then
-      log "Generating kiterunner kite wordlist…"
-      kr kb convert /usr/share/seclists/Discovery/Web-Content/common.txt "$kite" 2>/dev/null && \
-        ok "kiterunner wordlist: $kite" || warn "failed to generate kite wordlist"
-    fi
-  fi
-}
-
 # ───────────────────────────── testssl.sh ──────────────────────────
 
 install_testssl() {
@@ -643,13 +556,9 @@ case "$MODE" in
 
     install_feroxbuster
 
-    install_x8
-
     install_wpscan
 
     install_testssl
-
-    install_kr_wordlist
 
     update_nuclei_templates
 

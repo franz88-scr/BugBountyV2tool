@@ -139,14 +139,14 @@ The remaining phases fan out in the second stage with independent concurrent exe
 
 | Phase | Tools | Description |
 |-------|-------|-------------|
-| **01-RECON** | subfinder, amass, assetfinder | Passive subdomain enumeration from CT logs, search engines, DNS |
+| **01-RECON** | subfinder, amass | Passive subdomain enumeration from CT logs, search engines, DNS |
 | **02-RESOLVE** | dnsx, puredns | DNS resolution + wildcard-resistant validation |
 | **03-PERMUTE** | dnsgen, dnsx | Subdomain permutation generation; resolves candidates |
-| **04-SCAN** | naabu (nmap fallback), httprobe, httpx, subjack (nuclei fallback) | Port scanning, HTTP probing, service detection, subdomain takeover |
-| **05-HARVEST** | gau, waybackurls, gospider, katana, subjs, waymore | Historical URL harvesting + active crawling + JS URL extraction |
+| **04-SCAN** | naabu (nmap fallback), httprobe, httpx, nuclei | Port scanning, HTTP probing, service detection, subdomain takeover |
+| **05-HARVEST** | gau, gospider, katana, subjs, waymore | Historical URL harvesting + active crawling + JS URL extraction |
 | **06-JSINTEL** | LinkFinder, SecretFinder, nuclei (exposures) | JavaScript file analysis for endpoints and secrets |
-| **07-PARAMS** | ParamSpider, Arjun, x8 | Parameter discovery on harvested URLs |
-| **08-FUZZ** | ffuf, kiterunner (kr), feroxbuster | Directory/file fuzzing with SecLists wordlists |
+| **07-PARAMS** | Arjun | Parameter discovery on harvested URLs |
+| **08-FUZZ** | ffuf, feroxbuster | Directory/file fuzzing with SecLists wordlists |
 | **09-VULNSCAN** | nuclei (full + technologies) | Vulnerability scanning with auto-updated templates |
 | **10-TLSCMS** | testssl.sh, wpscan | TLS security assessment + WordPress scanning |
 | **11-INJECT** | kxss, Gxss, dalfox, sqlmap, SSRF probes | XSS pre-filter, scanning, SQL injection, SSRF parameter injection |
@@ -177,7 +177,7 @@ out/
 ├── urls_js.txt               # JavaScript URLs
 ├── urls_xss.txt              # URLs with parameters (XSS candidates)
 ├── urls_ssrf.txt             # URLs with SSRF-prone parameters
-├── js_secrets.txt            # Secrets from SecretFinder/linkfinder
+├── js_secrets.txt            # Secrets from SecretFinder/nuclei
 ├── js_secrets_deep.txt       # Deep JS secrets (custom regex + source maps)
 ├── params.txt                # Discovered parameters
 ├── fuzz.txt                  # Fuzzing results
@@ -215,11 +215,11 @@ out/
 
 | Category | Tools |
 |----------|-------|
-| Enumeration | subfinder, amass, assetfinder, dnsx, puredns |
-| Network | naabu, nmap, httpx, httprobe, subjack, cdncheck |
-| URLs | gau, waybackurls, gospider, katana, subjs, waymore, unfurl |
-| Analysis | LinkFinder, SecretFinder, ParamSpider, Arjun, x8, dnsgen, inql |
-| Fuzzing | ffuf, kiterunner (kr), feroxbuster, qsreplace, Gxss |
+| Enumeration | subfinder, amass, dnsx, puredns |
+| Network | naabu, nmap, httpx, httprobe, nuclei, cdncheck |
+| URLs | gau, gospider, katana, subjs, waymore, unfurl |
+| Analysis | SecretFinder, Arjun, dnsgen, inql |
+| Fuzzing | ffuf, feroxbuster, qsreplace, Gxss |
 | Vulns | nuclei, dalfox, sqlmap, testssl.sh, wpscan, kxss, wafw00f |
 | Secrets | gitleaks, trufflehog, SecretFinder, LinkFinder |
 | Cloud | cloud_enum |

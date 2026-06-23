@@ -67,18 +67,11 @@ done
 
 ## J3 — Deep Parameter Discovery
 
-Automated tools (Arjun/x8) can be shallow. Many apps have more parameters than discovered.
+Automated tools (Arjun) can be shallow. Many apps have more parameters than discovered.
 
 ```bash
 # Arjun with tighter settings
 arjun -i urls_all.txt -t 20 -o json/params_deep.json --headers "Cookie: <session>"
-
-# x8 with max depth
-x8 -u urls_all.txt -o json/params_x8_deep.json \
-  --max-params 10 --max-values 5 --max-param-name-length 64
-
-# ParamSpider per endpoint with high level
-paramspider -d "$(echo $URL | sed 's|https\?://||;s|/.*||')" --level high --quiet
 ```
 
 **Action items:**

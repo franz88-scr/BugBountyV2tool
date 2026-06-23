@@ -92,13 +92,6 @@ def test_fuzzer_json_normalizers(tmp_path: Path) -> None:
     ffuf.write_text(json.dumps({"results": [{"status": 200, "url": "https://x/a"}]}))
     assert reconchain._extract_urls_from_ffuf_json(ffuf) == ["200\thttps://x/a"]
 
-    kr = tmp_path / "kr.jsonl"
-    kr.write_text('{"matched-raw-url":"https://x/api"}\n{"url":"https://x/v2"}\n')
-    assert reconchain._extract_urls_from_kiterunner_jsonl(kr) == [
-        "https://x/api",
-        "https://x/v2",
-    ]
-
 
 def test_target_token_normalization(tmp_path: Path) -> None:
     src = tmp_path / "hosts.txt"

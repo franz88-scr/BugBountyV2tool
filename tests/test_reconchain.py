@@ -46,8 +46,9 @@ def test_merge_unique_filters_and_avoids_self_merge(tmp_path: Path) -> None:
 
     count = reconchain.merge_unique([src, dst], dst, reconchain._is_valid_hostname)
 
-    assert count == 2
-    assert dst.read_text().splitlines() == ["b.example.com", "a.example.com"]
+    # count includes pre-existing dst content (old.example.com) plus valid src lines
+    assert count == 3
+    assert dst.read_text().splitlines() == ["old.example.com", "b.example.com", "a.example.com"]
 
 
 def test_file_readers_treat_directories_as_empty(tmp_path: Path) -> None:
@@ -130,7 +131,7 @@ def test_write_reports_escape_html_and_markdown(tmp_path: Path) -> None:
 
     assert json.loads(summary.read_text())["counts"]["subdomains"] == 1
     assert "&lt;script&gt;" in html.read_text()
-    assert "`x<y`" in md.read_text()
+    assert "`x&lt;y`" in md.read_text()
 
 
 def test_phase_f2_produces_tls_wp_file(tmp_path: Path) -> None:
@@ -187,11 +188,34 @@ def test_stages_cover_pipeline_exactly_once() -> None:
 def test_stage_order_respects_dependencies() -> None:
     # phase -> first stage index it appears in
     stage_of = {name: i for i, stage in enumerate(reconchain.STAGES) for name in stage}
-    # 01-RECON-02-RESOLVE-04-SCAN-05-HARVEST are all in the same streaming stage now; fan-out phases
-    # (which consume 05-HARVEST/04-SCAN output) must come no earlier than 05-HARVEST.
-    assert stage_of["01-RECON"] == stage_of["02-RESOLVE"] == stage_of["04-SCAN"] == stage_of["05-HARVEST"]
-    for fanout in ("06-JSINTEL", "07-PARAMS", "08-FUZZ", "09-VULNSCAN", "10-TLSCMS", "11-INJECT"):
-        assert stage_of[fanout] >= stage_of["05-HARVEST"]
+    # 00-SCOPE and 01-RECON in stage 0 (no deps between them)
+    assert stage_of["00-SCOPE"] == stage_of["01-RECON"]
+
+    dependencies = {
+        "02-RESOLVE": {"01-RECON"},
+        "04-SCAN": {"02-RESOLVE"},
+        "04b-TAKEOVER-VALIDATE": {"04-SCAN"},
+        "05-HARVEST": {"04-SCAN"},
+        "05b-APISPEC": {"05-HARVEST"},
+        "06-JSINTEL": {"05-HARVEST"},
+        "15-SECRETS": {"06-JSINTEL"},
+        "07-PARAMS": {"05-HARVEST", "06-JSINTEL", "15-SECRETS"},
+        "08-FUZZ": {"07-PARAMS"},
+        "11-INJECT": {"07-PARAMS"},
+        "11b-SQLMAP": {"07-PARAMS"},
+        "12-SSTI": {"07-PARAMS"},
+        "17B-SSRFMETA": {"11-INJECT"},
+        "39-OAUTH": {"24-JWT"},
+        "40-PWRESET": {"24-JWT"},
+        "16A-AUTHZ": {"24-JWT"},
+        "16B-MASSASSIGN": {"24-JWT"},
+        "17-IDOR": {"24-JWT"},
+        "29-DEPCHECK": {"06-JSINTEL"},
+        "45-EVIDENCE": {"44-CHAIN"},
+    }
+    for consumer, producers in dependencies.items():
+        for producer in producers:
+            assert stage_of[consumer] > stage_of[producer], f"{consumer} must run after {producer}"
 
 
 def test_independent_phases_run_concurrently(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -391,15 +415,15 @@ def test_phase_k_source_map_regex() -> None:
         assert m.group(1) == expected
 
 
-def test_phase_l_no_endpoints_returns_zero(tmp_path: Path) -> None:
-    """Phase 16-AUTHZ should return count 0 when no endpoints exist."""
+def test_phase_16a_no_endpoints_returns_zero(tmp_path: Path) -> None:
+    """Phase 16A-AUTHZ should return count 0 when no endpoints exist."""
     tools = reconchain.Tools()
-    result = asyncio.run(reconchain.phase_16_AUTHZ(tmp_path, tools, set(), set()))
+    result = asyncio.run(reconchain.phase_16A_AUTHZ(tmp_path, tools, set(), set()))
     assert result["count"] == 0
 
 
-def test_phase_l_extracts_api_endpoints_from_urls(tmp_path: Path) -> None:
-    """Phase 16-AUTHZ should detect API-like endpoints from urls_all.txt."""
+def test_phase_16a_extracts_api_endpoints_from_urls(tmp_path: Path) -> None:
+    """Phase 16A-AUTHZ should detect API-like endpoints from urls_all.txt."""
     urls = tmp_path / "urls_all.txt"
     urls.write_text(
         "https://example.com/api/v1/users\n"
@@ -407,9 +431,9 @@ def test_phase_l_extracts_api_endpoints_from_urls(tmp_path: Path) -> None:
         "https://example.com/admin\n"
     )
     tools = reconchain.Tools()
-    asyncio.run(reconchain.phase_16_AUTHZ(tmp_path, tools, set(), set()))
+    asyncio.run(reconchain.phase_16A_AUTHZ(tmp_path, tools, set(), set()))
 
-    auth = tmp_path / "auth_bypass.txt"
+    auth = tmp_path / "authz_bypass.txt"
     content = auth.read_text()
     assert "api" in content
     assert "admin" in content
@@ -432,15 +456,26 @@ def test_phase_l_mass_assignment_fields_defined() -> None:
 
 
 def test_vuln_txt_merge_includes_existing_files(tmp_path: Path) -> None:
-    """Phase 11-INJECT merge should include xss.txt and sqlmap.log when they exist."""
+    """Phase 11-INJECT merge should include xss.txt when it exists."""
     urls_all = tmp_path / "urls_all.txt"
     urls_all.write_text("https://example.com/page?q=1\n")
     (tmp_path / "xss.txt").write_text("xss finding\n")
-    (tmp_path / "sqlmap.log").write_text("sqlmap finding\n")
     tools = reconchain.Tools()
     asyncio.run(reconchain.phase_11_INJECT(tmp_path, tools, set(), set(), None))
 
     vulns = tmp_path / "vulns.txt"
     assert vulns.exists()
-    assert "xss finding" in vulns.read_text() or "sqlmap finding" in vulns.read_text()
+    assert "xss finding" in vulns.read_text()
+
+
+def test_parse_semver_and_semver_lt() -> None:
+    assert reconchain._parse_semver("1.2.3") == (1, 2, 3)
+    assert reconchain._parse_semver("1.2") == (1, 2, 0)
+    assert reconchain._parse_semver("1") is None
+    assert reconchain._parse_semver("abc") is None
+    assert reconchain._parse_semver("1.2.x") == (1, 2, 0)  # ignores non-digit trailing parts
+    assert reconchain._semver_lt((1, 2, 3), (1, 2, 4))
+    assert reconchain._semver_lt((1, 2, 3), (2, 0, 0))
+    assert not reconchain._semver_lt((2, 0, 0), (1, 9, 9))
+    assert not reconchain._semver_lt((1, 2, 3), (1, 2, 3))
 

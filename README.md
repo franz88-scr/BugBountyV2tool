@@ -1,7 +1,7 @@
-# ReconChain v2.1
+# ReconChain v1.5
 
-A Python orchestrator that chains 40+ recon and vulnerability tools into a single,
-resumable pipeline — no config files, no YAML, no DSL.
+A Python orchestrator that chains 51+ recon and vulnerability phases into a single,
+resumable DAG pipeline — no config files, no YAML, no DSL.
 
 ```bash
 # Quick start — interactive wizard
@@ -43,7 +43,7 @@ Prompts for:
 - **Output directory** — defaults to `./out_{domain}`
 - **Parallel jobs** — how many tools to run simultaneously
 - **Scan depth** — SQLmap level/risk, request delay, sample sizes
-- **Manual testing add-ons** — SSTI, origin bypass, deep JS secrets, auth bypass, cloud buckets, git exposure, GraphQL, WAF
+- **Manual testing add-ons** — SSTI, origin bypass, deep JS secrets, auth bypass, IDOR, mass assignment, SSRF metadata, LFI, cloud, git, GraphQL, WAF, NoSQLi, race, JWT, XXE, CMDi, proto pollution, cache, dependency check, open redirect, clickjack, CRLF, CORS, file upload, smuggling, OAuth, password reset, WebSocket, LDAP, deserialization
 - **Resume / Force** — picks up where you left off, or force re-run all phases
 
 Shows a summary before starting. Zero flags to remember.
@@ -58,7 +58,7 @@ Shows a summary before starting. Zero flags to remember.
 ./reconchain.py -d example.com --fast
 
 # Pick specific phases
-./reconchain.py -d example.com -o ./out --only 01-RECON,02-RESOLVE,04-SCAN,05-HARVEST,17-REPORT
+./reconchain.py -d example.com -o ./out --only 00-SCOPE,01-RECON,02-RESOLVE,04-SCAN,05-HARVEST,44-REPORT
 
 # Skip slow phases
 ./reconchain.py -d example.com -o ./out --skip 10-TLSCMS,11-INJECT
@@ -89,77 +89,176 @@ Shows a summary before starting. Zero flags to remember.
 
 | Level | What Runs | Use Case |
 |-------|-----------|----------|
-| **1 — Basic** | 01-RECON → 02-RESOLVE → 03-PERMUTE → 04-SCAN → 05-HARVEST → 17-REPORT | Quick domain recon: subdomains, DNS, ports, URLs |
-| **2 — Standard** | Level 1 + 06-JSINTEL → 07-PARAMS → 08-FUZZ → 09-VULNSCAN → 10-TLSCMS | Full automated vuln scanning |
-| **Full** | Level 2 + 12-SSTI → 14-ORIGIN → 15-SECRETS → 16-AUTHZ → M → N → O → P | Maximum coverage (SSTI, origin bypass, deep JS, auth bypass, cloud, git, GraphQL, WAF) |
+| **1 — Basic** | 00-SCOPE → 01-RECON → 02-RESOLVE → 04-SCAN → 05-HARVEST → 44-REPORT | Quick domain recon: scope validation, subdomains, DNS, ports, URLs |
+| **2 — Standard** | Level 1 + 03-PERMUTE → 06-JSINTEL → 07-PARAMS → 08-FUZZ → 09-VULNSCAN → 10-TLSCMS → 24-JWT → 28-CACHED → 34-RATELIMIT → 41-WEBSOCKET | Full automated vuln scanning + basic web checks |
+| **Full** | All 51 phases | Maximum coverage (scope validation, takeover confirm, API specs, XSS, SQLi, SSTI, OOB, NoSQLi, race, XXE, cmd inject, proto pollution, open redirect, clickjack, CRLF, CORS, JWT, file upload, smuggling, OAuth, password reset, LDAP, deserialization, IDOR, SSRF metadata, LFI, chain correlation, evidence capture) |
 
-## Pipeline (streaming: 01-RECON→02-RESOLVE→04-SCAN→05-HARVEST overlap via incremental processing)
+## Pipeline — Execution Stages (DAG)
 
+### Stage 0 — Scope + Discovery
 ```
-Enum Pt1 — Subdomains, DNS, Ports, URLs
-  01-RECON  subdomains        ──→ all_subs.txt
-  02-RESOLVE DNS resolve       ──→ resolved.txt + resolved_full.txt
-  03-PERMUTE permute subs      ──→ all_subs.txt (append)
-  04-SCAN   ports/hosts       ──→ ports.txt + hosts.txt + takeover.txt
-  05-HARVEST URL harvest       ──→ urls_all.txt
-
-Enum Pt2 — JS, Parameters, Fuzzing, Vuln Scanning
-  06-JSINTEL JS analysis       ──→ js_secrets.txt
-  07-PARAMS  parameters        ──→ params.txt
-  08-FUZZ    fuzzing           ──→ fuzz.txt
-  09-VULNSCAN nuclei + tech     ──→ nuclei_combined.txt
-  10-TLSCMS  ssl + wp          ──→ tls_wp.txt
-
-Vuln Pt1 — XSS, SQLi, SSTI, OAST
-  11-INJECT XSS + SQLi + SSRF ──→ vulns.txt
-  12-SSTI   SSTI fuzzing      ──→ ssti.txt
-  13-OOB    OAST polling      ──→ callbacks.txt
-
-Deep Pt1 — Origin Bypass, Deep JS, Auth Bypass
-  14-ORIGIN  origin bypass     ──→ origin.txt
-  15-SECRETS deep JS secrets   ──→ js_secrets_deep.txt
-  16-AUTHZ   auth bypass       ──→ auth_bypass.txt
-
-Deep Pt2 — Cloud, Git, GraphQL, WAF
-  M   cloud buckets     ──→ cloud_buckets.txt
-  N   git exposure      ──→ git_exposure.txt
-  O   GraphQL introsp.  ──→ graphql_introspection.txt
-  P   WAF detection     ──→ waf_detection.txt
-
-Report
-  17-REPORT reports           ──→ summary.json + report.html + report.md + summary.txt
+00-SCOPE   scope validation          ──→ scope_validated.txt
+01-RECON   subdomains                ──→ all_subs.txt
+02-RESOLVE DNS resolve               ──→ resolved.txt + resolved_full.txt
+03-PERMUTE permute subs              ──→ all_subs.txt (append)
+04-SCAN    ports/hosts               ──→ ports.txt + hosts.txt + takeover.txt
+04b-TAKEOVER-VALIDATE confirm CNAME  ──→ takeover_confirmed.txt
+34-RATELIMIT rate-limit burst test   ──→ rate_limiting.txt
 ```
 
-Streaming stages: 01-RECON/02-RESOLVE/03-PERMUTE/04-SCAN/05-HARVEST all run concurrently in the first stage — 01-RECON writes
-subdomains incrementally, 02-RESOLVE polls and resolves them as they arrive, 04-SCAN and 05-HARVEST start
-on partial hosts. This cuts wall-clock time by overlapping the linear chain.
-The remaining phases fan out in the second stage with independent concurrent execution.
+### Stage 1 — WAF Detection (informs throttle for later stages)
+```
+21-WAF     WAF detection             ──→ waf_detection.txt
+```
+
+### Stage 2 — Parallel Harvest + Analysis
+```
+05-HARVEST URL harvest               ──→ urls_all.txt
+05b-APISPEC API spec hunt            ──→ api_specs.txt
+06-JSINTEL JS analysis               ──→ js_secrets.txt
+15-SECRETS deep JS secrets           ──→ secrets.txt
+```
+
+### Stage 3 — Parameter Discovery
+```
+07-PARAMS  parameters                ──→ params.txt
+```
+
+### Stage 4 — Fuzzing (throttled by WAF profile)
+```
+08-FUZZ    fuzzing                   ──→ fuzz.txt
+```
+
+### Stage 5 — Independent Parallel Scans
+```
+09-VULNSCAN nuclei + tech            ──→ nuclei_combined.txt
+10-TLSCMS  ssl + wp                  ──→ tls_wp.txt
+14-ORIGIN  origin bypass             ──→ origin.txt
+18-CLOUD   cloud buckets             ──→ cloud_buckets.txt
+19-GIT     git exposure              ──→ git_exposure.txt
+20-GRAPHQL GraphQL introsp.          ──→ graphql_introspection.txt
+```
+
+### Stage 6 — Main Injection Cluster (consume parameter corpus)
+```
+11-INJECT  XSS + SSRF                ──→ vulns.txt
+11b-SQLMAP sqlmap (pre-filtered)     ──→ sqlmap_findings.txt
+12-SSTI    SSTI fuzzing              ──→ ssti.txt
+22-NOSQLI  NoSQL injection           ──→ nosqli.txt
+25-XXE     XXE injection             ──→ xxe.txt
+26-CMDINJECT cmd injection           ──→ cmd_injection.txt
+27-SSPP    proto pollution           ──→ sspp.txt
+42-LDAP    LDAP injection            ──→ ldap_injection.txt
+43-DESERIAL deserialization          ──→ deserialization.txt
+```
+
+### Stage 7 — SSRF Follow-up
+```
+17B-SSRFMETA cloud metadata exfil    ──→ ssrf_meta.txt
+```
+
+### Stage 8 — JWT Analysis (feeds into auth probes)
+```
+24-JWT     JWT analysis              ──→ jwt_analysis.txt
+36-JWTADV  advanced JWT              ──→ jwt_advanced.txt
+```
+
+### Stage 9 — Auth-focused Cluster
+```
+39-OAUTH   OAuth testing             ──→ oauth_misconfig.txt
+40-PWRESET password reset            ──→ password_reset.txt
+16A-AUTHZ  auth bypass headers       ──→ authz_bypass.txt
+16B-MASSASSIGN mass assignment       ──→ mass_assign.txt
+17-IDOR    ID manipulation            ──→ idor.txt
+```
+
+### Stage 10 — Long Tail Independent Checks
+```
+28-CACHED  cache poison              ──→ cache_poison.txt
+29-DEPCHECK dependency check         ──→ depcheck.txt
+30-LFI     path traversal            ──→ lfi.txt
+31-OPENREDIR open redirect           ──→ open_redirect.txt
+32-CLICKJACK clickjacking            ──→ clickjacking.txt
+33-CRLF    CRLF injection            ──→ crlf_injection.txt
+35-CORSADV advanced CORS             ──→ cors_advanced.txt
+37-FILEUPLOAD file upload            ──→ file_upload.txt
+38-SMUGGLE request smugg.            ──→ smuggling.txt
+41-WEBSOCKET WebSocket               ──→ websocket.txt
+```
+
+### Stage 11 — OOB + Race
+```
+13-OOB     OAST polling              ──→ callbacks.txt
+23-RACE    race condition            ──→ race_conditions.txt
+```
+
+### Stage 12 — Correlation + Evidence
+```
+44-CHAIN   cross-reference findings  ──→ chain_correlation.txt
+45-EVIDENCE capture req/resp pairs   ──→ evidence/
+```
+
+### Always runs last
+```
+44-REPORT  reports                   ──→ summary.json + report.html + report.md + summary.txt
+```
 
 ### Phase Details
 
 | Phase | Tools | Description |
 |-------|-------|-------------|
+| **00-SCOPE** | Python builtins | Validates target assets against scope/allowlist file |
 | **01-RECON** | subfinder, amass | Passive subdomain enumeration from CT logs, search engines, DNS |
 | **02-RESOLVE** | dnsx, puredns | DNS resolution + wildcard-resistant validation |
 | **03-PERMUTE** | dnsgen, dnsx | Subdomain permutation generation; resolves candidates |
 | **04-SCAN** | naabu (nmap fallback), httprobe, httpx, nuclei | Port scanning, HTTP probing, service detection, subdomain takeover |
+| **04b-TAKEOVER-VALIDATE** | curl, Python socket | Connects to dangling CNAME targets to confirm exploitability |
 | **05-HARVEST** | gau, gospider, katana, subjs, waymore | Historical URL harvesting + active crawling + JS URL extraction |
+| **05b-APISPEC** | curl, Python requests | Probes /swagger.json, /openapi.yaml, GraphQL SDL |
 | **06-JSINTEL** | LinkFinder, SecretFinder, nuclei (exposures) | JavaScript file analysis for endpoints and secrets |
 | **07-PARAMS** | Arjun | Parameter discovery on harvested URLs |
 | **08-FUZZ** | ffuf, feroxbuster | Directory/file fuzzing with SecLists wordlists |
 | **09-VULNSCAN** | nuclei (full + technologies) | Vulnerability scanning with auto-updated templates |
 | **10-TLSCMS** | testssl.sh, wpscan | TLS security assessment + WordPress scanning |
-| **11-INJECT** | kxss, Gxss, dalfox, sqlmap, SSRF probes | XSS pre-filter, scanning, SQL injection, SSRF parameter injection |
+| **11-INJECT** | kxss, Gxss, dalfox, SSRF probes | XSS pre-filter, scanning, SSRF parameter injection |
+| **11b-SQLMAP** | sqlmap (via response-diff heuristic pre-filter) | SQL injection with pre-screening to reduce false positives |
 | **12-SSTI** | SSTI probes | Server-Side Template Injection detection |
 | **13-OOB** | interactsh-client | OOB interaction capture for SSRF/blind findings |
-| **17-REPORT** | gowitness, reporting | Screenshots + HTML, Markdown, JSON, and text summary |
 | **14-ORIGIN** | favicon hash, crt.sh, dig MX/SPF/DMARC/DKIM, ipinfo.io, cdncheck | Origin IP bypass enumeration (Cloudflare, CDN discovery) |
-| **15-SECRETS** | gitleaks, unfurl, deep JS regex + source map analysis | GitLeaks secret scanning, URL extraction, entropy-based secret detection |
-| **16-AUTHZ** | qsreplace, auth bypass headers, mass assignment probes | Authentication bypass testing + mass assignment field discovery |
-| **M** | cloud_enum, custom Python probes | Cloud bucket discovery across AWS, GCP, Azure, DigitalOcean, etc. |
-| **N** | gitdumper, trufflehog | Git repository download + secret scanning from exposed .git |
-| **O** | inql, custom GraphQL probes | GraphQL introspection + deep schema analysis |
-| **P** | wafw00f, custom WAF signatures | WAF detection with 50+ vendor signatures + malicious probes |
+| **15-SECRETS** | gitleaks, unfurl, deep JS regex + source map analysis | GitLeaks secret scanning, URL extraction, entropy-based secret detection; pushes credentials to shared queue |
+| **16A-AUTHZ** | qsreplace, auth bypass headers, role bypass | Authentication bypass testing (X-Original-URL, X-Forwarded-For, header injection) |
+| **16B-MASSASSIGN** | POST field injection | Mass assignment vulnerability detection (admin, role, balance fields) |
+| **17-IDOR** | Python probes | ID sequencing, UUID swap, numeric increment/decrement |
+| **17B-SSRFMETA** | curl to cloud metadata IPs | Cloud metadata credential theft (AWS/GCP/Azure) triggered by confirmed SSRF |
+| **18-CLOUD** | cloud_enum, custom Python probes | Cloud bucket discovery across AWS, GCP, Azure, DigitalOcean, etc. |
+| **19-GIT** | gitdumper, trufflehog | Git repository download + secret scanning from exposed .git |
+| **20-GRAPHQL** | inql, custom GraphQL probes | GraphQL introspection + deep schema analysis |
+| **21-WAF** | wafw00f, custom WAF signatures | WAF detection with 50+ vendor signatures; sets global throttle/evasion flag |
+| **22-NOSQLI** | Custom Python probes | NoSQL injection detection via MongoDB operators ($ne, $regex, $where) |
+| **23-RACE** | Concurrent request bursts | Race condition detection on state-changing endpoints (redeem, transfer, purchase, vote) |
+| **24-JWT** | jwt_tool | JWT decoding, algorithm confusion, weak signature testing |
+| **25-XXE** | Custom Python probes | XML External Entity injection via payload reflection |
+| **26-CMDINJECT** | Custom Python probes | OS command injection via timing-based and error-based detection |
+| **27-SSPP** | Custom Python probes | Server-side prototype pollution via JSON key collision |
+| **28-CACHED** | Cache key manipulation probes | Web cache poisoning via unkeyed headers and parameter cloaking |
+| **29-DEPCHECK** | Custom Python probes | Dependency confusion detection via npm/PyPI/RubyGems package enumeration |
+| **30-LFI** | Custom Python probes | Path traversal probes for /etc/passwd, /windows/win.ini, log poisoning |
+| **31-OPENREDIR** | Custom Python probes | Open redirect detection via URL scheme and host validation |
+| **32-CLICKJACK** | Custom Python probes | Clickjacking vulnerability via missing X-Frame-Options/CSP frame-ancestors |
+| **33-CRLF** | Custom Python probes | CRLF injection via response splitting and header injection |
+| **34-RATELIMIT** | URL burst requests | Rate limiting assessment via sequential request bursts (runs early after Stage 0) |
+| **35-CORSADV** | Custom origin reflection test | Advanced CORS misconfiguration testing (origin reflection, null, trusted domains) |
+| **36-JWTADV** | JWK header injection | JWT key injection, algorithm confusion, KID traversal |
+| **37-FILEUPLOAD** | Custom Python probes | File upload vulnerability detection (extension bypass, magic bytes, size limits) |
+| **38-SMUGGLE** | Raw socket CL.TE/TE.CL | HTTP request smuggling via Content-Length / Transfer-Encoding desync |
+| **39-OAUTH** | Custom Python probes | OAuth misconfiguration testing (redirect_uri, state, scope, CSRF); consumes JWT findings |
+| **40-PWRESET** | Custom Python probes | Password reset token analysis (predictability, enumeration, host header poisoning); consumes JWT findings |
+| **41-WEBSOCKET** | Raw socket upgrade handshake | WebSocket endpoint discovery and insecure handshake detection |
+| **42-LDAP** | Custom Python probes | LDAP injection via filter manipulation and boolean-based detection |
+| **43-DESERIAL** | Custom Python payload POSTs | Deserialization attack surface detection via Java/Python/PHP/Ruby serialized payloads |
+| **44-CHAIN** | Python cross-referencing | Correlates findings across phases (secrets→auth, IDOR→mass-assign, SSRF→LFI) |
+| **45-EVIDENCE** | Python request/response capture | Captures request/response pairs for confirmed findings |
+| **44-REPORT** | gowitness, reporting | Screenshots + HTML, Markdown, JSON, and text summary |
 
 ## Output
 
@@ -173,12 +272,15 @@ out/
 ├── hosts.txt                 # Live HTTP hosts with titles + tech
 ├── host_targets.txt          # Normalized HTTP targets
 ├── takeover.txt              # Subdomain takeover candidates
+├── takeover_confirmed.txt    # Confirmed dangling CNAME exploits
+├── scope_validated.txt       # In-scope assets validated
+├── api_specs.txt             # API specification files found
 ├── urls_all.txt              # All discovered URLs
 ├── urls_js.txt               # JavaScript URLs
 ├── urls_xss.txt              # URLs with parameters (XSS candidates)
 ├── urls_ssrf.txt             # URLs with SSRF-prone parameters
 ├── js_secrets.txt            # Secrets from SecretFinder/nuclei
-├── js_secrets_deep.txt       # Deep JS secrets (custom regex + source maps)
+├── secrets.txt               # Deep JS secrets (custom regex + source maps)
 ├── params.txt                # Discovered parameters
 ├── fuzz.txt                  # Fuzzing results
 ├── nuclei_combined.txt       # Nuclei findings (full + tech)
@@ -186,15 +288,42 @@ out/
 ├── tech.txt                  # Technology detection results
 ├── tls_wp.txt                # TLS + WordPress results
 ├── ssti.txt                  # SSTI probe results
-├── vulns.txt                 # XSS/SQLi/SSRF findings (merged)
+├── vulns.txt                 # XSS/SSRF findings (merged)
 ├── xss.txt                   # Dalfox XSS findings
 ├── sqlmap_findings.txt       # Extracted SQLi findings from sqlmap
+├── nosqli.txt                # NoSQL injection findings
+├── race_conditions.txt       # Race condition probes
+├── jwt_analysis.txt          # JWT analysis results
+├── xxe.txt                   # XXE injection probes
+├── cmd_injection.txt         # Command injection probes
+├── sspp.txt                  # Server-side prototype pollution probes
+├── cache_poison.txt          # Cache poisoning probes
+├── depcheck.txt              # Dependency confusion probes
 ├── origin.txt                # Origin IP candidates
-├── auth_bypass.txt           # Auth bypass probes + mass assignment fields
+├── authz_bypass.txt          # Auth bypass probes
+├── mass_assign.txt           # Mass assignment fields discovered
+├── idor.txt                  # IDOR findings
+├── ssrf_meta.txt             # SSRF metadata exfiltration results
+├── lfi.txt                   # Local file inclusion findings
+├── open_redirect.txt         # Open redirect findings
+├── clickjacking.txt          # Clickjacking findings
+├── crlf_injection.txt        # CRLF injection findings
+├── rate_limiting.txt         # Rate limit test results
+├── cors_advanced.txt         # Advanced CORS findings
+├── jwt_advanced.txt          # Advanced JWT attack findings
+├── file_upload.txt           # File upload vulnerability findings
+├── smuggling.txt             # Request smuggling findings
+├── oauth_misconfig.txt       # OAuth misconfiguration findings
+├── password_reset.txt        # Password reset token analysis
+├── websocket.txt             # WebSocket endpoint findings
+├── ldap_injection.txt        # LDAP injection findings
+├── deserialization.txt       # Deserialization findings
 ├── cloud_buckets.txt         # Cloud bucket discovery results
 ├── git_exposure.txt          # Git exposure findings
 ├── graphql_introspection.txt # GraphQL introspection results
 ├── waf_detection.txt         # WAF detection results
+├── chain_correlation.txt     # Cross-phase correlation findings
+├── evidence/                 # Request/response pairs for confirmed vulns
 ├── screenshots/              # Browser screenshots (gowitness)
 │   └── *.png
 ├── oast/
@@ -241,13 +370,13 @@ binary.
   --only                        Comma-separated phases to run (e.g. 01-RECON,14-ORIGIN,15-SECRETS)
   --skip                        Comma-separated phases to skip
   -j, --jobs                    Max parallel processes (default: cpu_count × 2)
-  --fast                        Basic recon only (01-RECON, 02-RESOLVE, 04-SCAN, 05-HARVEST, 17-REPORT)
+  --fast                        Basic recon only (00-SCOPE, 01-RECON, 02-RESOLVE, 04-SCAN, 05-HARVEST, 44-REPORT)
   --resume                      Resume from state.json
   --force                       Re-run all phases even if output files exist
   --keep-all                    Disable downsampling (keep all results)
   -q, --quiet                   Suppress info logs
   --no-color                    Disable ANSI colors
-  --proxy                       Proxy URL (e.g. socks5://127.0.0.1:9050)
+  --proxy                       Proxy URL (e.g. socks5://127.0.0.1:9050); auto-detected from ALL_PROXY / HTTPS_PROXY / HTTP_PROXY / PROXY env vars
   --cookie                      Cookie string for authenticated scans
   --header                      Extra HTTP header (repeatable)
   --sqlmap-level                SQLmap --level (1-5, default: 1)
@@ -278,9 +407,32 @@ binary.
 | `WPSCAN_API_TOKEN` | WPScan API token (enables vulnerability data) |
 | `FFUF_WORDLIST` | Custom ffuf wordlist path |
 | `KITE_FILE` | Kiterunner wordlist path |
-| `PROXY` | Default proxy for HTTP tools |
+| `PROXY` | Default proxy for HTTP tools (deprecated — set `ALL_PROXY` instead) |
 | `COOKIE` | Default cookie for authenticated scans |
 | `NO_COLOR` | Disable colour output |
+
+### Proxy Support
+
+All outbound HTTP/S tool calls respect the standard `ALL_PROXY`, `HTTPS_PROXY`, and
+`HTTP_PROXY` environment variables (lowercase variants also supported). On startup
+the orchestrator detects these variables and propagates them to every subprocess,
+so **Go, Python, Ruby, and Rust tools** all route through the proxy without
+per-tool configuration. Additionally, explicit `--proxy`/`-x` flags are passed to
+`ffuf`, `nuclei`, `dalfox`, `katana`, `feroxbuster`, and `wpscan` for tools that
+honour CLI flags better than environment variables.
+
+For **SOCKS proxies**, `proxychains4` is automatically prepended to bash-runner
+commands when `ALL_PROXY` contains a `socks4://` or `socks5://` scheme. Direct
+tool invocations (Go/Python/Ruby binaries) use the native SOCKS support built into
+those runtimes, avoiding double-proxying.
+
+**No explicit `--proxy` flag is required** — just export your proxy variable before
+launching the scan:
+
+```bash
+export ALL_PROXY=socks5://127.0.0.1:9050
+python reconchain.py -d example.com
+```
 
 ## Severity Scoring
 
@@ -289,28 +441,27 @@ HTML report:
 
 | Level | Score | Example |
 |-------|-------|---------|
-| CRITICAL | 10+ | Subdomain takeover, OOB callback |
-| HIGH | 5–9 | SQLi, XSS, exposed git repo, cloud bucket |
-| MEDIUM | 1–4 | Open port, JS secret, origin IP found |
+| CRITICAL | 10+ | Subdomain takeover, OOB callback, SSRF metadata |
+| HIGH | 5–9 | SQLi, XSS, exposed git repo, cloud bucket, IDOR, LFI |
+| MEDIUM | 1–4 | Open port, JS secret, origin IP found, mass assignment |
 | LOW | 0 | No findings |
 
 ## Key Improvements
 
-- **40+ tools** — 12 new tools added: httprobe, puredns, Gxss, unfurl, qsreplace,
-  cdncheck, gowitness, cloud_enum, gitdumper, trufflehog, wafw00f, inql
-- **Phases M–P** — Cloud bucket discovery, git exposure scanning, GraphQL
-  introspection, WAF detection
+- **51 phases** — 15 new phases: 00-SCOPE, 04b-TAKEOVER-VALIDATE, 05b-APISPEC, 11b-SQLMAP, 16A-AUTHZ, 16B-MASSASSIGN, 17-IDOR, 17B-SSRFMETA, 30-LFI, 44-CHAIN, 45-EVIDENCE
+- **DAG execution stages** — 13 ordered stages with feedback loops: WAF detection informs throttle/evasion, SSRF triggers metadata exfil, JWT analysis feeds auth probes, secrets flow into credential queue
+- **Cross-phase correlation** — 44-CHAIN cross-references findings (secrets→auth, IDOR→mass-assign, SSRF→LFI); 45-EVIDENCE captures request/response pairs
+- **Scope gating** — 00-SCOPE validates assets against allowlist/scope file before any recon runs
+- **WAF-aware throttling** — 21-WAF sets global `waf_detected` / `waf_evasion_throttle` flags consumed by all downstream phases
+- **40+ tools** — 12 new tools added: httprobe, puredns, Gxss, unfurl, qsreplace, cdncheck, gowitness, cloud_enum, gitdumper, trufflehog, wafw00f, inql
 - **Screenshots** — gowitness captures browser screenshots of live hosts
 - **Webhook notifications** — send JSON payloads with severity to any webhook URL
 - **Config file support** — `--config` JSON file pre-populates options
-- **Dockerfile** — containerised deployment with multi-stage build
-- **Streaming pipeline** — 01-RECON/02-RESOLVE/03-PERMUTE/04-SCAN/05-HARVEST all run concurrently; wall-clock reduction
-  of 40–60% on typical targets
+- **Streaming pipeline** — 01-RECON, 02-RESOLVE, 04-SCAN, 05-HARVEST run concurrently; overall wall-clock reduction of 40–60%
 - **Downsampling** — artifacts truncated to 1 entry per phase (--keep-all to disable)
 - **Per-phase output guards** — skip completed phases unless --force is set
 - **Nuclei template cache** — auto-updates at most once per 24h
-- **Graceful degradation** — every external tool is optional; pipeline handles
-  missing binaries without crashing
+- **Graceful degradation** — every external tool is optional; pipeline handles missing binaries without crashing
 
 ## Security
 

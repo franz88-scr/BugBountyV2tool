@@ -4,6 +4,19 @@
 
 #
 
+# DAG: Stage 0 (00-SCOPE→01-RECON→02-RESOLVE→03-PERMUTE→04-SCAN→04b-TAKEOVER-VALIDATE→34-RATELIMIT),
+#      Stage 1 (21-WAF), Stage 2 (05-HARVEST→05b-APISPEC→06-JSINTEL→15-SECRETS), Stage 3 (07-PARAMS),
+#      Stage 4 (08-FUZZ), Stage 5 (09-VULNSCAN→10-TLSCMS→14-ORIGIN→18-CLOUD→19-GIT→20-GRAPHQL),
+#      Stage 6 (11-INJECT→11b-SQLMAP→12-SSTI→22-NOSQLI→25-XXE→26-CMDINJECT→27-SSPP→42-LDAP→43-DESERIAL),
+#      Stage 7 (17b-SSRFMETA), Stage 8 (24-JWT→36-JWTADV),
+#      Stage 9 (39-OAUTH→40-PWRESET→16A-AUTHZ→16B-MASSASSIGN→17-IDOR),
+#      Stage 10 (28-CACHED→29-DEPCHECK→30-LFI→31-OPENREDIR→32-CLICKJACK→33-CRLF→35-CORSADV→37-FILEUPLOAD→38-SMUGGLE→41-WEBSOCKET),
+#      Stage 11 (13-OOB→23-RACE), Stage 12 (44-CHAIN→45-EVIDENCE), + 44-REPORT.
+
+# Optional: proxychains4 for SOCKS proxy support (auto-detected).
+
+#
+
 # Usage:
 
 #   ./install.sh              # install everything
@@ -210,7 +223,7 @@ install_system() {
 
         ruby ruby-dev build-essential libcurl4-openssl-dev libssl-dev \
 
-        jq seclists cargo \
+        jq seclists cargo proxychains4 \
         libatk-1.0-0 libatk-bridge2.0-0 libcups2 libdrm2 libxdamage1 \
         libxkbcommon0 libpango-1.0-0 libcairo2 libasound2 \
         2>/dev/null || warn "some apt packages failed (non-fatal)"
@@ -221,7 +234,7 @@ install_system() {
 
       sudo dnf install -y nmap python3 python3-pip git curl wget \
 
-        ruby ruby-devel gcc make openssl-devel jq cargo
+        ruby ruby-devel gcc make openssl-devel jq cargo proxychains4
 
       ;;
 
@@ -229,13 +242,13 @@ install_system() {
 
       sudo pacman -Sy --noconfirm nmap python python-pip git curl wget \
 
-        ruby jq base-devel rust
+        ruby jq base-devel rust proxychains-ng
 
       ;;
 
     brew)
 
-      brew install nmap python git curl wget ruby jq go rust
+      brew install nmap python git curl wget ruby jq go rust proxychains-ng
 
       ;;
 
@@ -393,8 +406,7 @@ install_python_tools() {
 
   # dnsgen — subdomain permutation (Python)
   if ! command -v dnsgen >/dev/null 2>&1; then
-    pip3 install --user --break-system-packages dnsgen 2>/dev/null || \
-      pip3 install --user dnsgen || warn "dnsgen pip install failed"
+    pip3 install --user dnsgen 2>/dev/null || warn "dnsgen pip install failed"
   fi
   ok "dnsgen"
 
@@ -530,13 +542,13 @@ install_testssl() {
 update_nuclei_templates() {
 
   if command -v nuclei >/dev/null 2>&1; then
-
-    log "Updating nuclei templates…"
-
-    nuclei -update-templates -silent || warn "nuclei template update failed"
-
-    ok "nuclei templates updated"
-
+    if [[ -n "${NO_NUCLEI_UPDATE:-}" ]]; then
+      log "NO_NUCLEI_UPDATE set, skipping nuclei template update"
+    else
+      log "Updating nuclei templates…"
+      timeout 120 nuclei -update-templates -silent || warn "nuclei template update failed or timed out"
+      ok "nuclei templates updated"
+    fi
   fi
 
 }
@@ -574,6 +586,9 @@ esac
 # ───────────────────────────── post-check ─────────────────────────
 
 log "Final tool check:"
+
+# Add ~/.local/bin to PATH so pip --user installs are found (P2-5)
+export PATH="$HOME/.local/bin:$PATH"
 
 check "${ALL_TOOLS[@]}"
 

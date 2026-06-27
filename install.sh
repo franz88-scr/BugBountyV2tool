@@ -393,8 +393,7 @@ install_python_tools() {
 
   # dnsgen — subdomain permutation (Python)
   if ! command -v dnsgen >/dev/null 2>&1; then
-    pip3 install --user --break-system-packages dnsgen 2>/dev/null || \
-      pip3 install --user dnsgen || warn "dnsgen pip install failed"
+    pip3 install --user dnsgen 2>/dev/null || warn "dnsgen pip install failed"
   fi
   ok "dnsgen"
 
@@ -530,13 +529,13 @@ install_testssl() {
 update_nuclei_templates() {
 
   if command -v nuclei >/dev/null 2>&1; then
-
-    log "Updating nuclei templates…"
-
-    nuclei -update-templates -silent || warn "nuclei template update failed"
-
-    ok "nuclei templates updated"
-
+    if [[ -n "${NO_NUCLEI_UPDATE:-}" ]]; then
+      log "NO_NUCLEI_UPDATE set, skipping nuclei template update"
+    else
+      log "Updating nuclei templates…"
+      timeout 120 nuclei -update-templates -silent || warn "nuclei template update failed or timed out"
+      ok "nuclei templates updated"
+    fi
   fi
 
 }
@@ -574,6 +573,9 @@ esac
 # ───────────────────────────── post-check ─────────────────────────
 
 log "Final tool check:"
+
+# Add ~/.local/bin to PATH so pip --user installs are found (P2-5)
+export PATH="$HOME/.local/bin:$PATH"
 
 check "${ALL_TOOLS[@]}"
 

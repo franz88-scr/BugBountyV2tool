@@ -463,6 +463,17 @@ HTML report:
 - **Nuclei template cache** — auto-updates at most once per 24h
 - **Graceful degradation** — every external tool is optional; pipeline handles missing binaries without crashing
 
+## Bug Fixes (v1.5.1)
+
+- **CRLF injection detection** — payloads in phase 33-CRLF were double-encoded
+  by `urllib.parse.urlencode`, making every test silently ineffective. Changed
+  `_CRLF_PAYLOADS` to use raw CRLF bytes so `urlencode` produces the correct
+  single-encoded form (`%0D%0A` instead of `%250D%250A`), and the server
+  receives actual CRLF characters.
+- **`.ds_tmp` orphan cleanup** — `_downsample_file` creates `.ds_tmp` temp files
+  during atomic writes, but only `*.tmp` files were cleaned on startup. Added
+  cleanup for `*.ds_tmp` to prevent orphan accumulation after crashes.
+
 ## Security
 
 Only scan systems you own or have explicit permission to test. Recon tools may

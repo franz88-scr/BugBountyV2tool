@@ -144,7 +144,7 @@ _HOSTNAME_RE = re.compile(
     r"^(?=.{1,253}$)(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+"
     r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.?$"
 )
-__version__ = "1.5.0"
+__version__ = "1.5.1"
 VALID_PHASES = {
     "00-SCOPE",
     "01-RECON",
@@ -199,7 +199,7 @@ VALID_PHASES = {
     "44-REPORT",
     "45-EVIDENCE",
 }
-FAST_PHASES = {"00-SCOPE", "01-RECON", "02-RESOLVE", "04-SCAN", "05-HARVEST"}
+FAST_PHASES = {"00-SCOPE", "01-RECON", "02-RESOLVE", "04-SCAN", "05-HARVEST", "44-REPORT"}
 PhaseSet = Set[str]
 
 
@@ -605,36 +605,16 @@ def _run_blocking(
                 start_new_session=True,
             )
             _register_proc(proc)
-            proc.wait(timeout=timeout)
+            if not _wait_proc(proc, timeout):
+                _kill_proc(proc)
+                with _SPAWNED_PIDS_LOCK, contextlib.suppress(ValueError):
+                    _SPAWNED_PIDS.remove(proc.pid)
+                with log_path.open("ab") as f:
+                    f.write(f"\n[timeout after {timeout}s]\n".encode("utf-8"))
+                return 124, time.monotonic() - t0
             with _SPAWNED_PIDS_LOCK, contextlib.suppress(ValueError):
                 _SPAWNED_PIDS.remove(proc.pid)
             return proc.returncode, time.monotonic() - t0
-        except subprocess.TimeoutExpired:
-            if proc is not None and proc.poll() is None:
-                with contextlib.suppress(ProcessLookupError):
-                    os.killpg(proc.pid, signal.SIGTERM)
-                # Wait with WNOHANG polling so we don't get stuck (H2)
-                for _ in range(50):
-                    try:
-                        proc.wait(timeout=0.1)
-                    except subprocess.TimeoutExpired:
-                        continue
-                    break
-                else:
-                    with contextlib.suppress(ProcessLookupError):
-                        os.killpg(proc.pid, signal.SIGKILL)
-                    for _ in range(50):
-                        try:
-                            proc.wait(timeout=0.1)
-                        except subprocess.TimeoutExpired:
-                            continue
-                        break
-            if proc is not None:
-                with _SPAWNED_PIDS_LOCK, contextlib.suppress(ValueError):
-                    _SPAWNED_PIDS.remove(proc.pid)
-            with log_path.open("ab") as f:
-                f.write(f"\n[timeout after {timeout}s]\n".encode("utf-8"))
-            return 124, time.monotonic() - t0
         except FileNotFoundError as e:
             with log_path.open("ab") as f:
                 f.write(f"\n[binary not found: {e}]\n".encode("utf-8"))
@@ -684,13 +664,36 @@ def _maybe_timeout(base: int) -> int:
 def _wait_proc(proc: subprocess.Popen, timeout: int) -> bool:
     """Wait for a subprocess with moderate polling intervals to avoid
     hanging on unkillable processes (prevents zombies, H2/H10)."""
-    for _ in range(timeout):
+    for _ in range(max(1, timeout)):
         try:
             proc.wait(timeout=1)
             return True
         except subprocess.TimeoutExpired:
             continue
     return False
+
+
+def _kill_proc(proc: subprocess.Popen) -> None:
+    """Kill a subprocess with SIGTERM, poll, then escalate to SIGKILL."""
+    if proc.poll() is not None:
+        return
+    with contextlib.suppress(ProcessLookupError):
+        os.killpg(proc.pid, signal.SIGTERM)
+    for _ in range(50):
+        try:
+            proc.wait(timeout=0.1)
+        except subprocess.TimeoutExpired:
+            continue
+        break
+    else:
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(proc.pid, signal.SIGKILL)
+        for _ in range(50):
+            try:
+                proc.wait(timeout=0.1)
+            except subprocess.TimeoutExpired:
+                continue
+            break
 
 
 def _cleanup_child_procs() -> None:
@@ -726,27 +729,33 @@ _PIPELINE_CFG: PipelineConfig = PipelineConfig()
 
 
 class Progress:
-    def __init__(self, total: int, stages: Optional[List[List[str]]] = None):
-        self.bar = tqdm(total=total, desc="Scan", position=0)
+    def __init__(self, phases: List[str], stages: Optional[List[List[str]]] = None):
+        self.phases = phases
+        self.phase_set = set(phases)
         self.stages = stages or []
+        self._weight_done = 0
         self._completed = 0
+        self._total_weight = sum(_PHASE_WEIGHTS.get(p, 1) for p in phases)
+        self.bar = tqdm(total=self._total_weight, desc="Scan", position=0)
 
     def next(self, name: str):
+        w = _PHASE_WEIGHTS.get(name, 1)
+        self._weight_done += w
         self._completed += 1
         if self.bar.total == 0:
             return
         stage_idx = 0
         if self.stages:
-            phase_count = 0
+            seen = 0
             for i, stage in enumerate(self.stages):
-                phase_count += len(stage)
-                if self._completed <= phase_count:
+                seen += sum(1 for p in stage if p in self.phase_set)
+                if self._completed <= seen:
                     stage_idx = i
                     break
-        pct = (self._completed / self.bar.total) * 100
+        pct = min(100.0, (self._weight_done / self.bar.total) * 100)
         stage_info = f"Stage {stage_idx + 1}/{len(self.stages)} " if self.stages else ""
         self.bar.set_description(f"{stage_info}[{pct:.0f}%] {name}")
-        self.bar.update(1)
+        self.bar.update(w)
 
     def close(self):
         self.bar.close()
@@ -872,20 +881,39 @@ def merge_unique(
 
 
 def _downsample_file(path: Path, n: int = 1) -> None:
-    """Keep only the first `n` non-blank, non-comment lines of a text file (in-place)."""
+    """Keep only the first `n` non-blank, non-comment lines of a text file (in-place).
+    Streams the file line by line to avoid loading large files into memory."""
     if not path.is_file():
         return
-    lines = [ln for ln in path.read_text(encoding="utf-8", errors="ignore").splitlines()
-             if ln.strip() and not ln.lstrip().startswith("#")]
-    if len(lines) > n:
-        tmp = path.with_suffix(path.suffix + ".ds_tmp")
-        try:
-            tmp.write_text("\n".join(lines[:n]) + "\n")
-            os.replace(tmp, path)
-        except Exception:
-            with contextlib.suppress(Exception):
-                tmp.unlink(missing_ok=True)
-            raise
+    # First pass: count valid lines
+    count = 0
+    try:
+        with path.open(encoding="utf-8", errors="ignore") as f:
+            for ln in f:
+                if ln.strip() and not ln.lstrip().startswith("#"):
+                    count += 1
+                    if count > n:
+                        break
+    except (OSError, IOError):
+        return
+    if count <= n:
+        return
+    # Second pass: write first n valid lines
+    tmp = path.with_suffix(path.suffix + ".ds_tmp")
+    try:
+        with path.open(encoding="utf-8", errors="ignore") as src, tmp.open("w", encoding="utf-8") as dst:
+            written = 0
+            for ln in src:
+                if ln.strip() and not ln.lstrip().startswith("#"):
+                    dst.write(ln if ln.endswith("\n") else ln + "\n")
+                    written += 1
+                    if written >= n:
+                        break
+        os.replace(tmp, path)
+    except Exception:
+        with contextlib.suppress(Exception):
+            tmp.unlink(missing_ok=True)
+        raise
 
 
 def safe_suffix(s: str) -> str:
@@ -987,9 +1015,8 @@ class Interactsh:
         token = os.environ.get("INTERACTSH_TOKEN")
         # rotate log so a stale "Domain: <old>" line from a previous run
         # can never be mistaken for this run's announcement.
-        with contextlib.suppress(Exception):
-            self.log.unlink()
         ensure(self.log)
+        self.log.write_text("")
         cmd = ["interactsh-client", "-v"]
         if token:
             cmd += ["-t", token]
@@ -1500,18 +1527,7 @@ async def phase_04_SCAN(
                 _maybe_timeout(1800),
             )
         )
-        # UDP port scan (top-100 UDP ports)
-        udp_ports_file = outdir / "ports_udp.txt"
-        jobs.append(
-            (
-                "naabu-udp",
-                [
-                    "naabu", "-silent", "-l", str(hosts), "-o", str(udp_ports_file),
-                    "-top-ports", "100", "-udp",
-                ],
-                _maybe_timeout(1800),
-            )
-        )
+        # UDP scanning not supported by naabu 2.x; skipped
     elif have_hosts and t.has("nmap"):
         _nmap_cmd = ["nmap", "-iL", str(hosts), "-Pn", "-p-", "--open",
                      "--script=http-enum", "-oG", str(outdir / "ports.gnmap")]
@@ -1556,11 +1572,20 @@ async def phase_04_SCAN(
         )
     if have_hosts and t.has("httprobe"):
         httprobe_out = outdir / "hosts_httprobe.txt"
+        httprobe_runner = outdir / "logs" / "httprobe_runner.sh"
+        ensure(httprobe_runner)
+        httprobe_runner.write_text(
+            "#!/usr/bin/env bash\n"
+            "set -eu\n"
+            f"INPUT={shlex.quote(str(hosts))}\n"
+            f"OUTPUT={shlex.quote(str(httprobe_out))}\n"
+            'cat "$INPUT" | httprobe -c 50 -t 3000 > "$OUTPUT"\n'
+        )
+        httprobe_runner.chmod(0o755)
         jobs.append(
             (
                 "httprobe",
-                ["httprobe", "-l", str(hosts), "-c", "50", "-t", "3000",
-                 "-o", str(httprobe_out)],
+                ["bash", str(httprobe_runner)],
                 600,
             )
         )
@@ -1802,10 +1827,7 @@ async def phase_05_HARVEST(
     if t.has("katana"):
         _katana_proxy = []
         if _PIPELINE_CFG.proxy:
-            _kp = _PIPELINE_CFG.proxy
-            if _kp.startswith("socks5://"):
-                _kp = _kp[len("socks5://"):]
-            _katana_proxy = ["-p", _kp]
+            _katana_proxy = ["-proxy", _PIPELINE_CFG.proxy]
         _katana_depth = "1" if waf_detected else "3"
         g2.append(
             (
@@ -1820,8 +1842,6 @@ async def phase_05_HARVEST(
                     "-jc",
                     "-d",
                     _katana_depth,
-                    "-kf",
-                    "url,path,technologies",
                     "-duc",
                 ] + _katana_proxy + _extra_http_args(),
                 _maybe_timeout(900) if waf_detected else _maybe_timeout(1800),
@@ -1987,34 +2007,62 @@ async def phase_06_JSINTEL(outdir: Path, t: Tools, only: PhaseSet, skip: PhaseSe
     log("info", "Phase 06-JSINTEL: JS analysis (SecretFinder + nuclei)")
     urls = outdir / "urls_all.txt"
     js_urls = outdir / "urls_js.txt"
-    # crude filter: any URL whose path ends in a JS extension. Strip both
-    # query string and fragment so things like app.js?v=1 or app.js#x pass.
+    map_urls = outdir / "urls_sourcemap.txt"
+    # Collect JS URLs and source-map URLs from the harvested pool.
+    # Strip query/fragment to check extension; keep the full original URL.
     if urls.exists():
-        keep: List[str] = []
+        keep_js: List[str] = []
+        keep_map: List[str] = []
+        seen_ext: Set[str] = set()
         for u in read_lines(urls):
             path = u.split("?", 1)[0].split("#", 1)[0].lower()
-            if path.endswith((".js", ".jsx", ".mjs", ".cjs")):
-                keep.append(u)
-        if keep:
-            ensure(js_urls).write_text("\n".join(keep) + "\n")
+            if path.endswith((".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx")):
+                if u not in seen_ext:
+                    seen_ext.add(u)
+                    keep_js.append(u)
+            if path.endswith(".map"):
+                keep_map.append(u)
+        if keep_js:
+            ensure(js_urls).write_text("\n".join(keep_js) + "\n")
+            log("ok", f"06-JSINTEL: collected {len(keep_js)} JS/TS URLs")
+        if keep_map:
+            ensure(map_urls).write_text("\n".join(keep_map) + "\n")
+            log("ok", f"06-JSINTEL: collected {len(keep_map)} source-map URLs")
     if not js_urls.exists() or not read_lines(js_urls):
         log("info", "06-JSINTEL: no JS URLs found; skipping")
         ensure(outdir / "js_secrets.txt").write_text("")
         return {"06-JSINTEL": str(outdir / "js_secrets.txt"), "count": 0}
+    # When running over proxychains/Tor, downsample JS URLs so
+    # linkfinder/xnlinkfinder don't time out (each URL fetch is slow).
+    _js_input = js_urls
+    if _USE_PROXYCHAINS:
+        js_lines = read_lines(js_urls)
+        if len(js_lines) > 50:
+            sampled = js_lines[:50]
+            _js_input = outdir / "urls_js_sample.txt"
+            ensure(_js_input).write_text("\n".join(sampled) + "\n")
+            log("info", f"06-JSINTEL: downsampled {len(js_lines)} JS URLs to {len(sampled)} for slow network")
+
     jobs: List[Tuple[str, List[str], int]] = []
     if t.has("secretfinder"):
+        # SecretFinder's -i flag expects a single URL, not a file.
+        # Iterate over each JS URL so individual requests are not
+        # misinterpreted as file-path HTTP fetches.
         runner = outdir / "logs" / "secretfinder_runner.sh"
         ensure(runner)
         runner.write_text(
             "#!/usr/bin/env bash\n"
             "set -eu\n"
             f"OUT={shlex.quote(str(outdir / 'secrets.txt'))}\n"
-            f"IN={shlex.quote(str(js_urls))}\n"
-            '# -o writes HTML; redirect stdout to OUT for plain-text results\n'
-            'secretfinder -i "$IN" 2>/dev/null > "$OUT" || true\n'
+            f"IN={shlex.quote(str(_js_input))}\n"
+            'while IFS= read -r url; do\n'
+            '  [ -z "$url" ] && continue\n'
+            '  echo "[06-JSINTEL] secretfinder $url" >&2\n'
+            '  timeout 60 secretfinder -i "$url" 2>/dev/null || true\n'
+            'done < "$IN" > "$OUT" || true\n'
         )
         runner.chmod(0o755)
-        jobs.append(("secretfinder", ["bash", str(runner)], 1200))
+        jobs.append(("secretfinder", ["bash", str(runner)], _maybe_timeout(1800)))
     if t.has("linkfinder"):
         # linkfinder -o produces HTML output; kept for manual inspection only.
         linkfinder_out = outdir / "urls_linkfinder.html"
@@ -2024,24 +2072,34 @@ async def phase_06_JSINTEL(outdir: Path, t: Tools, only: PhaseSet, skip: PhaseSe
             "#!/usr/bin/env bash\n"
             "set -eu\n"
             f"OUT={shlex.quote(str(linkfinder_out))}\n"
-            f"IN={shlex.quote(str(js_urls))}\n"
-            'linkfinder -i "$IN" -o "$OUT" 2>/dev/null || true\n'
+            f"IN={shlex.quote(str(_js_input))}\n"
+            ': > "$OUT"\n'
+            'while IFS= read -r url; do\n'
+            '  [ -z "$url" ] && continue\n'
+            '  timeout 120 linkfinder -i "$url" 2>/dev/null || true\n'
+            'done < "$IN" >> "$OUT"\n'
         )
         runner.chmod(0o755)
-        jobs.append(("linkfinder", ["bash", str(runner)], 1200))
-    if t.has("xnlinkfinder") or t.has("xnLinkFinder"):
+        jobs.append(("linkfinder", ["bash", str(runner)], _maybe_timeout(1200)))
+    # Detect the actual xnLinkFinder binary name (case-sensitive on Linux)
+    _xnlf_bin = ""
+    if t.has("xnlinkfinder"):
+        _xnlf_bin = "xnlinkfinder"
+    elif t.has("xnLinkFinder"):
+        _xnlf_bin = "xnLinkFinder"
+    if _xnlf_bin:
         xnlink_out = outdir / "urls_xnlinkfinder.txt"
         runner = outdir / "logs" / "xnlinkfinder_runner.sh"
         ensure(runner)
         runner.write_text(
             "#!/usr/bin/env bash\n"
             "set -eu\n"
-            f"IN={shlex.quote(str(js_urls))}\n"
+            f"IN={shlex.quote(str(_js_input))}\n"
             f"OUT={shlex.quote(str(xnlink_out))}\n"
-            'xnLinkFinder -i "$IN" -o "$OUT" -sp /tmp/xnlinkfinder 2>/dev/null || true\n'
+            f'{_xnlf_bin} -i "$IN" -o "$OUT" -sp /tmp/xnlinkfinder 2>/dev/null || true\n'
         )
         runner.chmod(0o755)
-        jobs.append(("xnLinkFinder", ["bash", str(runner)], 1200))
+        jobs.append((_xnlf_bin, ["bash", str(runner)], _maybe_timeout(1200)))
     if t.has("nuclei"):
         jobs.append(
             (
@@ -2050,7 +2108,7 @@ async def phase_06_JSINTEL(outdir: Path, t: Tools, only: PhaseSet, skip: PhaseSe
                     "nuclei",
                     "-silent",
                     "-l",
-                    str(js_urls),
+                    str(_js_input),
                     "-t",
                     "http/exposed-panels",
                     "-t",
@@ -2058,31 +2116,50 @@ async def phase_06_JSINTEL(outdir: Path, t: Tools, only: PhaseSet, skip: PhaseSe
                     "-o",
                     str(outdir / "nuclei_exposures.txt"),
                 ] + _extra_http_args(),
-                _maybe_timeout(3000),
+                min(_maybe_timeout(3000), 7200),
             )
         )
-    # Collect .json endpoints for API surface analysis
-    json_urls = outdir / "urls_json.txt"
-    if urls.exists():
-        json_keep: List[str] = []
-        for u in read_lines(urls):
-            path = u.split("?", 1)[0].split("#", 1)[0].lower()
-            if path.endswith(".json"):
-                json_keep.append(u)
-        if json_keep:
-            ensure(json_urls).write_text("\n".join(json_keep) + "\n")
     await run_parallel(jobs, outdir)
-    # Merge JSON endpoints back into urls_all.txt so downstream phases
-    # (params, fuzz, authz) can discover API surface from JS files.
-    if json_urls.exists() and read_lines(json_urls):
-        merge_unique(
-            [outdir / "urls_all.txt", json_urls],
-            outdir / "urls_all.txt",
-        )
+    # Merge endpoints discovered by JS tools back into urls_all.txt so
+    # downstream phases (params, fuzz, authz) can discover fresh API surface.
+    # xnLinkFinder often discovers URLs embedded in JS (API routes, endpoints).
     xnlink_out = outdir / "urls_xnlinkfinder.txt"
     if xnlink_out.exists() and read_lines(xnlink_out):
         merge_unique(
-            [outdir / "urls_all.txt", xnlink_out],
+            [xnlink_out],
+            outdir / "urls_all.txt",
+        )
+    # Collect .json endpoints from JS tool output (xnLinkFinder, etc.) for
+    # API surface analysis — these are NEW endpoints the JS tools discovered.
+    json_urls = outdir / "urls_json.txt"
+    json_keep: List[str] = []
+    json_seen: Set[str] = set()
+    for src in [xnlink_out, outdir / "secrets.txt"]:
+        if src and src.exists():
+            for u in read_lines(src):
+                path = u.split("?", 1)[0].split("#", 1)[0].lower()
+                if path.endswith(".json") and u not in json_seen:
+                    json_seen.add(u)
+                    json_keep.append(u)
+    if json_keep:
+        ensure(json_urls).write_text("\n".join(json_keep) + "\n")
+    # Also extract .json from the original URL pool (pre-existing endpoints)
+    if urls.exists():
+        json_keep = []
+        if json_urls.exists():
+            json_keep = read_lines(json_urls)
+        seen_urls = set(json_keep)
+        for u in read_lines(urls):
+            path = u.split("?", 1)[0].split("#", 1)[0].lower()
+            if path.endswith(".json") and u not in seen_urls:
+                seen_urls.add(u)
+                json_keep.append(u)
+        if json_keep:
+            ensure(json_urls).write_text("\n".join(json_keep) + "\n")
+    # Merge JSON endpoints back so downstream phases see API surface
+    if json_urls.exists() and read_lines(json_urls):
+        merge_unique(
+            [json_urls],
             outdir / "urls_all.txt",
         )
     n = merge_unique(
@@ -2401,6 +2478,7 @@ async def _update_nuclei_templates(outdir: Path) -> None:
         cache_stamp.write_text(str(time.time()))
     except asyncio.TimeoutError:
         proc.kill()
+        await proc.wait()
 
 
 async def phase_09_VULNSCAN(outdir: Path, t: Tools, only: PhaseSet, skip: PhaseSet, force: bool = False) -> Dict[str, Any]:
@@ -2687,7 +2765,7 @@ async def phase_11_INJECT(
             "--delay", "500",
             "--no-spinner",
             "--user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-            "--only-custompayload",
+            "--only-custom-payload",
         ]
         proxy = os.environ.get("PROXY", "")
         if proxy:
@@ -3272,6 +3350,7 @@ async def phase_14_ORIGIN(
             stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=15)
         except asyncio.TimeoutError:
             proc.kill()
+            await proc.wait()
             stdout = b""
         mx = stdout.decode("utf-8", errors="ignore").strip()
         if mx and not mx.startswith(";"):
@@ -3296,6 +3375,7 @@ async def phase_14_ORIGIN(
                             out2, _ = await asyncio.wait_for(proc2.communicate(), timeout=10)
                         except asyncio.TimeoutError:
                             proc2.kill()
+                            await proc2.wait()
                             out2 = b""
                         for mip in out2.decode().splitlines():
                             mip = mip.strip()
@@ -4430,6 +4510,8 @@ async def phase_20_GRAPHQL(
             if not h.startswith("http"):
                 h = f"https://{h}"
             targets.append(h.rstrip("/"))
+    # Normalize all targets to HTTPS to avoid 308 redirects
+    targets = [re.sub(r"^http://", "https://", t) for t in targets]
     if not targets:
         log("warn", "Phase 20-GRAPHQL: no HTTP targets; skipping")
         return {"20-GRAPHQL": str(_o_out), "count": 0}
@@ -7083,6 +7165,62 @@ PIPELINE = [
     ("44-CHAIN", phase_44_CHAIN, ("outdir", "t", "only", "skip", "prev", "force")),
     ("45-EVIDENCE", phase_45_EVIDENCE, ("outdir", "t", "only", "skip", "prev", "force")),
 ]
+# Phase weights for progress bar accuracy (heuristic based on typical runtime).
+# Heavier phases (subdomain enum, port scan, nuclei, sqlmap, fuzz) contribute
+# more to the bar so it doesn't jump to 50% after 5 quick phases then stall.
+_PHASE_WEIGHTS: Dict[str, int] = {
+    "00-SCOPE": 1,
+    "01-RECON": 10,
+    "02-RESOLVE": 5,
+    "03-PERMUTE": 8,
+    "04-SCAN": 10,
+    "04b-TAKEOVER-VALIDATE": 3,
+    "05-HARVEST": 8,
+    "05b-APISPEC": 2,
+    "06-JSINTEL": 5,
+    "07-PARAMS": 5,
+    "08-FUZZ": 10,
+    "09-VULNSCAN": 10,
+    "10-TLSCMS": 8,
+    "11-INJECT": 8,
+    "11b-SQLMAP": 10,
+    "12-SSTI": 3,
+    "13-OOB": 2,
+    "14-ORIGIN": 3,
+    "15-SECRETS": 5,
+    "16A-AUTHZ": 2,
+    "16B-MASSASSIGN": 2,
+    "17-IDOR": 3,
+    "17B-SSRFMETA": 2,
+    "18-CLOUD": 3,
+    "19-GIT": 5,
+    "20-GRAPHQL": 2,
+    "21-WAF": 3,
+    "22-NOSQLI": 3,
+    "23-RACE": 3,
+    "24-JWT": 3,
+    "25-XXE": 3,
+    "26-CMDINJECT": 5,
+    "27-SSPP": 2,
+    "28-CACHED": 3,
+    "29-DEPCHECK": 5,
+    "30-LFI": 3,
+    "31-OPENREDIR": 2,
+    "32-CLICKJACK": 3,
+    "33-CRLF": 3,
+    "34-RATELIMIT": 2,
+    "35-CORSADV": 3,
+    "36-JWTADV": 3,
+    "37-FILEUPLOAD": 3,
+    "38-SMUGGLE": 5,
+    "39-OAUTH": 3,
+    "40-PWRESET": 3,
+    "41-WEBSOCKET": 3,
+    "42-LDAP": 2,
+    "43-DESERIAL": 3,
+    "44-CHAIN": 1,
+    "45-EVIDENCE": 3,
+}
 # Dependency-ordered execution stages. Phases in the same stage are independent
 # of one another (they only read artifacts produced by *earlier* stages, never
 # each other's output), so they run concurrently.
@@ -7173,6 +7311,7 @@ def _csv_from_phases(value: object) -> PhaseSet:
 
 
 async def run_pipeline(args: argparse.Namespace) -> int:
+    _TOOL_RC_REGISTRY.clear()
     outdir = Path(args.out).resolve()
     if outdir.exists() and not outdir.is_dir():
         raise ValueError(f"output path exists and is not a directory: {outdir}")
@@ -7274,6 +7413,19 @@ async def run_pipeline(args: argparse.Namespace) -> int:
         and shutil.which("proxychains4")
         and proxy.startswith("socks")
     )
+    if proxy:
+        import socket as _proxy_socket
+        try:
+            _proxy_url = proxy.split("://")[1] if "://" in proxy else proxy
+            _proxy_host = _proxy_url.split(":")[0]
+            _proxy_port = int(_proxy_url.split(":")[1].split("/")[0])
+            _s = _proxy_socket.create_connection((_proxy_host, _proxy_port), timeout=3)
+            _s.close()
+        except Exception:
+            log("warn", f"Proxy {proxy} is unreachable. Disabling proxy to avoid timeouts.")
+            proxy = ""
+            _USE_PROXYCHAINS = False
+            _set_proxy_env("")
 
     cookie = getattr(args, 'cookie', '')
     if not cookie:
@@ -7314,7 +7466,7 @@ async def run_pipeline(args: argparse.Namespace) -> int:
         return (not only or name in only) and name not in skip
 
     phases_to_run = [name for name, _, _ in PIPELINE if _selected(name)]
-    progress = Progress(len(phases_to_run), stages=STAGES)
+    progress = Progress(phases_to_run, stages=STAGES)
     scan_status.set_total(len(phases_to_run))
     active_needs_oast = any(name in {"08-FUZZ", "09-VULNSCAN", "10-TLSCMS", "11-INJECT"} for name in phases_to_run)
     h_selected = _selected("13-OOB")
@@ -7418,8 +7570,10 @@ async def run_pipeline(args: argparse.Namespace) -> int:
         for stage in STAGES:
             run_now = [name for name in stage if _selected(name)]
             for name in stage:
-                if not _selected(name) and name in skip:
+                if name in skip:
                     log("skip", f"phase {name} (--skip)")
+                elif only and name not in only:
+                    log("skip", f"phase {name} (not in --only)")
             if not run_now:
                 continue
             # Independent phases in a stage run concurrently; they only read
@@ -7465,9 +7619,9 @@ async def run_pipeline(args: argparse.Namespace) -> int:
             screenshots_dir = ensure(outdir / "screenshots")
             await _run(
                 "gowitness",
-                ["gowitness", "file", "-f", str(gowitness_targets),
-                 "-P", str(screenshots_dir), "--disable-db"],
-                600, outdir,
+                ["gowitness", "scan", "file", "-f", str(gowitness_targets),
+                 "-s", str(screenshots_dir), "--write-none"],
+                _maybe_timeout(600), outdir,
             )
             n_screenshots = len(list(screenshots_dir.glob("*.png"))) if screenshots_dir.exists() else 0
             if n_screenshots:
@@ -7548,7 +7702,7 @@ def _banner() -> None:
 {C["r"]}
 {C["g"]}   ╔══════════════════════════════════════════════════════╗
 {C["g"]}   ║  {C["c"]}ReconChain v{__version__}{C["g"]}  —  {C["y"]}Bug Bounty Recon & Vuln Pipeline{C["g"]}   ║
-{C["g"]}   ║  {C["d"]}40+ tools  |  51 phases  |  DAG stages  |  Resumable{C["g"]}   ║
+{C["g"]}   ║  {C["d"]}41+ tools  |  51 phases  |  DAG stages  |  Resumable{C["g"]}   ║
 {C["g"]}   ╚══════════════════════════════════════════════════════╝{C["r"]}
 """
     print(banner, flush=True)
@@ -7605,6 +7759,12 @@ def interactive_setup() -> argparse.Namespace:
         validator=lambda v: v.replace(".", "", 1).isdigit(),
         error_msg="Enter a number (e.g. 0, 0.5, 2)",
     )
+    # Proxy
+    print(f"\n{C['b']}Proxy:{C['r']}")
+    proxy = _prompt(
+        "Proxy URL (e.g. socks5://127.0.0.1:9050 for Tor), or leave empty for direct",
+        default="",
+    )
     def _validate_count(v: str) -> bool:
         return v.lower() == "all" or (v.isdigit() and int(v) > 0)
 
@@ -7620,6 +7780,8 @@ def interactive_setup() -> argparse.Namespace:
         validator=_validate_count,
         error_msg="Enter a positive number or 'all'",
     )
+    # Speed mode — reduce sample sizes across all phases
+    speed = _prompt_yes_no("Fast mode — reduce sample sizes for quicker scans (thorough but slow by default)", default=False)
     # 6. Authentication / headers
     print(f"\n{C['b']}Authentication:{C['r']}")
     cookie = _prompt(
@@ -7700,6 +7862,7 @@ def interactive_setup() -> argparse.Namespace:
     print(f"   Domain:           {C['y']}{domain}{C['r']}")
     print(f"   Output:           {C['y']}{out}{C['r']}")
     print(f"   Level:            {C['y']}{level}{C['r']}")
+    print(f"   Proxy:            {C['y']}{proxy if proxy else 'none'}{C['r']}")
     print(f"   Phases:           {C['y']}{', '.join(sorted(selected))}{C['r']}")
     print(f"   Jobs:             {C['y']}{jobs}{C['r']}")
     print(f"   SQLmap level/risk:{C['y']} {sqlmap_level}/{sqlmap_risk}{C['r']}")
@@ -7708,6 +7871,7 @@ def interactive_setup() -> argparse.Namespace:
     print(f"   Extra headers:    {C['y']}{len(extra_headers_list)} set{C['r']}")
     print(f"   Resume:           {C['y']}{'yes' if resume else 'no'}{C['r']}")
     print(f"   Force:            {C['y']}{'yes' if force else 'no'}{C['r']}")
+    print(f"   Fast mode:        {C['y']}{'yes' if speed else 'no'}{C['r']}")
     print(f" {C['b']}{'─' * 60}{C['r']}")
     if not _prompt_yes_no("Start scan", default=True):
         log("info", "Aborted by user")
@@ -7733,6 +7897,7 @@ def interactive_setup() -> argparse.Namespace:
     ns.sqlmap_level = int(sqlmap_level)
     ns.sqlmap_risk = int(sqlmap_risk)
     ns.delay = float(delay)
+    ns.proxy = proxy
     ns.rate_limit = 0
     def _resolve_count(v: str) -> int:
         return sys.maxsize if v.lower() == "all" else int(v)
@@ -7768,6 +7933,42 @@ def interactive_setup() -> argparse.Namespace:
     ns.sample_hosts_websocket = 10
     ns.sample_urls_ldap = 20
     ns.sample_endpoints_deserial = 10
+    ns.sample_hosts_ssl = 10
+    ns.sample_hosts_origin = 10
+    ns.sample_endpoints_cors = 10
+    ns.sample_endpoints_l = 20
+    ns.sample_endpoints_post = 5
+    if speed:
+        ns.sample_urls_nosqli = min(ns.sample_urls_nosqli, 5)
+        ns.sample_urls_cmdi = min(ns.sample_urls_cmdi, 5)
+        ns.sample_urls_xxe = min(ns.sample_urls_xxe, 3)
+        ns.sample_urls_crlf = min(ns.sample_urls_crlf, 5)
+        ns.sample_urls_redirect = min(ns.sample_urls_redirect, 5)
+        ns.sample_urls_ldap = min(ns.sample_urls_ldap, 5)
+        ns.sample_urls_depcheck = min(ns.sample_urls_depcheck, 5)
+        ns.sample_urls_upload = min(ns.sample_urls_upload, 3)
+        ns.sample_hosts_ssl = min(ns.sample_hosts_ssl, 2)
+        ns.sample_hosts_origin = min(ns.sample_hosts_origin, 3)
+        ns.sample_hosts_cloud = min(ns.sample_hosts_cloud, 2)
+        ns.sample_hosts_git = min(ns.sample_hosts_git, 2)
+        ns.sample_hosts_graphql = min(ns.sample_hosts_graphql, 2)
+        ns.sample_hosts_waf = min(ns.sample_hosts_waf, 2)
+        ns.sample_hosts_jwt = min(ns.sample_hosts_jwt, 5)
+        ns.sample_hosts_jwtadv = min(ns.sample_hosts_jwtadv, 5)
+        ns.sample_hosts_cached = min(ns.sample_hosts_cached, 3)
+        ns.sample_hosts_clickjack = min(ns.sample_hosts_clickjack, 5)
+        ns.sample_hosts_ratelimit = min(ns.sample_hosts_ratelimit, 3)
+        ns.sample_hosts_smuggle = min(ns.sample_hosts_smuggle, 3)
+        ns.sample_hosts_websocket = min(ns.sample_hosts_websocket, 3)
+        ns.sample_endpoints_race = min(ns.sample_endpoints_race, 3)
+        ns.sample_endpoints_cors = min(ns.sample_endpoints_cors, 3)
+        ns.sample_endpoints_corsadv = min(ns.sample_endpoints_corsadv, 3)
+        ns.sample_endpoints_sspp = min(ns.sample_endpoints_sspp, 3)
+        ns.sample_endpoints_l = min(ns.sample_endpoints_l, 5)
+        ns.sample_endpoints_post = min(ns.sample_endpoints_post, 2)
+        ns.sample_endpoints_oauth = min(ns.sample_endpoints_oauth, 3)
+        ns.sample_endpoints_pwreset = min(ns.sample_endpoints_pwreset, 3)
+        ns.sample_endpoints_deserial = min(ns.sample_endpoints_deserial, 3)
     return ns
 
 

@@ -188,10 +188,11 @@ def test_stages_cover_pipeline_exactly_once() -> None:
 def test_stage_order_respects_dependencies() -> None:
     # phase -> first stage index it appears in
     stage_of = {name: i for i, stage in enumerate(reconchain.STAGES) for name in stage}
-    # 00-SCOPE and 01-RECON in stage 0 (no deps between them)
-    assert stage_of["00-SCOPE"] == stage_of["01-RECON"]
+    # 00-SCOPE in stage 0, 01-RECON in stage 1 (scope must complete first)
+    assert stage_of["00-SCOPE"] < stage_of["01-RECON"]
 
     dependencies = {
+        "01-RECON": {"00-SCOPE"},
         "02-RESOLVE": {"01-RECON"},
         "04-SCAN": {"02-RESOLVE"},
         "04b-TAKEOVER-VALIDATE": {"04-SCAN"},

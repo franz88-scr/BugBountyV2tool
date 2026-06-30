@@ -1,4 +1,4 @@
-# ReconChain v1.5
+# ReconChain v1.5.1
 
 A Python orchestrator that chains 51+ recon and vulnerability phases into a single,
 resumable DAG pipeline — no config files, no YAML, no DSL.
@@ -344,10 +344,10 @@ out/
 
 | Category | Tools |
 |----------|-------|
-| Enumeration | subfinder, amass, dnsx, puredns |
+| Enumeration | subfinder, amass, alterx, dnsx, puredns |
 | Network | naabu, nmap, httpx, httprobe, nuclei, cdncheck |
 | URLs | gau, gospider, katana, subjs, waymore, unfurl |
-| Analysis | SecretFinder, Arjun, dnsgen, inql |
+| Analysis | SecretFinder, Arjun, dnsgen, alterx, inql |
 | Fuzzing | ffuf, feroxbuster, qsreplace, Gxss |
 | Vulns | nuclei, dalfox, sqlmap, testssl.sh, wpscan, kxss, wafw00f |
 | Secrets | gitleaks, trufflehog, SecretFinder, LinkFinder |
@@ -426,6 +426,11 @@ commands when `ALL_PROXY` contains a `socks4://` or `socks5://` scheme. Direct
 tool invocations (Go/Python/Ruby binaries) use the native SOCKS support built into
 those runtimes, avoiding double-proxying.
 
+On startup, the orchestrator performs a **pre-flight connectivity check** against
+the proxy address. If the proxy is unreachable (e.g. Tor not running), the proxy
+is disabled with a warning, preventing all downstream tools from hanging until
+timeout.
+
 **No explicit `--proxy` flag is required** — just export your proxy variable before
 launching the scan:
 
@@ -453,7 +458,7 @@ HTML report:
 - **Cross-phase correlation** — 44-CHAIN cross-references findings (secrets→auth, IDOR→mass-assign, SSRF→LFI); 45-EVIDENCE captures request/response pairs
 - **Scope gating** — 00-SCOPE validates assets against allowlist/scope file before any recon runs
 - **WAF-aware throttling** — 21-WAF sets global `waf_detected` / `waf_evasion_throttle` flags consumed by all downstream phases
-- **40+ tools** — 12 new tools added: httprobe, puredns, Gxss, unfurl, qsreplace, cdncheck, gowitness, cloud_enum, gitdumper, trufflehog, wafw00f, inql
+- **41+ tools** — added alterx: subdomain permutation generator from ProjectDiscovery
 - **Screenshots** — gowitness captures browser screenshots of live hosts
 - **Webhook notifications** — send JSON payloads with severity to any webhook URL
 - **Config file support** — `--config` JSON file pre-populates options
@@ -465,6 +470,21 @@ HTML report:
 
 ## Bug Fixes (v1.5.1)
 
+- **Proxy connectivity check** — SOCKS proxy auto-detected from env but Tor/SSH
+  often not running, causing every tool to hang until timeout (3× scaled).
+  Added pre-flight socket check at startup; dead proxies are disabled with a
+  warning instead of silently degrading every phase.
+- **dalfox `--only-custompayload` typo** — flag was `--only-custompayload` but
+  the correct name is `--only-custom-payload`. Dalfox crashed immediately on
+  launch, skipping all XSS scanning.
+- **katana `-p` → `-proxy`** — `-p` is the `-parallelism` flag (expects an int),
+  so `-p socks5://127.0.0.1:9050` caused a parse error. Changed to `-proxy`.
+- **gowitness v3 subcommand** — gowitness 3.x removed the top-level `file`
+  subcommand; `file` is now `gowitness scan file`. Also replaced `-P` with
+  `-s` and `--disable-db` with `--write-none`.
+- **GraphQL HTTPS normalization** — targets were probed with `http://`, getting
+  a 308 redirect. inql doesn't follow redirects, causing all GraphQL probes to
+  fail with `HTTP Error 308`. Targets are now forced to `https://`.
 - **CRLF injection detection** — payloads in phase 33-CRLF were double-encoded
   by `urllib.parse.urlencode`, making every test silently ineffective. Changed
   `_CRLF_PAYLOADS` to use raw CRLF bytes so `urlencode` produces the correct

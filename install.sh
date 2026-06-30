@@ -193,7 +193,11 @@ ALL_TOOLS=(subfinder amass dnsx naabu nmap httpx nuclei
 
            kxss dnsgen gitleaks httprobe trufflehog unfurl qsreplace
 
-           Gxss cdncheck puredns gowitness wafw00f inql cloud_enum gitdumper)
+           Gxss cdncheck puredns gowitness wafw00f inql cloud_enum gitdumper
+
+           alterx xnlinkfinder cloudfox crlfuzz graphinder
+
+           clairvoyance commix corsy smuggler)
 
 
 
@@ -308,6 +312,14 @@ GO_TOOLS=(
   "github.com/d3mondev/puredns/v2"
 
   "github.com/sensepost/gowitness"
+
+  "github.com/projectdiscovery/alterx/cmd/alterx"
+
+  "github.com/BishopFox/cloudfox"
+
+  "github.com/dwisiswant0/crlfuzz/cmd/crlfuzz"
+
+  "github.com/Escape-Technologies/graphinder"
 
 )
 
@@ -456,6 +468,51 @@ GITEOF
     sudo chmod +x /usr/local/bin/gitdumper
   fi
   command -v gitdumper >/dev/null 2>&1 && ok "gitdumper" || dim "gitdumper not installed"
+
+  # xnLinkFinder — JS link extractor
+  if ! command -v xnLinkFinder >/dev/null 2>&1; then
+    if [[ ! -d /opt/xnLinkFinder ]]; then
+      sudo git clone --depth 1 https://github.com/xnl-h4ck3r/xnLinkFinder.git /opt/xnLinkFinder 2>/dev/null || true
+    fi
+    pip3 install -r /opt/xnLinkFinder/requirements.txt 2>/dev/null || true
+    sudo ln -sf /opt/xnLinkFinder/xnLinkFinder.py /usr/local/bin/xnLinkFinder
+  fi
+  command -v xnLinkFinder >/dev/null 2>&1 && ok "xnLinkFinder" || dim "xnLinkFinder not installed"
+
+  # clairvoyance — GraphQL introspection abuse
+  if ! command -v clairvoyance >/dev/null 2>&1; then
+    pip3 install --user clairvoyance 2>/dev/null || pip3 install --user --break-system-packages clairvoyance 2>/dev/null || \
+      warn "clairvoyance pip install failed"
+  fi
+  command -v clairvoyance >/dev/null 2>&1 && ok "clairvoyance" || dim "clairvoyance not installed"
+
+  # commix — command injection exploiter
+  if ! command -v commix >/dev/null 2>&1; then
+    if [[ ! -d /opt/commix ]]; then
+      sudo git clone --depth 1 https://github.com/commixproject/commix.git /opt/commix 2>/dev/null || true
+    fi
+    sudo ln -sf /opt/commix/commix.py /usr/local/bin/commix
+  fi
+  command -v commix >/dev/null 2>&1 && ok "commix" || dim "commix not installed"
+
+  # corsy — CORS misconfiguration scanner
+  if ! command -v corsy >/dev/null 2>&1; then
+    if [[ ! -d /opt/Corsy ]]; then
+      sudo git clone --depth 1 https://github.com/s0md3v/Corsy.git /opt/Corsy 2>/dev/null || true
+    fi
+    pip3 install -r /opt/Corsy/requirements.txt 2>/dev/null || true
+    sudo ln -sf /opt/Corsy/corsy.py /usr/local/bin/corsy
+  fi
+  command -v corsy >/dev/null 2>&1 && ok "corsy" || dim "corsy not installed"
+
+  # smuggler — HTTP request smuggling
+  if ! command -v smuggler >/dev/null 2>&1; then
+    if [[ ! -d /opt/smuggler ]]; then
+      sudo git clone --depth 1 https://github.com/defparam/smuggler.git /opt/smuggler 2>/dev/null || true
+    fi
+    sudo ln -sf /opt/smuggler/smuggler.py /usr/local/bin/smuggler
+  fi
+  command -v smuggler >/dev/null 2>&1 && ok "smuggler" || dim "smuggler not installed"
 
 }
 

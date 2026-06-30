@@ -364,7 +364,7 @@ class PipelineConfig:
     sqlmap_risk: int = 1
     delay: float = 0.0
     rate_limit: int = 0
-    sample_urls_fuzz: int = 2
+    sample_urls_fuzz: int = 200
     sample_urls_params: int = 15
 
     sample_urls_arjun_waf: int = 5
@@ -424,8 +424,14 @@ def _auto_detect_proxy() -> str:
 def _set_proxy_env(proxy: str) -> None:
     """Set all standard proxy env vars so any subprocess inherits them.
     Go tools (httpx, ffuf, nuclei, katana, etc.) respect ALL_PROXY/HTTPS_PROXY.
-    Python tools (via urllib) respect HTTP_PROXY/HTTPS_PROXY."""
+    Python tools (via urllib) respect HTTP_PROXY/HTTPS_PROXY.
+    When proxy is empty, ALL proxy env vars are unset to prevent stale
+    unreachable proxies from leaking to child processes."""
+    _PROXY_VARS = ["ALL_PROXY", "all_proxy", "HTTPS_PROXY", "https_proxy",
+                   "HTTP_PROXY", "http_proxy", "PROXY"]
     if not proxy:
+        for v in _PROXY_VARS:
+            os.environ.pop(v, None)
         return
     os.environ["ALL_PROXY"] = proxy
     os.environ["all_proxy"] = proxy
@@ -480,9 +486,10 @@ def _extra_http_args() -> List[str]:
 
 def _get_urlopener() -> Callable[..., Any]:
     """Return a urlopen-compatible callable that respects proxy configuration.
-    Returns either urllib.request.urlopen (no proxy) or a proxy-wrapped version."""
+    Returns either urllib.request.urlopen (no proxy) or a proxy-wrapped version.
+    Note: urllib.request.ProxyHandler only supports HTTP/HTTPS proxies, not SOCKS."""
     proxy = _PIPELINE_CFG.proxy or os.environ.get("PROXY", "")
-    if proxy:
+    if proxy and proxy.startswith(("http://", "https://")):
         handler = urllib.request.ProxyHandler({
             "http": proxy,
             "https": proxy,
@@ -499,9 +506,10 @@ class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
 
 
 def _get_no_redirect_urlopener() -> Callable[..., Any]:
-    """Return a urlopen-compatible callable that does NOT follow HTTP redirects."""
+    """Return a urlopen-compatible callable that does NOT follow HTTP redirects.
+    Note: urllib.request.ProxyHandler only supports HTTP/HTTPS proxies, not SOCKS."""
     proxy = _PIPELINE_CFG.proxy or os.environ.get("PROXY", "")
-    if proxy:
+    if proxy and proxy.startswith(("http://", "https://")):
         handler = urllib.request.ProxyHandler({
             "http": proxy,
             "https": proxy,
@@ -1042,7 +1050,17 @@ class Interactsh:
         try:
             while time.time() < deadline:
                 if self.proc.poll() is not None:
-                    log("warn", "interactsh-client exited prematurely")
+                    _tail = ""
+                    try:
+                        with self.log.open("rb") as fh:
+                            raw = fh.read()
+                            _tail = raw.decode("utf-8", errors="replace")[-2000:]
+                    except OSError:
+                        pass
+                    log("warn", f"interactsh-client exited prematurely (rc={self.proc.returncode})")
+                    if _tail.strip():
+                        for _ln in _tail.strip().splitlines()[-10:]:
+                            log("warn", f"  interactsh: {_ln}")
                     return False
                 try:
                     with self.log.open("rb") as fh:
@@ -2359,9 +2377,8 @@ async def phase_08_FUZZ(outdir: Path, t: Tools, only: PhaseSet, skip: PhaseSet, 
     deduped = _dedupe_by_host_path(all_urls)
     sample = deduped[:_PIPELINE_CFG.sample_urls_fuzz]
     _proxy_opt = []
-    _proxy = os.environ.get("PROXY", "")
-    if _proxy:
-        _proxy_opt = ["-x", _proxy]
+    if _PIPELINE_CFG.proxy:
+        _proxy_opt = ["-x", _PIPELINE_CFG.proxy]
     # When operating over proxychains/tor, use smaller wordlists and
     # shorter timeouts — each request is ~1-5s vs ~50ms on a direct link.
     _is_slow_network = _USE_PROXYCHAINS
@@ -2501,9 +2518,8 @@ async def phase_09_VULNSCAN(outdir: Path, t: Tools, only: PhaseSet, skip: PhaseS
         return {"09-VULNSCAN": str(outdir / "nuclei_combined.txt"), "count": 0}
     jobs: List[Tuple[str, List[str], int]] = []
     _proxy_opt = []
-    _proxy = os.environ.get("PROXY", "")
-    if _proxy:
-        _proxy_opt = ["-proxy", _proxy]
+    if _PIPELINE_CFG.proxy:
+        _proxy_opt = ["-proxy", _PIPELINE_CFG.proxy]
     if t.has("nuclei"):
         nuclei_base = [
             "nuclei", "-silent", "-l", str(hosts),
@@ -2767,9 +2783,8 @@ async def phase_11_INJECT(
             "--user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
             "--only-custom-payload",
         ]
-        proxy = os.environ.get("PROXY", "")
-        if proxy:
-            dalfox_cmd.extend(["--proxy", proxy])
+        if _PIPELINE_CFG.proxy:
+            dalfox_cmd.extend(["--proxy", _PIPELINE_CFG.proxy])
         _dlf_cookie = os.environ.get("COOKIE", "")
         if _dlf_cookie:
             dalfox_cmd.extend(["--cookie", _dlf_cookie])
@@ -2803,9 +2818,9 @@ async def phase_11_INJECT(
             "#!/usr/bin/env python3\n"
             '"""SSRF probe: rewrite URL parameters to point at OAST listener and internal targets."""\n'
             "import os, random, sys, urllib.request, urllib.parse\n"
-            "# Proxy support: route through PROXY env var if set\n"
+            "# Proxy support: route through PROXY env var if set (HTTP/HTTPS only; SOCKS uses proxychains)\n"
             "_proxy = os.environ.get('PROXY', '')\n"
-            "if _proxy:\n"
+            "if _proxy and _proxy.startswith(('http://', 'https://')):\n"
             "    _handler = urllib.request.ProxyHandler({'http': _proxy, 'https': _proxy})\n"
             "    _urlopen = urllib.request.build_opener(_handler).open\n"
             "else:\n"
@@ -2872,9 +2887,9 @@ async def phase_11_INJECT(
                 "#!/usr/bin/env python3\n"
                 '"""Blind XSS probe: Fire requests with XSS payloads that call back to OAST."""\n'
                 "import os, sys, urllib.request\n"
-                "# Proxy support: route through PROXY env var if set\n"
+                "# Proxy support: route through PROXY env var if set (HTTP/HTTPS only; SOCKS uses proxychains)\n"
                 "_proxy = os.environ.get('PROXY', '')\n"
-                "if _proxy:\n"
+                "if _proxy and _proxy.startswith(('http://', 'https://')):\n"
                 "    _handler = urllib.request.ProxyHandler({'http': _proxy, 'https': _proxy})\n"
                 "    _urlopen = urllib.request.build_opener(_handler).open\n"
                 "else:\n"
@@ -3000,52 +3015,25 @@ async def phase_11b_SQLMAP(
     _out = outdir / "sqlmap_findings.txt"
     if _out.exists() and not force:
         return {"11b-SQLMAP": str(_out), "count": count_nonblank(_out)}
-    log("info", "Phase 11b-SQLMAP: sqlmap with response-difference pre-filtering")
+    log("info", "Phase 11b-SQLMAP: sqlmap with enriched parameter set")
     findings: List[str] = []
-    # Read param-bearing URLs from previous phases
+    # Collect param-bearing URLs from harvested URLs and Arjun-discovered params
+    all_urls: List[str] = []
     urls_file = outdir / "urls_all.txt"
-    all_urls = read_lines(urls_file) if urls_file.exists() else []
-    if not all_urls:
-        log("warn", "11b-SQLMAP: no URLs available; skipping")
+    if urls_file.exists():
+        all_urls.extend(read_lines(urls_file))
+    params_file = prev.get("07-PARAMS", "")
+    if params_file and Path(params_file).exists():
+        all_urls.extend(read_lines(Path(params_file)))
+    deduped = list(dict.fromkeys(all_urls))
+    param_urls = [u for u in deduped if "=" in u][:_PIPELINE_CFG.sample_urls_fuzz]
+    if not param_urls:
+        log("warn", "11b-SQLMAP: no parameter-bearing URLs available; skipping")
         return {"11b-SQLMAP": str(_out), "count": 0}
-    # Response-difference heuristic: for each param-bearing URL, send a baseline
-    # request and a test request with a benign SQL probe; if the responses differ
-    # significantly, flag the parameter for sqlmap testing.
-    _sql_urlopen = _get_urlopener()
+    candidates = list(param_urls)
+    for url in candidates:
+        findings.append(f"[candidate] {url}")
     _sql_extra_headers = _extra_headers_dict()
-    param_urls = [u for u in all_urls if "=" in u][:_PIPELINE_CFG.sample_urls_fuzz]
-    candidates: List[str] = []
-    sql_payloads = ["'", "\"", "\\", "1' OR '1'='1", "1\" OR \"1\"=\"1", "1' AND '1'='2", "sleep(5)"]
-    for url in param_urls:
-        await _throttle_rate()
-        try:
-            base_req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0", **_sql_extra_headers})
-            base_status, _, base_body = await _async_urlopen(_sql_urlopen, base_req, timeout=10)
-            base_len = len(base_body)
-            for payload in sql_payloads[:2]:
-                parsed = urllib.parse.urlparse(url)
-                qs = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
-                if not qs:
-                    continue
-                for pname in qs:
-                    test_qs = qs.copy()
-                    test_qs[pname] = [payload]
-                    new_qs = urllib.parse.urlencode(test_qs, doseq=True)
-                    test_url = urllib.parse.urlunparse(parsed._replace(query=new_qs))
-                    req = urllib.request.Request(test_url, headers={"User-Agent": "Mozilla/5.0", **_sql_extra_headers})
-                    test_status, _, test_body = await _async_urlopen(_sql_urlopen, req, timeout=10)
-                    test_len = len(test_body)
-                    if test_status != base_status or abs(test_len - base_len) > max(100, base_len * 0.15):
-                        candidates.append(test_url)
-                        findings.append(f"[candidate] {test_url} → status={test_status} len={test_len} (baseline={base_status}/{base_len})")
-                        break
-                    if test_url in candidates:
-                        break
-        except Exception:
-            continue
-    if not candidates:
-        log("warn", "11b-SQLMAP: no candidate parameters found via response-difference heuristic")
-        return {"11b-SQLMAP": str(_out), "count": 0}
     # Now run sqlmap on the filtered candidates
     if t.has("sqlmap"):
         sqlmap_in = ensure(outdir / "sqlmap_candidates.txt")
@@ -7416,16 +7404,22 @@ async def run_pipeline(args: argparse.Namespace) -> int:
     if proxy:
         import socket as _proxy_socket
         try:
-            _proxy_url = proxy.split("://")[1] if "://" in proxy else proxy
-            _proxy_host = _proxy_url.split(":")[0]
-            _proxy_port = int(_proxy_url.split(":")[1].split("/")[0])
+            _parsed = urllib.parse.urlparse(proxy)
+            _proxy_host = _parsed.hostname
+            _proxy_port = _parsed.port
+            if not _proxy_host:
+                _proxy_url = proxy.split("://")[-1]
+                _proxy_host = _proxy_url.split(":")[0]
+                _proxy_port = int(_proxy_url.split(":")[1].split("/")[0])
+            elif not _proxy_port:
+                _default_ports = {"http": 80, "https": 443,
+                                  "socks4": 1080, "socks5": 1080,
+                                  "socks5h": 1080, "socks4a": 1080}
+                _proxy_port = _default_ports.get(_parsed.scheme, 1080)
             _s = _proxy_socket.create_connection((_proxy_host, _proxy_port), timeout=3)
             _s.close()
         except Exception:
-            log("warn", f"Proxy {proxy} is unreachable. Disabling proxy to avoid timeouts.")
-            proxy = ""
-            _USE_PROXYCHAINS = False
-            _set_proxy_env("")
+            log("warn", f"Proxy {proxy} reachability check failed — continuing with proxy enabled (may cause timeouts if truly unreachable)")
 
     cookie = getattr(args, 'cookie', '')
     if not cookie:
@@ -7436,7 +7430,7 @@ async def run_pipeline(args: argparse.Namespace) -> int:
         sqlmap_risk=getattr(args, 'sqlmap_risk', 1),
         delay=getattr(args, 'delay', 0.0),
         rate_limit=getattr(args, 'rate_limit', 0),
-        sample_urls_fuzz=getattr(args, 'sample_urls_fuzz', 5),
+        sample_urls_fuzz=getattr(args, 'sample_urls_fuzz', 200),
         sample_urls_params=getattr(args, 'sample_urls_params', 50),
         sample_hosts_ssl=getattr(args, 'sample_hosts_ssl', 10),
         sample_hosts_origin=getattr(args, 'sample_hosts_origin', 10),
@@ -7759,12 +7753,8 @@ def interactive_setup() -> argparse.Namespace:
         validator=lambda v: v.replace(".", "", 1).isdigit(),
         error_msg="Enter a number (e.g. 0, 0.5, 2)",
     )
-    # Proxy
-    print(f"\n{C['b']}Proxy:{C['r']}")
-    proxy = _prompt(
-        "Proxy URL (e.g. socks5://127.0.0.1:9050 for Tor), or leave empty for direct",
-        default="",
-    )
+    # Proxy — auto-detect from environment
+    proxy = _auto_detect_proxy()
     def _validate_count(v: str) -> bool:
         return v.lower() == "all" or (v.isdigit() and int(v) > 0)
 
@@ -7862,7 +7852,7 @@ def interactive_setup() -> argparse.Namespace:
     print(f"   Domain:           {C['y']}{domain}{C['r']}")
     print(f"   Output:           {C['y']}{out}{C['r']}")
     print(f"   Level:            {C['y']}{level}{C['r']}")
-    print(f"   Proxy:            {C['y']}{proxy if proxy else 'none'}{C['r']}")
+    print(f"   Proxy:            {C['y']}{proxy if proxy else 'none (auto-detected)'}{C['r']}")
     print(f"   Phases:           {C['y']}{', '.join(sorted(selected))}{C['r']}")
     print(f"   Jobs:             {C['y']}{jobs}{C['r']}")
     print(f"   SQLmap level/risk:{C['y']} {sqlmap_level}/{sqlmap_risk}{C['r']}")
@@ -7897,7 +7887,7 @@ def interactive_setup() -> argparse.Namespace:
     ns.sqlmap_level = int(sqlmap_level)
     ns.sqlmap_risk = int(sqlmap_risk)
     ns.delay = float(delay)
-    ns.proxy = proxy
+    ns.proxy = proxy  # auto-detected from environment
     ns.rate_limit = 0
     def _resolve_count(v: str) -> int:
         return sys.maxsize if v.lower() == "all" else int(v)
@@ -8083,8 +8073,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--sample-urls-fuzz",
         type=int,
-        default=5,
-        help="number of URLs to sample for fuzzing (default: 5)",
+        default=200,
+        help="number of URLs to sample for fuzzing (default: 200)",
     )
     p.add_argument(
         "--sample-urls-params",

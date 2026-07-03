@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "reconchain"
-version = "1.2.0"
+version = "1.5.1"
 description = "A stdlib Python orchestrator for chained reconnaissance tooling."
 readme = "README.md"
 requires-python = ">=3.9"
@@ -32,6 +32,7 @@ dev = [
 reconchain = "reconchain:main"
 
 [tool.setuptools]
+packages = ["reconchain"]
 py-modules = ["reconchain"]
 
 [tool.pytest.ini_options]

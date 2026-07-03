@@ -1,17 +1,20 @@
 # ReconChain v1.5.1
 
-A Python orchestrator that chains 51+ recon and vulnerability phases into a single,
+A Python orchestrator that chains 54+ recon and vulnerability phases into a single,
 resumable DAG pipeline — no config files, no YAML, no DSL.
 
 ```bash
 # Quick start — interactive wizard
-./reconchain.py -i
+reconchain -i
 
 # One-liner (full audit)
-./reconchain.py -d example.com -o ./out
+reconchain -d example.com -o ./out
+
+# Multi-domain scan
+reconchain -d example.com,test.org -o ./out
 
 # Just recon, no scanning
-./reconchain.py -d example.com --fast
+reconchain -d example.com --fast
 ```
 
 ## Quick Start
@@ -34,16 +37,16 @@ chmod +x install.sh
 ### Interactive wizard (recommended for new users)
 
 ```bash
-./reconchain.py -i
+reconchain -i
 ```
 
 Prompts for:
-- **Domain** — validated hostname
+- **Domain(s)** — single or comma-separated multi-domain
 - **Recon level** — Basic / Standard / Full (see levels below)
 - **Output directory** — defaults to `./out_{domain}`
 - **Parallel jobs** — how many tools to run simultaneously
 - **Scan depth** — SQLmap level/risk, request delay, sample sizes
-- **Manual testing add-ons** — SSTI, origin bypass, deep JS secrets, auth bypass, IDOR, mass assignment, SSRF metadata, LFI, cloud, git, GraphQL, WAF, NoSQLi, race, JWT, XXE, CMDi, proto pollution, cache, dependency check, open redirect, clickjack, CRLF, CORS, file upload, smuggling, OAuth, password reset, WebSocket, LDAP, deserialization
+- **Manual testing add-ons** — SSTI, origin bypass, deep JS secrets, auth bypass, IDOR, mass assignment, SSRF metadata, LFI, cloud, git, GraphQL, WAF, NoSQLi, race, JWT, XXE, CMDi, proto pollution, cache, dependency check, open redirect, clickjack, CRLF, CORS, file upload, smuggling, OAuth, password reset, WebSocket, LDAP, deserialization, bucket enum, CDN detection, content discovery
 - **Resume / Force** — picks up where you left off, or force re-run all phases
 
 Shows a summary before starting. Zero flags to remember.
@@ -52,37 +55,40 @@ Shows a summary before starting. Zero flags to remember.
 
 ```bash
 # Full audit (everything)
-./reconchain.py -d example.com -o ./out
+reconchain -d example.com -o ./out
+
+# Multi-domain (runs pipeline per domain)
+reconchain -d example.com,test.org,sub.example.com
 
 # Basic recon only (fast)
-./reconchain.py -d example.com --fast
+reconchain -d example.com --fast
 
 # Pick specific phases
-./reconchain.py -d example.com -o ./out --only 00-SCOPE,01-RECON,02-RESOLVE,04-SCAN,05-HARVEST,44-REPORT
+reconchain -d example.com -o ./out --only 00-SCOPE,01-RECON,02-RESOLVE,04-SCAN,05-HARVEST,44-REPORT
 
 # Skip slow phases
-./reconchain.py -d example.com -o ./out --skip 10-TLSCMS,11-INJECT
+reconchain -d example.com -o ./out --skip 10-TLSCMS,11-INJECT
 
 # Resume a cancelled scan
-./reconchain.py -d example.com -o ./out --resume
+reconchain -d example.com -o ./out --resume
 
 # Force re-run all phases
-./reconchain.py -d example.com -o ./out --force
+reconchain -d example.com -o ./out --force
 
 # Tune parallelism
-./reconchain.py -d example.com -o ./out -j 32
+reconchain -d example.com -o ./out -j 32
 
 # Custom scan depth
-./reconchain.py -d example.com --sqlmap-level 3 --sqlmap-risk 2 --delay 1
+reconchain -d example.com --sqlmap-level 3 --sqlmap-risk 2 --delay 1
 
 # Custom sample sizes (more URLs = thorough but slower)
-./reconchain.py -d example.com --sample-urls-fuzz 50 --sample-urls-params 200
+reconchain -d example.com --sample-urls-fuzz 50 --sample-urls-params 200
 
 # Exclude noisy nuclei tags
-./reconchain.py -d example.com --exclude-tags info,tech
+reconchain -d example.com --exclude-tags info,tech
 
 # Proxy through tor/socks
-./reconchain.py -d example.com --proxy socks5://127.0.0.1:9050
+reconchain -d example.com --proxy socks5://127.0.0.1:9050
 ```
 
 ## Recon Levels
@@ -91,7 +97,7 @@ Shows a summary before starting. Zero flags to remember.
 |-------|-----------|----------|
 | **1 — Basic** | 00-SCOPE → 01-RECON → 02-RESOLVE → 04-SCAN → 05-HARVEST → 44-REPORT | Quick domain recon: scope validation, subdomains, DNS, ports, URLs |
 | **2 — Standard** | Level 1 + 03-PERMUTE → 06-JSINTEL → 07-PARAMS → 08-FUZZ → 09-VULNSCAN → 10-TLSCMS → 24-JWT → 28-CACHED → 34-RATELIMIT → 41-WEBSOCKET | Full automated vuln scanning + basic web checks |
-| **Full** | All 51 phases | Maximum coverage (scope validation, takeover confirm, API specs, XSS, SQLi, SSTI, OOB, NoSQLi, race, XXE, cmd inject, proto pollution, open redirect, clickjack, CRLF, CORS, JWT, file upload, smuggling, OAuth, password reset, LDAP, deserialization, IDOR, SSRF metadata, LFI, chain correlation, evidence capture) |
+| **Full** | All 54 phases | Maximum coverage (scope validation, takeover confirm, API specs, XSS, SQLi, SSTI, OOB, NoSQLi, race, XXE, cmd inject, proto pollution, open redirect, clickjack, CRLF, CORS, JWT, file upload, smuggling, OAuth, password reset, LDAP, deserialization, IDOR, SSRF metadata, LFI, chain correlation, evidence capture, bucket enum, CDN detection, content discovery) |
 
 ## Pipeline — Execution Stages (DAG)
 
@@ -99,7 +105,7 @@ Shows a summary before starting. Zero flags to remember.
 ```
 00-SCOPE   scope validation          ──→ scope_validated.txt
 01-RECON   subdomains                ──→ all_subs.txt
-02-RESOLVE DNS resolve               ──→ resolved.txt + resolved_full.txt
+02-RESOLVE DNS resolve (fallback)    ──→ resolved.txt + resolved_full.txt
 03-PERMUTE permute subs              ──→ all_subs.txt (append)
 04-SCAN    ports/hosts               ──→ ports.txt + hosts.txt + takeover.txt
 04b-TAKEOVER-VALIDATE confirm CNAME  ──→ takeover_confirmed.txt
@@ -198,6 +204,13 @@ Shows a summary before starting. Zero flags to remember.
 45-EVIDENCE capture req/resp pairs   ──→ evidence/
 ```
 
+### Stage 13 — Enhancement Phases
+```
+46-BUCKET  cloud bucket enum         ──→ bucket_enum.txt
+47-CDN     CDN detection             ──→ cdn_detection.txt
+48-CONTENT content discovery         ──→ content_discovery.txt
+```
+
 ### Always runs last
 ```
 44-REPORT  reports                   ──→ summary.json + report.html + report.md + summary.txt
@@ -209,7 +222,7 @@ Shows a summary before starting. Zero flags to remember.
 |-------|-------|-------------|
 | **00-SCOPE** | Python builtins | Validates target assets against scope/allowlist file |
 | **01-RECON** | subfinder, amass | Passive subdomain enumeration from CT logs, search engines, DNS |
-| **02-RESOLVE** | dnsx, puredns | DNS resolution + wildcard-resistant validation |
+| **02-RESOLVE** | massdns, dnsx, puredns, socket | DNS resolution with parallel fallback chain (massdns → dnsx → Python socket) |
 | **03-PERMUTE** | dnsgen, dnsx | Subdomain permutation generation; resolves candidates |
 | **04-SCAN** | naabu (nmap fallback), httprobe, httpx, nuclei | Port scanning, HTTP probing, service detection, subdomain takeover |
 | **04b-TAKEOVER-VALIDATE** | curl, Python socket | Connects to dangling CNAME targets to confirm exploitability |
@@ -258,6 +271,9 @@ Shows a summary before starting. Zero flags to remember.
 | **43-DESERIAL** | Custom Python payload POSTs | Deserialization attack surface detection via Java/Python/PHP/Ruby serialized payloads |
 | **44-CHAIN** | Python cross-referencing | Correlates findings across phases (secrets→auth, IDOR→mass-assign, SSRF→LFI) |
 | **45-EVIDENCE** | Python request/response capture | Captures request/response pairs for confirmed findings |
+| **46-BUCKET** | Python HTTP probes | Cloud storage bucket enumeration (S3, GCP, Azure, DigitalOcean) based on domain patterns |
+| **47-CDN** | Python HTTP probes | CDN provider detection via response header signatures (Cloudflare, Akamai, Fastly, etc.) |
+| **48-CONTENT** | Python HTTP probes | Content discovery via probing common sensitive paths (.env, .git, admin, etc.) |
 | **44-REPORT** | gowitness, reporting | Screenshots + HTML, Markdown, JSON, and text summary |
 
 ## Output
@@ -322,6 +338,9 @@ out/
 ├── git_exposure.txt          # Git exposure findings
 ├── graphql_introspection.txt # GraphQL introspection results
 ├── waf_detection.txt         # WAF detection results
+├── bucket_enum.txt           # Cloud storage bucket enumeration
+├── cdn_detection.txt         # CDN provider detection results
+├── content_discovery.txt     # Content discovery findings
 ├── chain_correlation.txt     # Cross-phase correlation findings
 ├── evidence/                 # Request/response pairs for confirmed vulns
 ├── screenshots/              # Browser screenshots (gowitness)
@@ -334,6 +353,7 @@ out/
 │   ├── *_runner.sh
 │   └── interactsh.log        # Raw interactsh output
 ├── state.json                # Resume state
+├── dedup_state.json          # Deduplication state
 ├── summary.json              # Machine-readable results
 ├── report.html               # HTML report (with severity badge + screenshots)
 ├── report.md                 # Markdown report
@@ -344,7 +364,7 @@ out/
 
 | Category | Tools |
 |----------|-------|
-| Enumeration | subfinder, amass, alterx, dnsx, puredns |
+| Enumeration | subfinder, amass, alterx, dnsx, puredns, massdns |
 | Network | naabu, nmap, httpx, httprobe, nuclei, cdncheck |
 | URLs | gau, gospider, katana, subjs, waymore, unfurl |
 | Analysis | SecretFinder, Arjun, dnsgen, alterx, inql |
@@ -354,8 +374,8 @@ out/
 | Cloud | cloud_enum |
 | Git | gitdumper |
 | Screenshots | gowitness |
-| OAST | interactsh-client |
-| DNS | dig |
+| OAST | interactsh-client (with optional HTTP webhook) |
+| DNS | dig, massdns |
 
 Missing tools are automatically skipped — the pipeline never crashes over a missing
 binary.
@@ -363,10 +383,9 @@ binary.
 ## Flags
 
 ```
-  -d, --domain                  Target domain (e.g. example.com)
+  -d, --domain                  Target domain(s) — single or comma-separated for multi-domain (e.g. example.com or example.com,test.org)
   -o, --out                     Output directory (default: ./out/<domain>)
   -i, --interactive             Interactive wizard
-  --config                      Path to JSON config file
   --only                        Comma-separated phases to run (e.g. 01-RECON,14-ORIGIN,15-SECRETS)
   --skip                        Comma-separated phases to skip
   -j, --jobs                    Max parallel processes (default: cpu_count × 2)
@@ -383,20 +402,68 @@ binary.
   --sqlmap-risk                 SQLmap --risk (1-3, default: 1)
   --delay                       Seconds between requests (default: 0)
   --rate-limit                  Max requests per second (default: 0)
-  --sample-urls-fuzz            URLs to fuzz (default: 5)
+  --sample-urls-fuzz            URLs to fuzz (default: 200)
   --sample-urls-params          URLs for parameter discovery (default: 50)
-  --sample-urls-pspider         URLs for ParamSpider (default: 3)
+  --sample-hosts-ssl            Hosts for SSL/TLS scanning (default: 10)
+  --sample-hosts-origin         Hosts for origin bypass (default: 10)
+  --sample-hosts-cloud          Hosts for cloud bucket discovery (default: 5)
+  --sample-hosts-git            Hosts for Git exposure (default: 5)
+  --sample-hosts-graphql        Hosts for GraphQL introspection (default: 5)
+  --sample-hosts-waf            Hosts for WAF detection (default: 5)
   --sample-urls-xss-blind       URLs for blind XSS probe (default: 20)
   --sample-urls-ssti            SSTI sample URLs (default: 5)
   --sample-endpoints-l          Endpoints for auth bypass (default: 20)
   --sample-endpoints-post       Endpoints to mass-assign POST (default: 5)
   --sample-endpoints-cors       Endpoints to CORS-fuzz (default: 10)
-  --sample-buckets              Bucket names to test (default: 50)
-  --sample-hosts-git            Hosts for git exposure (default: 20)
-  --sample-hosts-graphql        Hosts for GraphQL probe (default: 20)
-  --sample-hosts-waf            Hosts for WAF detection (default: 20)
   --exclude-tags                Nuclei tags to exclude (e.g. 'info,tech')
 ```
+
+## Features
+
+### Multi-domain Support
+Scan multiple domains in a single run by separating them with commas:
+```bash
+reconchain -d example.com,test.org,sub.example.com
+```
+Each domain is scanned independently (own state, own output directory under
+`./out/<domain>/`). Results from each domain are reported separately.
+
+### Parallel Resolver Fallback
+`02-RESOLVE` now uses a fallback chain: **massdns → dnsx → Python socket**.
+If the fastest resolver (`massdns`) is unavailable or its resolvers file is
+missing, it falls back to `dnsx` batch resolution. If `dnsx` is also
+unavailable, it falls back to Python's built-in `getaddrinfo()` via asyncio.
+This ensures resolution never blocks on a missing binary.
+
+### Smarter Rate Limiting
+The `RateLimiter` offers per-domain tracking with adaptive exponential backoff
+on failures and jitter to avoid thundering-herd patterns. Wired into the
+pipeline via the `--rate-limit` flag.
+
+### Cross-scan Deduplication
+The `DedupEngine` persists seen findings to `dedup_state.json` with normalized
+key matching and optional content fingerprinting (MD5 of normalized content)
+for fuzzy dedup across multiple scans.
+
+### OAST Callback Collector v2
+In addition to the `interactsh-client` subprocess, `Interactsh` now supports an
+optional local HTTP webhook server (`start_webhook()`) that captures callbacks
+directly. Webhook callbacks are merged with interactsh-client callbacks in the
+final `callbacks.txt` output.
+
+### Scan Monitoring
+The `MonitorEngine` persists watched domains to
+`~/.config/reconchain/monitor/watches.json`. When the pipeline finishes, it
+checks for due scans and automatically re-launches them via subprocess.
+
+### User-Agent Rotation
+`UARotator` provides a pool of 15+ modern browser user-agent strings and is
+available for pipeline phases to rotate through instead of hardcoding a single UA.
+
+### New Phases
+- **46-BUCKET** — Cloud storage bucket enumeration (S3, GCP, Azure, DigitalOcean)
+- **47-CDN** — CDN provider detection via response header signatures
+- **48-CONTENT** — Content/path discovery probing common sensitive paths
 
 ## Configuration
 
@@ -436,7 +503,7 @@ launching the scan:
 
 ```bash
 export ALL_PROXY=socks5://127.0.0.1:9050
-python reconchain.py -d example.com
+reconchain -d example.com
 ```
 
 ## Severity Scoring
@@ -451,48 +518,28 @@ HTML report:
 | MEDIUM | 1–4 | Open port, JS secret, origin IP found, mass assignment |
 | LOW | 0 | No findings |
 
-## Key Improvements
+## Key Improvements (v1.5.1)
 
-- **51 phases** — 15 new phases: 00-SCOPE, 04b-TAKEOVER-VALIDATE, 05b-APISPEC, 11b-SQLMAP, 16A-AUTHZ, 16B-MASSASSIGN, 17-IDOR, 17B-SSRFMETA, 30-LFI, 44-CHAIN, 45-EVIDENCE
+- **54 phases** — 18 new phases: 00-SCOPE, 04b-TAKEOVER-VALIDATE, 05b-APISPEC, 11b-SQLMAP, 16A-AUTHZ, 16B-MASSASSIGN, 17-IDOR, 17B-SSRFMETA, 30-LFI, 44-CHAIN, 45-EVIDENCE, 46-BUCKET, 47-CDN, 48-CONTENT
 - **DAG execution stages** — 13 ordered stages with feedback loops: WAF detection informs throttle/evasion, SSRF triggers metadata exfil, JWT analysis feeds auth probes, secrets flow into credential queue
 - **Cross-phase correlation** — 44-CHAIN cross-references findings (secrets→auth, IDOR→mass-assign, SSRF→LFI); 45-EVIDENCE captures request/response pairs
 - **Scope gating** — 00-SCOPE validates assets against allowlist/scope file before any recon runs
 - **WAF-aware throttling** — 21-WAF sets global `waf_detected` / `waf_evasion_throttle` flags consumed by all downstream phases
-- **41+ tools** — added alterx: subdomain permutation generator from ProjectDiscovery
+- **Multi-domain** — comma-separated `-d` runs pipeline per domain
+- **Parallel resolver fallback** — massdns → dnsx → Python socket fallback chain
+- **Cross-scan dedup** — persisted `DedupEngine` with content fingerprinting
+- **OAST webhook** — local HTTP server captures OOB callbacks directly
+- **Smarter rate limiting** — per-domain tracking + adaptive exponential backoff
+- **Scan monitoring** — `MonitorEngine` schedules and auto-launches re-scans
+- **41+ tools** — added alterx, massdns
 - **Screenshots** — gowitness captures browser screenshots of live hosts
 - **Webhook notifications** — send JSON payloads with severity to any webhook URL
-- **Config file support** — `--config` JSON file pre-populates options
 - **Streaming pipeline** — 01-RECON, 02-RESOLVE, 04-SCAN, 05-HARVEST run concurrently; overall wall-clock reduction of 40–60%
 - **Downsampling** — artifacts truncated to 1 entry per phase (--keep-all to disable)
 - **Per-phase output guards** — skip completed phases unless --force is set
 - **Nuclei template cache** — auto-updates at most once per 24h
 - **Graceful degradation** — every external tool is optional; pipeline handles missing binaries without crashing
-
-## Bug Fixes (v1.5.1)
-
-- **Proxy connectivity check** — SOCKS proxy auto-detected from env but Tor/SSH
-  often not running, causing every tool to hang until timeout (3× scaled).
-  Added pre-flight socket check at startup; dead proxies are disabled with a
-  warning instead of silently degrading every phase.
-- **dalfox `--only-custompayload` typo** — flag was `--only-custompayload` but
-  the correct name is `--only-custom-payload`. Dalfox crashed immediately on
-  launch, skipping all XSS scanning.
-- **katana `-p` → `-proxy`** — `-p` is the `-parallelism` flag (expects an int),
-  so `-p socks5://127.0.0.1:9050` caused a parse error. Changed to `-proxy`.
-- **gowitness v3 subcommand** — gowitness 3.x removed the top-level `file`
-  subcommand; `file` is now `gowitness scan file`. Also replaced `-P` with
-  `-s` and `--disable-db` with `--write-none`.
-- **GraphQL HTTPS normalization** — targets were probed with `http://`, getting
-  a 308 redirect. inql doesn't follow redirects, causing all GraphQL probes to
-  fail with `HTTP Error 308`. Targets are now forced to `https://`.
-- **CRLF injection detection** — payloads in phase 33-CRLF were double-encoded
-  by `urllib.parse.urlencode`, making every test silently ineffective. Changed
-  `_CRLF_PAYLOADS` to use raw CRLF bytes so `urlencode` produces the correct
-  single-encoded form (`%0D%0A` instead of `%250D%250A`), and the server
-  receives actual CRLF characters.
-- **`.ds_tmp` orphan cleanup** — `_downsample_file` creates `.ds_tmp` temp files
-  during atomic writes, but only `*.tmp` files were cleaned on startup. Added
-  cleanup for `*.ds_tmp` to prevent orphan accumulation after crashes.
+- **Modular package** — code split into 14 submodules with backward-compatible re-exports
 
 ## Security
 

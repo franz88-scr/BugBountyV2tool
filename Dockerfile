@@ -5,7 +5,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /opt/reconchain
-COPY reconchain.py pyproject.toml ./
+COPY reconchain.py reconchain/ pyproject.toml ./
 
 FROM base AS install
 

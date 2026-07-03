@@ -1,0 +1,305 @@
+"""Subprocess management, job scheduling, and pipeline helpers."""
+from __future__ import annotations
+import argparse
+import asyncio
+import contextlib
+import json
+import os
+import shutil
+import signal
+import subprocess
+import threading
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Set, Tuple
+
+from reconchain.config import VALID_PHASES, _HOSTNAME_RE, PipelineConfig
+from reconchain.utils import ensure, log, read_lines, _tqdm_available
+
+try:
+    from tqdm import tqdm
+except ImportError:
+    class tqdm:
+        def __init__(self, *args, **kwargs): pass
+        def update(self, n=1): pass
+        def set_description(self, desc=None, refresh=True): pass
+        def close(self): pass
+        @classmethod
+        def write(cls, msg="", *args, **kwargs): print(msg, flush=True)
+
+
+@dataclass
+class StepResult:
+    name: str
+    cmd: List[str]
+    rc: int
+    duration: float
+    log_path: Optional[Path] = None
+    note: str = ""
+
+
+MAX_PARALLEL_JOBS = max(4, (os.cpu_count() or 4) * 2)
+_USE_PROXYCHAINS = False
+_SPAWNED_PIDS: List[int] = []
+_SPAWNED_PIDS_LOCK = threading.Lock()
+_JOB_SEM: Optional[asyncio.Semaphore] = None
+_PIPELINE_CFG: PipelineConfig = PipelineConfig()
+_TOOL_RC_REGISTRY: Dict[str, int] = {}
+
+
+def _needs_proxychains(cmd: List[str]) -> bool:
+    if not _USE_PROXYCHAINS:
+        return False
+    if len(cmd) < 2:
+        return False
+    # Python probe scripts (TLS check, SSRF, blind XSS) use raw sockets
+    # that don't respect HTTP_PROXY env vars — they need proxychains.
+    if cmd[0] in ("python3", "python") and isinstance(cmd[1], str) and cmd[1].endswith(".py"):
+        return True
+    # Standalone tools that don't respect proxy env vars natively
+    if cmd[0] in ("waymore", "cloud_enum",
+                   "wafw00f", "wafw00f.py", "gowitness", "gitdumper",
+                   "Gxss", "kxss", "interactsh-client"):
+        return True
+    return False
+
+
+def _proxify_cmd(cmd: List[str]) -> List[str]:
+    """Prepend proxychains4 when SOCKS proxy is active and tool needs it."""
+    if _needs_proxychains(cmd):
+        return ["proxychains4"] + cmd
+    return cmd
+
+
+_PROXY_VARS = ["ALL_PROXY", "all_proxy", "HTTPS_PROXY", "https_proxy",
+               "HTTP_PROXY", "http_proxy", "PROXY"]
+
+_DNS_TOOLS = {"massdns", "dnsx", "puredns", "dig", "nslookup", "host", "subfinder"}
+_RAW_TOOLS = {"nmap", "naabu"}
+
+def _bypass_proxy(cmd: List[str]) -> bool:
+    """Return True if the command should bypass the proxy entirely.
+    DNS tools should NEVER go through SOCKS/proxychains — DNS resolution does
+    not need anonymity and DNS-over-SOCKS is notoriously slow.
+    Port scanners (nmap, naabu) also bypass — they use raw/stealth packets that
+    cannot be routed through a TCP-only proxy."""
+    if not cmd:
+        return False
+    return cmd[0] in _DNS_TOOLS | _RAW_TOOLS
+
+
+def _run_blocking(cmd: List[str], timeout: int, cwd: Optional[Path], log_path: Path) -> Tuple[int, float]:
+    cmd = _proxify_cmd(cmd)
+    t0 = time.monotonic()
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Save and clear proxy env for DNS tools (Go tools like dnsx respect ALL_PROXY natively)
+    _saved_proxy: Dict[str, Optional[str]] = {}
+    if _bypass_proxy(cmd):
+        for v in _PROXY_VARS:
+            _saved_proxy[v] = os.environ.pop(v, None)
+
+    try:
+        with log_path.open("wb") as logf:
+            proc: Optional[subprocess.Popen[bytes]] = None
+            try:
+                proc = subprocess.Popen(
+                    cmd,
+                    cwd=str(cwd) if cwd else None,
+                    stdin=subprocess.DEVNULL,
+                    stdout=logf,
+                    stderr=subprocess.STDOUT,
+                    start_new_session=True,
+                )
+                _register_proc(proc)
+                if not _wait_proc(proc, timeout):
+                    _kill_proc(proc)
+                    with _SPAWNED_PIDS_LOCK, contextlib.suppress(ValueError):
+                        _SPAWNED_PIDS.remove(proc.pid)
+                    with log_path.open("ab") as f:
+                        f.write(f"\n[timeout after {timeout}s]\n".encode("utf-8"))
+                    return 124, time.monotonic() - t0
+                with _SPAWNED_PIDS_LOCK, contextlib.suppress(ValueError):
+                    _SPAWNED_PIDS.remove(proc.pid)
+                return proc.returncode, time.monotonic() - t0
+            except FileNotFoundError as e:
+                with log_path.open("ab") as f:
+                    f.write(f"\n[binary not found: {e}]\n".encode("utf-8"))
+                return 127, time.monotonic() - t0
+            except (PermissionError, OSError) as e:
+                with log_path.open("ab") as f:
+                    f.write(f"\n[exec error: {e}]\n".encode("utf-8"))
+                return 127, time.monotonic() - t0
+    finally:
+        # Restore proxy env vars after DNS tool completes
+        if _saved_proxy:
+            for v, val in _saved_proxy.items():
+                if val is not None:
+                    os.environ[v] = val
+
+
+async def _run(name: str, cmd: List[str], timeout: int, outdir: Path, note: str = "") -> StepResult:
+    if not cmd:
+        log("skip", f"{name} (missing tool)")
+        return StepResult(name, [], 0, 0.0, outdir / "logs" / f"{name}.log", note=note or "skipped")
+    logp = outdir / "logs" / f"{name}.log"
+    log("info", f"{name}  $ {cmd[0]} {(' '.join(cmd[1:3]))}{' ...' if len(cmd) > 3 else ''}")
+    rc, dur = await asyncio.to_thread(_run_blocking, cmd, timeout, outdir, logp)
+    lvl = "ok" if rc == 0 else "warn" if rc in (1, 124, 127) else "err"
+    log(lvl, f"{name} -> rc={rc} in {dur:.1f}s")
+    if rc not in (0, None) and note != "skipped":
+        _TOOL_RC_REGISTRY[name] = rc
+    return StepResult(name, cmd, rc, dur, logp, note=note)
+
+
+def _wait_proc(proc: subprocess.Popen, timeout: int) -> bool:
+    for _ in range(max(1, timeout)):
+        try:
+            proc.wait(timeout=1)
+            return True
+        except subprocess.TimeoutExpired:
+            continue
+    return False
+
+
+def _kill_proc(proc: subprocess.Popen) -> None:
+    if proc.poll() is not None:
+        return
+    with contextlib.suppress(ProcessLookupError):
+        os.killpg(proc.pid, signal.SIGTERM)
+    for _ in range(50):
+        try:
+            proc.wait(timeout=0.1)
+        except subprocess.TimeoutExpired:
+            continue
+        break
+    else:
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(proc.pid, signal.SIGKILL)
+        for _ in range(50):
+            try:
+                proc.wait(timeout=0.1)
+            except subprocess.TimeoutExpired:
+                continue
+            break
+
+
+_CLEANUP_DONE = False
+
+def _cleanup_child_procs() -> None:
+    global _CLEANUP_DONE
+    if _CLEANUP_DONE:
+        return
+    if not _SPAWNED_PIDS_LOCK.acquire(blocking=False):
+        return
+    try:
+        for pid in list(_SPAWNED_PIDS):
+            with contextlib.suppress(ProcessLookupError, OSError):
+                os.killpg(pid, signal.SIGTERM)
+            with contextlib.suppress(ProcessLookupError, OSError):
+                os.waitpid(pid, os.WNOHANG)
+        _SPAWNED_PIDS.clear()
+        _CLEANUP_DONE = True
+    finally:
+        _SPAWNED_PIDS_LOCK.release()
+
+
+def _register_proc(proc: subprocess.Popen) -> None:
+    with _SPAWNED_PIDS_LOCK:
+        _SPAWNED_PIDS.append(proc.pid)
+
+
+def _maybe_timeout(base: int) -> int:
+    return base * 3 if _USE_PROXYCHAINS else base
+
+
+async def run_parallel(jobs: List[Tuple[str, List[str], int]], outdir: Path, desc: str = "jobs") -> List[StepResult]:
+    sem = _JOB_SEM if _JOB_SEM is not None else asyncio.Semaphore(MAX_PARALLEL_JOBS)
+    pbar = tqdm(total=len(jobs), desc=desc, leave=False, position=1)
+
+    async def _guarded(n: str, c: List[str], t: int) -> StepResult:
+        async with sem:
+            res = await _run(n, c, t, outdir)
+            pbar.update(1)
+            return res
+
+    coros = [_guarded(n, c, t) for n, c, t in jobs]
+    try:
+        return await asyncio.gather(*coros)
+    finally:
+        pbar.close()
+
+
+async def _update_nuclei_templates(outdir: Path) -> None:
+    if not shutil.which("nuclei"):
+        return
+    cache_stamp = outdir / ".nuclei_update_stamp"
+    if cache_stamp.exists():
+        try:
+            age = time.time() - float(cache_stamp.read_text(encoding="utf-8", errors="ignore").strip())
+            if age < 86400:
+                return
+        except (ValueError, OSError):
+            pass
+    log("info", "09-VULNSCAN: updating nuclei templates...")
+    _nu_cmd = ["nuclei", "-update-templates", "-silent"]
+    if _PIPELINE_CFG.proxy:
+        _nu_cmd += ["-proxy", _PIPELINE_CFG.proxy]
+    _nu_cmd = _proxify_cmd(_nu_cmd)
+    proc = await asyncio.create_subprocess_exec(
+        *_nu_cmd,
+        stdin=asyncio.subprocess.DEVNULL,
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.DEVNULL,
+    )
+    try:
+        rc = await asyncio.wait_for(proc.wait(), timeout=120)
+        if rc == 0:
+            cache_stamp.write_text(str(time.time()))
+        else:
+            log("warn", f"nuclei -update-templates returned {rc}")
+    except asyncio.TimeoutError:
+        proc.kill()
+        await proc.wait()
+
+
+def _atomic_write_json(path: Path, payload: dict) -> None:
+    ensure(path)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    try:
+        with tmp.open("w") as f:
+            json.dump(payload, f, indent=2, default=str)
+        os.replace(tmp, path)
+    except Exception:
+        with contextlib.suppress(Exception):
+            tmp.unlink(missing_ok=True)
+        raise
+
+
+def _parse_phase_csv(value: str) -> Set[str]:
+    phases = {p.strip().upper() for p in value.split(",") if p.strip()}
+    invalid = sorted(phases - VALID_PHASES)
+    if invalid:
+        raise argparse.ArgumentTypeError(
+            f"unknown phase(s): {', '.join(invalid)}; valid phases: "
+            f"{', '.join(sorted(VALID_PHASES))}"
+        )
+    return phases
+
+
+def _domain_arg(value: str) -> str:
+    domain = value.rstrip(".").lower()
+    if not _HOSTNAME_RE.match(domain) or "." not in domain:
+        raise argparse.ArgumentTypeError(
+            "domain must be a valid DNS name with at least one dot, for example example.com"
+        )
+    return domain
+
+
+def _csv_from_phases(value: object) -> Set[str]:
+    if isinstance(value, set):
+        return {str(v).upper() for v in value}
+    if isinstance(value, str):
+        return _parse_phase_csv(value)
+    return set()

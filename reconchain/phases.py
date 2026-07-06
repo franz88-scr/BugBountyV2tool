@@ -901,7 +901,7 @@ async def phase_05_HARVEST(
             '\'timeout 300 gau --subs --threads 2 '
             '--blacklist ttf,woff,svg,png,jpg,gif,ico,css "$1" '
             '> "$TMPDIR/$(echo "$1" | md5sum | cut -d" " -f1).txt"\' _ {} < "$IN"\n'
-            'cat "$TMPDIR"/*.txt >> "$OUT"\n'
+            'cat "$TMPDIR"/*.txt >> "$OUT" || true\n'
         )
         runner.chmod(0o755)
         g1.append(("gau", ["bash", str(runner)], _maybe_timeout(3600)))
@@ -1162,7 +1162,7 @@ async def phase_06_JSINTEL(outdir: Path, t: Tools, only: PhaseSet, skip: PhaseSe
             '\'echo "[06-JSINTEL] secretfinder $1" >&2; '
              'timeout 120 secretfinder -i "$1" > '
              '"$TMPDIR/$(echo "$1" | md5sum | cut -d" " -f1).txt"\' _ {} < "$IN"\n'
-            'cat "$TMPDIR"/*.txt >> "$OUT"\n'
+             'cat "$TMPDIR"/*.txt >> "$OUT" || true\n'
         )
         runner.chmod(0o755)
         jobs.append(("secretfinder", ["bash", str(runner)], _maybe_timeout(3600)))
@@ -1182,7 +1182,7 @@ async def phase_06_JSINTEL(outdir: Path, t: Tools, only: PhaseSet, skip: PhaseSe
             'trap "rm -rf \'$TMPDIR\'" EXIT\n'
             'xargs -r -P 5 -I{} sh -c '
              '\'timeout 180 linkfinder -i "$1" > "$TMPDIR/$(echo "$1" | md5sum | cut -d" " -f1).html"\' _ {} < "$IN"\n'
-            'cat "$TMPDIR"/*.html >> "$OUT"\n'
+             'cat "$TMPDIR"/*.html >> "$OUT" || true\n'
         )
         runner.chmod(0o755)
         jobs.append(("linkfinder", ["bash", str(runner)], _maybe_timeout(3600)))
@@ -1307,16 +1307,17 @@ async def phase_07_PARAMS(
         if arjun_urls:
             arjun_had_input = True
             arjun_in.write_text("\n".join(arjun_urls) + "\n")
-            arjun_cmd = [
+            _arjun_parts = [
                 "arjun", "-i", str(arjun_in), "-o", str(outdir / "params_arjun.json"),
                 "-T", "60", "--rate-limit", "50",
                 "--disable-redirects",
             ]
             _arjun_headers = _extra_headers_dict()
             if _arjun_headers:
-                arjun_cmd += ["--headers", "\n".join(f"{k}: {v}" for k, v in _arjun_headers.items())]
+                _arjun_parts += ["--headers", "\n".join(f"{k}: {v}" for k, v in _arjun_headers.items())]
             timeout = _maybe_timeout(600) if waf_detected else _maybe_timeout(1800)
-            jobs.append(("arjun", arjun_cmd, timeout))
+            arjun_cmd_str = " ".join(shlex.quote(a) for a in _arjun_parts)
+            jobs.append(("arjun", ["bash", "-c", f"{arjun_cmd_str} || true"], timeout))
             if waf_detected and sample_size < _PIPELINE_CFG.sample_urls_params:
                 log("info", f"07-PARAMS: WAF detected, reduced arjun sample to {sample_size} URLs with {timeout}s timeout")
     if jobs:

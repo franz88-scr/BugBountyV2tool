@@ -33,7 +33,6 @@ reconchain = "reconchain:main"
 
 [tool.setuptools]
 packages = ["reconchain"]
-py-modules = ["reconchain"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

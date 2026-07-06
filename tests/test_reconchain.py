@@ -48,7 +48,7 @@ def test_merge_unique_filters_and_avoids_self_merge(tmp_path: Path) -> None:
 
     # count includes pre-existing dst content (old.example.com) plus valid src lines
     assert count == 3
-    assert dst.read_text().splitlines() == ["old.example.com", "b.example.com", "a.example.com"]
+    assert dst.read_text().splitlines() == ["a.example.com", "b.example.com", "old.example.com"]
 
 
 def test_file_readers_treat_directories_as_empty(tmp_path: Path) -> None:

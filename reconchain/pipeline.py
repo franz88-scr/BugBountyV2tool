@@ -14,14 +14,12 @@ from typing import Any, Dict, List, Set
 
 from reconchain.config import PipelineConfig, FAST_PHASES
 from reconchain.phases import (
-    STAGES, _RECON_LEVELS, PIPELINE as _PIPELINE,
-    _SCOPE_FILE, _SCOPE_PATTERNS, PhaseSet,
+    STAGES, PIPELINE as _PIPELINE,
 )
 from reconchain.process import (
     _JOB_SEM, _PIPELINE_CFG, _TOOL_RC_REGISTRY,
-    _USE_PROXYCHAINS, _cleanup_child_procs, _csv_from_phases,
-    _domain_arg, _maybe_timeout, _atomic_write_json, _update_nuclei_templates,
-    _run, _parse_phase_csv,
+    _USE_PROXYCHAINS, _run, _cleanup_child_procs, _csv_from_phases,
+    _maybe_timeout, _atomic_write_json, _update_nuclei_templates,
 )
 from reconchain.reporting import (
     _counts, write_summary, write_html, write_markdown, write_full_summary,
@@ -29,8 +27,8 @@ from reconchain.reporting import (
 from reconchain.tools import Tools
 from reconchain.utils import (
     Progress, ScanStatus, ensure, log, read_lines,
-    _is_valid_hostname, _auto_detect_cookies, _auto_detect_proxy,
-    _set_proxy_env, _downsample_file, _patch_socks, _socks_patched,
+    _auto_detect_cookies, _auto_detect_proxy,
+    _set_proxy_env, _downsample_file, _patch_socks,
 )
 from reconchain.interactsh import Interactsh
 from reconchain.dedup import DedupEngine
@@ -41,6 +39,7 @@ async def run_pipeline(args: argparse.Namespace) -> int:
     _TOOL_RC_REGISTRY.clear()
     import reconchain.process as _proc_mod
     _proc_mod._CLEANUP_DONE = False
+    _proc_mod._SPAWNED_PIDS.clear()
     outdir = Path(args.out).resolve()
     if outdir.exists() and not outdir.is_dir():
         raise ValueError(f"output path exists and is not a directory: {outdir}")
@@ -108,11 +107,6 @@ async def run_pipeline(args: argparse.Namespace) -> int:
     if not proxy:
         proxy = _auto_detect_proxy()
     if proxy:
-        _set_proxy_env(proxy)
-    _USE_PROXYCHAINS = bool(proxy and shutil.which("proxychains4") and proxy.startswith("socks"))
-    if proxy and proxy.startswith(("socks4://", "socks5://", "socks5h://", "socks4a://")):
-        _patch_socks(proxy)
-    if proxy:
         import socket as _proxy_socket
         try:
             _parsed = urllib.parse.urlparse(proxy)
@@ -130,8 +124,11 @@ async def run_pipeline(args: argparse.Namespace) -> int:
         except Exception:
             log("warn", f"Proxy {proxy} unreachable — disabling proxy")
             proxy = ""
-            _set_proxy_env("")
-            _USE_PROXYCHAINS = False
+    if proxy:
+        _set_proxy_env(proxy)
+    _USE_PROXYCHAINS = bool(proxy and shutil.which("proxychains4") and proxy.startswith("socks"))
+    if proxy and proxy.startswith(("socks4://", "socks5://", "socks5h://", "socks4a://")):
+        _patch_socks(proxy)
 
     cookie = getattr(args, 'cookie', '')
     if not cookie:
@@ -253,7 +250,13 @@ async def run_pipeline(args: argparse.Namespace) -> int:
             os._exit(128 + sig)
         _shutdown_requested = True
         _cleanup_child_procs()
-        raise SystemExit(128 + sig)
+        try:
+            loop = asyncio.get_running_loop()
+            for task in asyncio.all_tasks(loop):
+                task.cancel()
+            loop.call_soon_threadsafe(loop.stop)
+        except RuntimeError:
+            raise SystemExit(128 + sig)
     _orig_sigint = signal.signal(signal.SIGINT, _signal_handler)
     _orig_sigterm = signal.signal(signal.SIGTERM, _signal_handler)
 
@@ -269,7 +272,7 @@ async def run_pipeline(args: argparse.Namespace) -> int:
         waf_file = outdir / "waf_detection.txt"
         if waf_file.exists():
             waf_lines = read_lines(waf_file)
-            _PIPELINE_CFG.waf_detected = any("detected" in l.lower() and "no waf" not in l.lower() for l in waf_lines)
+            _PIPELINE_CFG.waf_detected = any("detected" in wl.lower() and "no waf" not in wl.lower() for wl in waf_lines)
             if _PIPELINE_CFG.waf_detected:
                 _PIPELINE_CFG.waf_evasion_throttle = 1.0
         for stage in STAGES:
@@ -306,7 +309,13 @@ async def run_pipeline(args: argparse.Namespace) -> int:
                         if isinstance(v, str) and v.endswith(".txt"):
                             _downsample_file(Path(v), n=1)
             try:
-                _atomic_write_json(state_path, state)
+                _state_for_disk = json.loads(json.dumps(state, default=str))
+                _state_for_disk.pop("cookie", None)
+                _state_for_disk.pop("COOKIE", None)
+                _state_for_disk.pop("extra_headers", None)
+                _state_for_disk.pop("EXTRA_HEADERS", None)
+                _state_for_disk.pop("credentials", None)
+                _atomic_write_json(state_path, _state_for_disk)
             except Exception as e:
                 log("warn", f"state.json write failed: {e}")
     finally:
@@ -331,8 +340,8 @@ async def run_pipeline(args: argparse.Namespace) -> int:
                     screenshots_dir = ensure(outdir / "screenshots")
                     _gw_proxy = []
                     if _PIPELINE_CFG.proxy:
-                        _gw_proxy = ["--proxy", _PIPELINE_CFG.proxy]
-                    await _run("gowitness", ["gowitness", "scan", "file", "-f", str(gowitness_targets), "-s", str(screenshots_dir), "--write-none"] + _gw_proxy, _maybe_timeout(600), outdir)
+                        _gw_proxy = ["--chrome-proxy", _PIPELINE_CFG.proxy]
+                    await _run("gowitness", ["gowitness", "scan", "file", "-f", str(gowitness_targets), "-s", str(screenshots_dir), "--screenshot-format", "png", "--write-none"] + _gw_proxy, _maybe_timeout(600), outdir)
                     n_screenshots = len(list(screenshots_dir.glob("*.png"))) if screenshots_dir.exists() else 0
                     if n_screenshots:
                         log("ok", f"gowitness: {n_screenshots} screenshots → {screenshots_dir}")

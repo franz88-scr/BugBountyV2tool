@@ -94,9 +94,9 @@ class Interactsh:
             handler_cls = _make_callback_handler(self._instance_id)
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            sock.bind(("0.0.0.0", port or 0))
+            sock.bind(("127.0.0.1", port or 0))
             self._webhook_port = sock.getsockname()[1]
-            self._httpd = HTTPServer(("0.0.0.0", self._webhook_port), handler_cls, bind_and_activate=False)
+            self._httpd = HTTPServer(("127.0.0.1", self._webhook_port), handler_cls, bind_and_activate=False)
             self._httpd.socket = sock
             self._httpd.server_address = sock.getsockname()
             self._httpd.server_bind = lambda: None

@@ -5,7 +5,9 @@ import hashlib
 import json
 import os
 import re
+import struct
 import sys
+import ssl
 import threading
 import urllib.error
 import urllib.parse
@@ -26,6 +28,13 @@ def _is_valid_hostname(s: str) -> bool:
     s = s.rstrip(".").lower()
     if "." not in s or any(c.isspace() or c in "[]()<>{}" for c in s):
         return False
+    # Reject IP addresses (octets look like valid hostname labels)
+    try:
+        import ipaddress
+        ipaddress.ip_address(s)
+        return False
+    except ValueError:
+        pass
     return bool(_HOSTNAME_RE.match(s))
 
 def _is_under_domain(host: str, domain: str) -> bool:
@@ -177,8 +186,13 @@ def _patch_socks(proxy: str) -> bool:
 
 _socks_patched: bool = False
 
+def _ssl_context() -> ssl.SSLContext:
+    return ssl.create_default_context()
+
+
 def _get_urlopener() -> Callable[..., Any]:
     from reconchain.process import _PIPELINE_CFG
+    ctx = _ssl_context()
     proxy = _PIPELINE_CFG.proxy or os.environ.get("PROXY", "")
     if proxy:
         if proxy.startswith(("http://", "https://")):
@@ -187,12 +201,12 @@ def _get_urlopener() -> Callable[..., Any]:
                 "https": proxy,
             })
             opener = urllib.request.build_opener(handler)
-            return opener.open
+            return lambda *a, **kw: opener.open(*a, **{**kw, "context": ctx})
         if proxy.startswith(("socks4://", "socks5://", "socks5h://", "socks4a://")):
             global _socks_patched
             if not _socks_patched:
                 _socks_patched = _patch_socks(proxy)
-    return urllib.request.urlopen
+    return lambda *a, **kw: urllib.request.urlopen(*a, **{**kw, "context": ctx})
 
 class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
@@ -200,6 +214,7 @@ class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
 
 def _get_no_redirect_urlopener() -> Callable[..., Any]:
     from reconchain.process import _PIPELINE_CFG
+    ctx = _ssl_context()
     proxy = _PIPELINE_CFG.proxy or os.environ.get("PROXY", "")
     if proxy:
         if proxy.startswith(("http://", "https://")):
@@ -208,13 +223,13 @@ def _get_no_redirect_urlopener() -> Callable[..., Any]:
                 "https": proxy,
             })
             opener = urllib.request.build_opener(_NoRedirectHandler, handler)
-            return opener.open
+            return lambda *a, **kw: opener.open(*a, **{**kw, "context": ctx})
         if proxy.startswith(("socks4://", "socks5://", "socks5h://", "socks4a://")):
             global _socks_patched
             if not _socks_patched:
                 _socks_patched = _patch_socks(proxy)
     opener = urllib.request.build_opener(_NoRedirectHandler)
-    return opener.open
+    return lambda *a, **kw: opener.open(*a, **{**kw, "context": ctx})
 
 async def _async_urlopen(urlopen_func: Any, req: urllib.request.Request, timeout: int = 10) -> Tuple[int, Any, bytes]:
     import asyncio
@@ -317,7 +332,7 @@ def merge_unique(srcs: List[Path], dst: Path, validator: Optional[Callable[[str]
     ensure(dst)
     tmp = dst.with_suffix(dst.suffix + ".merge_tmp")
     try:
-        tmp.write_text("\n".join(seen) + "\n")
+        tmp.write_text("\n".join(sorted(seen)) + "\n")
         os.replace(tmp, dst)
     except Exception:
         with contextlib.suppress(Exception):
@@ -443,8 +458,8 @@ def _merge_dnsx_output(src: Path, hosts_out: Path, full_out: Path) -> int:
             if h.strip():
                 seen_hosts.add(h.strip().lower())
     if full_out.exists():
-        for l in read_lines(full_out):
-            line = l.strip()
+        for ln in read_lines(full_out):
+            line = ln.strip()
             if line:
                 seen_full_lines.add(line)
                 host = line.split()[0].rstrip(".").lower()
@@ -521,7 +536,7 @@ def _mmh3_hash(data: bytes) -> int:
     length = len(data)
     nblocks = length // 4
     for i in range(nblocks):
-        k = __import__('struct').unpack_from("<I", data, i * 4)[0]
+        k = struct.unpack_from("<I", data, i * 4)[0]
         k = (k * c1) & 0xFFFFFFFF
         k = ((k << r1) | (k >> (32 - r1))) & 0xFFFFFFFF
         k = (k * c2) & 0xFFFFFFFF

@@ -3,7 +3,6 @@ import json
 import os
 import subprocess
 import sys
-import time
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -75,8 +74,10 @@ class MonitorEngine:
                 due.append(info)
         return due
 
-    def run_due_scans(self, reconchain_cmd: str = "reconchain") -> List[str]:
+    def run_due_scans(self, reconchain_cmd: str = "") -> List[str]:
         started = []
+        if not reconchain_cmd:
+            reconchain_cmd = os.path.abspath(sys.argv[0]) if sys.argv and sys.argv[0] else "reconchain"
         for scan in self.due_scans():
             domain = scan["domain"]
             args = scan.get("args", [])

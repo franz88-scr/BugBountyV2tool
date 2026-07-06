@@ -9,10 +9,10 @@ COPY reconchain.py reconchain/ pyproject.toml ./
 
 FROM base AS install
 
-RUN pip install --no-cache-dir -e . 2>/dev/null || true
+RUN pip install --no-cache-dir -e .
 
 COPY install.sh .
-RUN bash install.sh --go-only 2>/dev/null || true
+RUN bash install.sh --go-only 2>&1 || echo "[WARN] go-only install had failures (non-fatal)"
 
 FROM base
 

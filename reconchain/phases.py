@@ -5,7 +5,6 @@ import asyncio
 import base64
 import contextlib
 import fnmatch
-import hashlib
 import json
 import math
 import os
@@ -14,8 +13,6 @@ import re
 import shlex
 import shutil
 import socket
-import struct
-import subprocess
 import time
 import urllib.parse
 import urllib.request
@@ -31,7 +28,7 @@ from reconchain.process import (
 )
 from reconchain.tools import Tools
 from reconchain.utils import (
-    ensure, log, read_lines, count_nonblank, merge_unique, merge_unique_str,
+    ensure, log, read_lines, read_jsonl, count_nonblank, merge_unique, merge_unique_str,
     _is_valid_hostname, _is_under_domain,
     _existing_artifacts,
     _get_urlopener, _get_no_redirect_urlopener, safe_suffix, _safe_name,
@@ -42,8 +39,9 @@ from reconchain.utils import (
     _parse_httpx_tech,
     _mmh3_hash,
     _extract_urls_from_ffuf_json, _merge_dnsx_output,
-    _throttle, _throttle_rate,
+    _throttle_rate,
 )
+from reconchain.interactsh import Interactsh
 
 
 
@@ -154,49 +152,75 @@ async def phase_01_RECON(
 ) -> Dict[str, Any]:
     if skip & {"01-RECON"}:
         return {}
+    if only and "01-RECON" not in only:
+        return {}
     out = outdir / "all_subs.txt"
     if out.exists() and not force:
         return {"01-RECON": str(out), "count": count_nonblank(out)}
     log("info", "Phase 01-RECON: subdomain enumeration")
     jobs: List[Tuple[str, List[str], int]] = []
     if t.has("subfinder"):
-        _sub_proxy = []
-        if _PIPELINE_CFG.proxy:
-            _sub_proxy = ["-proxy", _PIPELINE_CFG.proxy]
-        jobs.append(
-            (
-                "subfinder",
-                ["subfinder", "-d", domain, "-silent", "-o", str(outdir / "subs_subfinder.txt")] + _sub_proxy,
-                900,
+        _sub_out = outdir / "subs_subfinder.txt"
+        if resume and _sub_out.exists() and count_nonblank(_sub_out) > 0:
+            log("skip", "subfinder (resume — output exists)")
+        else:
+            _sub_proxy = []
+            if _PIPELINE_CFG.proxy:
+                _sub_proxy = ["-proxy", _PIPELINE_CFG.proxy]
+            jobs.append(
+                (
+                    "subfinder",
+                    ["subfinder", "-d", domain, "-silent", "-o", str(_sub_out)] + _sub_proxy,
+                    900,
+                )
             )
-        )
     if t.has("amass"):
-        # amass v4: passive is the default (the old `-passive` flag is
-        # deprecated) and `enum` emits *relationship* records on stdout, e.g.
-        #   `sub.example.com (FQDN) --> a_record --> 1.2.3.4 (IPAddress)`
-        # (the `-o` file holds the same raw terminal text, NOT a clean list).
-        # Feeding those lines straight into the merge made every line fail the
-        # hostname validator, so amass silently contributed zero subdomains.
-        # Run via a runner that extracts the `<name> (FQDN)` tokens; the 01-RECON
-        # merge's _under_domain validator then keeps only in-scope hosts.
-        runner = outdir / "logs" / "amass.sh"
-        ensure(runner)
-        runner.write_text(
-            "#!/usr/bin/env bash\n"
-            "set -eu\n"
-            "# DNS enumeration — clear proxy env so Go SOCKS doesn't slow DNS queries\n"
-            "unset ALL_PROXY all_proxy HTTPS_PROXY https_proxy HTTP_PROXY http_proxy PROXY\n"
-            f"OUT={shlex.quote(str(outdir / 'subs_amass.txt'))}\n"
-            f"DOMAIN={shlex.quote(domain)}\n"
-            ': > "$OUT"\n'
-            'amass enum -d "$DOMAIN" -nocolor 2>/dev/null '
-            "| grep --line-buffered -oE '[A-Za-z0-9._-]+ \\(FQDN\\)' "
-            "| sed 's/ (FQDN)$//' >> \"$OUT\" || true\n"
-        )
-        runner.chmod(0o755)
-        jobs.append(("amass", ["bash", str(runner)], _maybe_timeout(600)))
+        _amass_out = outdir / "subs_amass.txt"
+        if resume and _amass_out.exists() and count_nonblank(_amass_out) > 0:
+            log("skip", "amass (resume — output exists)")
+        else:
+            # amass v4: passive is the default (the old `-passive` flag is
+            # deprecated) and `enum` emits *relationship* records on stdout, e.g.
+            #   `sub.example.com (FQDN) --> a_record --> 1.2.3.4 (IPAddress)`
+            # (the `-o` file holds the same raw terminal text, NOT a clean list).
+            # Feeding those lines straight into the merge made every line fail the
+            # hostname validator, so amass silently contributed zero subdomains.
+            # Run via a runner that extracts the `<name> (FQDN)` tokens; the 01-RECON
+            # merge's _under_domain validator then keeps only in-scope hosts.
+            runner = outdir / "logs" / "amass.sh"
+            ensure(runner)
+            _amass_proxy_lines = ""
+            if _PIPELINE_CFG.proxy:
+                _amass_proxy_lines = f"export ALL_PROXY={shlex.quote(_PIPELINE_CFG.proxy)}\n"
+            runner.write_text(
+                "#!/usr/bin/env bash\n"
+                "set -eu\n"
+                "# DNS enumeration — clear proxy env so Go SOCKS doesn't slow DNS queries\n"
+                "unset ALL_PROXY all_proxy HTTPS_PROXY https_proxy HTTP_PROXY http_proxy PROXY\n"
+                f"{_amass_proxy_lines}"
+                f"OUT={shlex.quote(str(_amass_out))}\n"
+                f"DOMAIN={shlex.quote(domain)}\n"
+                ': > "$OUT"\n'
+                'amass enum -d "$DOMAIN" -nocolor '
+                "| grep --line-buffered -oE '[A-Za-z0-9._-]+ \\(FQDN\\)' "
+                "| sed 's/ (FQDN)$//' >> \"$OUT\"\n"
+            )
+            runner.chmod(0o755)
+            jobs.append(("amass", ["bash", str(runner)], _maybe_timeout(600)))
+
+    _a1_sources = [
+        outdir / "subs_subfinder.txt",
+        outdir / "subs_amass.txt",
+    ]
 
     if not jobs:
+        # Resume or all tools missing — merge any existing source files
+        if any(p.exists() for p in _a1_sources):
+            n = merge_unique(_a1_sources, out, validator=lambda s: _is_valid_hostname(s) and _is_under_domain(s, domain))
+            if n == 0:
+                out.touch()
+            log("ok", f"01-RECON: {n} unique subdomains → {out}")
+            return {"01-RECON": str(out), "count": n}
         log("warn", "01-RECON: no subdomain tools available")
         ensure(out)
         return {"01-RECON": str(out), "count": 0}
@@ -206,22 +230,29 @@ async def phase_01_RECON(
     def _under_domain(s: str) -> bool:
         return _is_valid_hostname(s) and _is_under_domain(s, domain)
 
-    _a1_sources = [
-        outdir / "subs_subfinder.txt",
-        outdir / "subs_amass.txt",
-    ]
-
     async def _incremental_merge() -> None:
         """Merge tool outputs into all_subs.txt every 30s during execution."""
-        _last_size = 0
+        _last_mtimes: Dict[str, float] = {str(p): 0.0 for p in _a1_sources}
         while True:
             await asyncio.sleep(30)
-            existing = [p for p in _a1_sources if p.exists()]
-            if existing:
-                current = sum(len(read_lines(p)) for p in existing)
-                if current > _last_size:
-                    merge_unique(_a1_sources, out, validator=_under_domain)
-                    _last_size = current
+            changed = False
+            for p in _a1_sources:
+                if p.exists():
+                    # Verify file is stable (not mid-write) to avoid partial reads
+                    try:
+                        size1 = p.stat().st_size
+                        await asyncio.sleep(0.05)
+                        size2 = p.stat().st_size
+                        if size1 != size2:
+                            continue
+                    except OSError:
+                        continue
+                    mtime = p.stat().st_mtime
+                    if mtime > _last_mtimes.get(str(p), 0.0):
+                        changed = True
+                        _last_mtimes[str(p)] = mtime
+            if changed:
+                merge_unique(_a1_sources, out, validator=_under_domain)
 
     merge_task = asyncio.create_task(_incremental_merge())
     try:
@@ -239,7 +270,7 @@ async def phase_01_RECON(
     # Final merge
     n = merge_unique(_a1_sources, out, validator=_under_domain)
     if n == 0:
-        ensure(out)  # Empty file signals 01-RECON completed (no subs found)
+        out.touch()  # Empty file signals 01-RECON completed (no subs found)
     log("ok", f"01-RECON: {n} unique subdomains → {out}")
     ret: Dict[str, Any] = {"01-RECON": str(out), "count": n}
     if failures:
@@ -260,6 +291,8 @@ async def phase_02_RESOLVE(
 ) -> Dict[str, Any]:
     if skip & {"02-RESOLVE"}:
         return {}
+    if only and "02-RESOLVE" not in only:
+        return {}
     out = outdir / "resolved.txt"
     full = outdir / "resolved_full.txt"
     if out.exists() and not force:
@@ -271,6 +304,7 @@ async def phase_02_RESOLVE(
         is_done = isinstance(prev.get("01-RECON"), str) or subs_file.exists()
         if is_done:
             log("warn", "02-RESOLVE: 01-RECON produced no subdomains; skipping")
+            out.touch()
             return {"02-RESOLVE": str(out), "count": 0}
         for _ in range(120):  # up to ~10 min
             await asyncio.sleep(5)
@@ -278,11 +312,19 @@ async def phase_02_RESOLVE(
                 break
         if not read_lines(subs_file):
             log("warn", "02-RESOLVE: 01-RECON produced no subdomains; skipping")
+            out.touch()
             return {"02-RESOLVE": str(out), "count": 0}
 
     log("info", "Phase 02-RESOLVE: resolution with parallel fallback (massdns → dnsx → dig)")
     _a2_processed: Set[str] = set()
+    # Seed processed set from existing resolved file when resuming
+    if resume:
+        for ln in read_lines(out):
+            h = ln.strip().lower()
+            if h:
+                _a2_processed.add(h)
     _a2_stable_count = 0
+
     # Run puredns on initial subdomains for wildcard-resistant resolution
     if t.has("puredns"):
         puredns_out = outdir / "resolved_puredns.txt"
@@ -298,11 +340,11 @@ async def phase_02_RESOLVE(
         if puredns_out.exists() and read_lines(puredns_out):
             existing = set()
             if out.exists():
-                existing.update(l.strip().lower() for l in read_lines(out) if l.strip())
+                existing.update(ln.strip().lower() for ln in read_lines(out) if ln.strip())
             new_puredns: List[str] = []
             for ln in read_lines(puredns_out):
                 host = ln.strip().lower()
-                if host and host not in existing:
+                if host and _is_valid_hostname(host) and host not in existing:
                     existing.add(host)
                     new_puredns.append(host)
             if new_puredns:
@@ -325,15 +367,14 @@ async def phase_02_RESOLVE(
         except Exception:
             return None
 
-    async def _resolve_batch(batch_subs: Path) -> int:
+    async def _resolve_batch(hosts: List[str]) -> int:
         """Resolve subdomains with fallback chain: massdns → dnsx → socket."""
-        tmp = outdir / ".a2_batch.txt"
-        batch = [s.strip().lower() for s in read_lines(batch_subs)
-                 if s.strip() and s.strip().lower() not in _a2_processed]
-        if not batch:
+        hosts = [h for h in hosts if h not in _a2_processed]
+        if not hosts:
             return 0
-        _a2_processed.update(b.lower() for b in batch)
-        tmp.write_text("\n".join(batch) + "\n")
+        _a2_processed.update(h.lower() for h in hosts)
+        tmp = outdir / ".a2_batch.txt"
+        tmp.write_text("\n".join(hosts) + "\n")
         resolved_count = 0
         # Try massdns first (fastest)
         if t.has("massdns"):
@@ -350,7 +391,7 @@ async def phase_02_RESOLVE(
                     for ln in read_lines(massdns_out):
                         if ln.strip() and " " in ln:
                             host = ln.split()[0].rstrip(".").lower()
-                            if host and host not in _a2_processed:
+                            if _is_valid_hostname(host) and host not in _a2_processed:
                                 merge_unique_str(host, out)
                                 merge_unique_str(host, full)
                                 resolved_count += 1
@@ -363,7 +404,7 @@ async def phase_02_RESOLVE(
         # Fall back to dnsx batch resolution
         if t.has("dnsx"):
             full_batch = outdir / ".a2_full_batch.txt"
-            res = await _run(
+            await _run(
                 "dnsx",
                 ["dnsx", "-silent", "-l", str(tmp), "-o", str(full_batch),
                  "-a", "-aaaa", "-cname", "-resp"],
@@ -376,8 +417,8 @@ async def phase_02_RESOLVE(
                 return cnt
             full_batch.unlink(missing_ok=True)
         # Final fallback: Python socket resolution
-        log("info", f"02-RESOLVE: resolving {len(batch)} host(s) via socket fallback")
-        tasks = [_resolve_socket(h) for h in batch]
+        log("info", f"02-RESOLVE: resolving {len(hosts)} host(s) via socket fallback")
+        tasks = [_resolve_socket(h) for h in hosts]
         results = await asyncio.gather(*tasks)
         resolved_hosts = [h for h in results if h is not None]
         if resolved_hosts:
@@ -387,23 +428,29 @@ async def phase_02_RESOLVE(
         tmp.unlink(missing_ok=True)
         return resolved_count
 
+    async def _read_subs() -> List[str]:
+        return [s.strip().lower() for s in read_lines(subs_file) if s.strip()]
+
     # Process initial available subdomains
-    await _resolve_batch(subs_file)
+    initial = await _read_subs()
+    await _resolve_batch(initial)
 
     # Poll for new subdomains while 01-RECON may still be running (up to 10 min total)
     for _ in range(40):
         await asyncio.sleep(15)
-        new_subs = [s.strip().lower() for s in read_lines(subs_file)
-                    if s.strip() and s.strip().lower() not in _a2_processed]
+        all_subs = await _read_subs()
+        new_subs = [s for s in all_subs if s not in _a2_processed]
         if not new_subs:
             _a2_stable_count += 1
             if _a2_stable_count >= 4:
                 break
             continue
         _a2_stable_count = 0
-        await _resolve_batch(subs_file)
+        await _resolve_batch(new_subs)
 
     c = count_nonblank(out)
+    if c == 0:
+        out.touch()
     return {"02-RESOLVE": str(out), "count": c}
 
 
@@ -411,6 +458,8 @@ async def phase_03_PERMUTE(
     domain: str, outdir: Path, t: Tools, only: PhaseSet, skip: PhaseSet, prev: Dict[str, Any], force: bool = False,
 ) -> Dict[str, Any]:
     if skip & {"03-PERMUTE"}:
+        return {}
+    if only and "03-PERMUTE" not in only:
         return {}
     _a3_stamp = outdir / f".phase_03.stamp.{os.getpid()}"
     if not force and any(outdir.glob(".phase_03.stamp.*")):
@@ -424,7 +473,6 @@ async def phase_03_PERMUTE(
         return {}
     permuted = outdir / "subs_permuted.txt"
     resolved = outdir / "subs_permuted_resolved.txt"
-    merged = outdir / "subs_merged.txt"
     all_subs = outdir / "all_subs.txt"
     alt_out = outdir / "subs_permuted_alterx.txt"
     jobs: List[Tuple[str, List[str], int]] = []
@@ -436,7 +484,8 @@ async def phase_03_PERMUTE(
             "set -eu\n"
             f"IN={shlex.quote(str(subs_in))}\n"
             f"OUT={shlex.quote(str(alt_out))}\n"
-            "alterx -l \"$IN\" -silent -o \"$OUT\" 2>/dev/null || true\n"
+            "alterx -l \"$IN\" -silent -o \"$OUT\"\n"
+            'head -500 "$OUT" > "${OUT}.tmp" && mv "${OUT}.tmp" "$OUT"\n'
         )
         runner.chmod(0o755)
         jobs.append(("alterx", ["bash", str(runner)], 600))
@@ -448,7 +497,7 @@ async def phase_03_PERMUTE(
             "set -eu\n"
             f"IN={shlex.quote(str(subs_in))}\n"
             f"OUT={shlex.quote(str(permuted))}\n"
-            "dnsgen \"$IN\" 2>/dev/null | sort -u > \"$OUT\" || true\n"
+            "dnsgen \"$IN\" | sort -u | head -500 > \"$OUT\"\n"
         )
         runner.chmod(0o755)
         jobs.append(("dnsgen", ["bash", str(runner)], 600))
@@ -456,10 +505,16 @@ async def phase_03_PERMUTE(
         await run_parallel(jobs, outdir)
     # Merge alterx results into subs_in so dnsx can also resolve them
     if alt_out.exists() and read_lines(alt_out):
-        merge_unique([subs_in, alt_out], subs_in)
+        alt_hosts = [ln for ln in read_lines(alt_out) if _is_valid_hostname(ln)]
+        if alt_hosts:
+            tmp_alt = outdir / ".permuted_alterx_valid.txt"
+            tmp_alt.write_text("\n".join(alt_hosts) + "\n")
+            merge_unique([subs_in, tmp_alt], subs_in)
+            tmp_alt.unlink(missing_ok=True)
     # Resolve permuted subdomains with dnsx (batched to avoid timeout on large sets)
     if permuted.exists() and read_lines(permuted) and t.has("dnsx"):
-        all_permuted = read_lines(permuted)
+        all_raw = read_lines(permuted)
+        all_permuted = [h for h in all_raw if _is_valid_hostname(h)]
         batch_size = 200
         resolved_all = outdir / "subs_permuted_resolved.txt"
         ensure(resolved_all).write_text("")
@@ -513,6 +568,8 @@ async def phase_04_SCAN(
 ) -> Dict[str, Any]:
     if skip & {"04-SCAN"}:
         return {}
+    if only and "04-SCAN" not in only:
+        return {}
     if all(
         (outdir / f).exists()
         for f in ("ports.txt", "hosts.txt", "host_targets.txt", "takeover.txt")
@@ -562,7 +619,7 @@ async def phase_04_SCAN(
         )
         # UDP scanning not supported by naabu 2.x; skipped
     elif have_hosts and t.has("nmap"):
-        _nmap_cmd = ["nmap", "-iL", str(hosts), "-Pn", "-p-", "--open",
+        _nmap_cmd = ["nmap", "-iL", str(hosts), "-Pn", "--top-ports", "1000", "--open",
                      "--script=http-enum", "-oG", str(outdir / "ports.gnmap")]
         jobs.append(("nmap", _nmap_cmd, _maybe_timeout(1800)))
     # DNS takeover check via nuclei (separate from http/takeovers)
@@ -602,7 +659,6 @@ async def phase_04_SCAN(
                     "-tech-detect",
                     "-status-code",
                     "-follow-redirects",
-                    "-fr",
                 ] + _extra_http_args() + _httpx_proxy,
                 1800,
             )
@@ -646,7 +702,8 @@ async def phase_04_SCAN(
                 _maybe_timeout(1800),
             )
         )
-    await run_parallel(jobs, outdir)
+    if jobs:
+        await run_parallel(jobs, outdir)
     # Merge httprobe results into hosts.txt
     httprobe_out = outdir / "hosts_httprobe.txt"
     hosts_file_path = outdir / "hosts.txt"
@@ -669,7 +726,7 @@ async def phase_04_SCAN(
             ports_csv = ",".join(pp)
             out_sv = outdir / f"services_{safe_suffix(h)}.gnmap"
             _sv_cmd = ["nmap", "-Pn", "-sV", "--open",
-                       "-p", ports_csv, str(h), "-oG", str(out_sv)]
+                       "-p", ports_csv, str(h), "--host-timeout", "10m", "-oG", str(out_sv)]
             sv_jobs.append((f"nmap-sv-{_safe_name(h)}", _sv_cmd, 600))
         if sv_jobs:
             await run_parallel(sv_jobs, outdir)
@@ -701,7 +758,8 @@ async def phase_04_SCAN(
                     bits = entry.strip().split("/")
                     if len(bits) >= 3 and bits[1] == "open":
                         ports.add(f"{ip}:{bits[0]}")
-                ensure(ports_file).write_text("\n".join(sorted(ports)) + ("\n" if ports else ""))
+            if ports:
+                ensure(ports_file).write_text("\n".join(sorted(ports)) + "\n")
     raw_hosts = outdir / "hosts.txt"
     targets = outdir / "host_targets.txt"
     if raw_hosts.exists() and read_lines(raw_hosts):
@@ -721,6 +779,8 @@ async def phase_04b_TAKEOVER_VALIDATE(
     outdir: Path, t: Tools, only: PhaseSet, skip: PhaseSet, force: bool = False,
 ) -> Dict[str, Any]:
     if skip & {"04b-TAKEOVER-VALIDATE"}:
+        return {}
+    if only and "04b-TAKEOVER-VALIDATE" not in only:
         return {}
     _out = outdir / "takeover_confirmed.txt"
     if _out.exists() and not force:
@@ -791,6 +851,8 @@ async def phase_05_HARVEST(
 ) -> Dict[str, Any]:
     if skip & {"05-HARVEST"}:
         return {}
+    if only and "05-HARVEST" not in only:
+        return {}
     _c1_out = outdir / "urls_all.txt"
     if _c1_out.exists() and not force:
         return {"05-HARVEST": str(_c1_out), "count": count_nonblank(_c1_out)}
@@ -833,9 +895,13 @@ async def phase_05_HARVEST(
             f"OUT={shlex.quote(str(outdir / 'urls_gau.txt'))}\n"
             f"IN={shlex.quote(str(hosts))}\n"
             ': > "$OUT"\n'
-            'xargs -r -P 5 -I{} timeout 300 gau '
-            '--subs --threads 2 '
-            '--blacklist ttf,woff,svg,png,jpg,gif,ico,css {} >> "$OUT" 2>/dev/null < "$IN" || true\n'
+            'TMPDIR=$(mktemp -d) || exit 1\n'
+            'trap "rm -rf \'$TMPDIR\'" EXIT\n'
+            'xargs -r -P 5 -I{} sh -c '
+            '\'timeout 300 gau --subs --threads 2 '
+            '--blacklist ttf,woff,svg,png,jpg,gif,ico,css "$1" '
+            '> "$TMPDIR/$(echo "$1" | md5sum | cut -d" " -f1).txt"\' _ {} < "$IN"\n'
+            'cat "$TMPDIR"/*.txt >> "$OUT"\n'
         )
         runner.chmod(0o755)
         g1.append(("gau", ["bash", str(runner)], _maybe_timeout(3600)))
@@ -855,7 +921,7 @@ async def phase_05_HARVEST(
             f"OUT={shlex.quote(str(outdir / 'urls_gospider.txt'))}\n"
             f"IN={shlex.quote(str(hosts))}\n"
             f'gospider -q -t {_gs_threads} -d {_gs_depth} -S "$IN" 2>/dev/null '
-            '| grep -oE \'https?://[^[:space:]"]+\' | sort -u > "$OUT" || true\n'
+            '| grep -oE \'https?://[^[:space:]"]+\' | sort -u > "$OUT"\n'
         )
         runner.chmod(0o755)
         g1.append(("gospider", ["bash", str(runner)], _maybe_timeout(1800)))
@@ -892,7 +958,7 @@ async def phase_05_HARVEST(
             f"OUT={shlex.quote(str(outdir / 'urls_subjs.txt'))}\n"
             f"IN={shlex.quote(str(hosts))}\n"
             ': > "$OUT"\n'
-            'subjs -i "$IN" > "$OUT" 2>/dev/null || true\n'
+            'subjs -i "$IN" > "$OUT"\n'
         )
         runner.chmod(0o755)
         g2.append(("subjs", ["bash", str(runner)], _maybe_timeout(1200)))
@@ -930,6 +996,8 @@ async def phase_05b_APISPEC(
     outdir: Path, t: Tools, only: PhaseSet, skip: PhaseSet, prev: Dict[str, Any], force: bool = False,
 ) -> Dict[str, Any]:
     if skip & {"05b-APISPEC"}:
+        return {}
+    if only and "05b-APISPEC" not in only:
         return {}
     _out = outdir / "api_specs.txt"
     if _out.exists() and not force:
@@ -983,12 +1051,7 @@ async def phase_05b_APISPEC(
                 status, headers, body_bytes = await _async_urlopen(_ap_urlopen, req, timeout=10)
                 body = body_bytes.decode("utf-8", errors="ignore")
                 if status in (200, 301, 302) and len(body) > 50:
-                    content_type = headers.get("Content-Type", "")
-                    # Validate it looks like an API spec
-                    spec_type = "unknown"
                     if "swagger" in body.lower() or path.endswith("swagger.json"):
-                        spec_type = "swagger"
-                        # Extract endpoints
                         try:
                             data = json.loads(body)
                             if "paths" in data:
@@ -999,7 +1062,6 @@ async def phase_05b_APISPEC(
                         except json.JSONDecodeError:
                             results.append(f"[swagger] {url} (unparseable JSON)")
                     elif "openapi" in body.lower() or path.endswith(("openapi.yaml", "openapi.yml", "openapi.json")):
-                        spec_type = "openapi"
                         try:
                             data = json.loads(body)
                             if "paths" in data:
@@ -1010,12 +1072,10 @@ async def phase_05b_APISPEC(
                         except json.JSONDecodeError:
                             results.append(f"[openapi] {url} (unparseable JSON)")
                     elif "graphql" in body.lower() or "sdl" in path:
-                        spec_type = "graphql-sdl"
                         results.append(f"[graphql-sdl] {url} → {len(body[:500].splitlines())} lines")
                         for ln in body[:1000].splitlines()[:10]:
                             results.append(f"  {ln[:120]}")
                     elif "id_token" in body or "jwks_uri" in body or "authorization_endpoint" in body:
-                        spec_type = "oidc"
                         results.append(f"[oidc] {url} (OpenID Connect configuration)")
                     else:
                         results.append(f"[api-spec] {url} → HTTP {status} ({len(body)} bytes)")
@@ -1037,6 +1097,8 @@ async def phase_05b_APISPEC(
 async def phase_06_JSINTEL(outdir: Path, t: Tools, only: PhaseSet, skip: PhaseSet, force: bool = False) -> Dict[str, Any]:
     if skip & {"06-JSINTEL"}:
         return {}
+    if only and "06-JSINTEL" not in only:
+        return {}
     _c2_out = outdir / "js_secrets.txt"
     if _c2_out.exists() and not force:
         return {"06-JSINTEL": str(_c2_out), "count": count_nonblank(_c2_out)}
@@ -1050,13 +1112,15 @@ async def phase_06_JSINTEL(outdir: Path, t: Tools, only: PhaseSet, skip: PhaseSe
         keep_js: List[str] = []
         keep_map: List[str] = []
         seen_js: Set[str] = set()
+        seen_map: Set[str] = set()
         for u in read_lines(urls):
             path = u.split("?", 1)[0].split("#", 1)[0].lower()
             if path.endswith((".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx")):
                 if u not in seen_js:
                     seen_js.add(u)
                     keep_js.append(u)
-            if path.endswith(".map"):
+            if path.endswith(".map") and u not in seen_map:
+                seen_map.add(u)
                 keep_map.append(u)
         if keep_js:
             ensure(js_urls).write_text("\n".join(keep_js) + "\n")
@@ -1092,9 +1156,13 @@ async def phase_06_JSINTEL(outdir: Path, t: Tools, only: PhaseSet, skip: PhaseSe
             f"OUT={shlex.quote(str(outdir / 'secrets.txt'))}\n"
             f"IN={shlex.quote(str(_js_input))}\n"
             ': > "$OUT"\n'
+            'TMPDIR=$(mktemp -d) || exit 1\n'
+            'trap "rm -rf \'$TMPDIR\'" EXIT\n'
             'xargs -r -P 5 -I{} sh -c '
             '\'echo "[06-JSINTEL] secretfinder $1" >&2; '
-            'timeout 120 secretfinder -i "$1" 2>/dev/null\' _ {} >> "$OUT" < "$IN" || true\n'
+             'timeout 120 secretfinder -i "$1" > '
+             '"$TMPDIR/$(echo "$1" | md5sum | cut -d" " -f1).txt"\' _ {} < "$IN"\n'
+            'cat "$TMPDIR"/*.txt >> "$OUT"\n'
         )
         runner.chmod(0o755)
         jobs.append(("secretfinder", ["bash", str(runner)], _maybe_timeout(3600)))
@@ -1113,8 +1181,8 @@ async def phase_06_JSINTEL(outdir: Path, t: Tools, only: PhaseSet, skip: PhaseSe
             'TMPDIR=$(mktemp -d) || exit 1\n'
             'trap "rm -rf \'$TMPDIR\'" EXIT\n'
             'xargs -r -P 5 -I{} sh -c '
-            '\'timeout 180 linkfinder -i "$1" > "$TMPDIR/$(echo "$1" | md5sum | cut -d" " -f1).html" 2>/dev/null\' _ {} < "$IN" || true\n'
-            'cat "$TMPDIR"/*.html >> "$OUT" 2>/dev/null || true\n'
+             '\'timeout 180 linkfinder -i "$1" > "$TMPDIR/$(echo "$1" | md5sum | cut -d" " -f1).html"\' _ {} < "$IN"\n'
+            'cat "$TMPDIR"/*.html >> "$OUT"\n'
         )
         runner.chmod(0o755)
         jobs.append(("linkfinder", ["bash", str(runner)], _maybe_timeout(3600)))
@@ -1124,8 +1192,8 @@ async def phase_06_JSINTEL(outdir: Path, t: Tools, only: PhaseSet, skip: PhaseSe
         _xnlf_bin = "xnlinkfinder"
     elif t.has("xnLinkFinder"):
         _xnlf_bin = "xnLinkFinder"
+    xnlink_out = outdir / "urls_xnlinkfinder.txt"
     if _xnlf_bin:
-        xnlink_out = outdir / "urls_xnlinkfinder.txt"
         runner = outdir / "logs" / "xnlinkfinder_runner.sh"
         ensure(runner)
         runner.write_text(
@@ -1133,7 +1201,7 @@ async def phase_06_JSINTEL(outdir: Path, t: Tools, only: PhaseSet, skip: PhaseSe
             "set -eu\n"
             f"IN={shlex.quote(str(_js_input))}\n"
             f"OUT={shlex.quote(str(xnlink_out))}\n"
-            f'{_xnlf_bin} -i "$IN" -o "$OUT" -sp /tmp/xnlinkfinder 2>/dev/null || true\n'
+            f'{_xnlf_bin} -i "$IN" -o "$OUT" -sp /tmp/xnlinkfinder\n'
         )
         runner.chmod(0o755)
         jobs.append((_xnlf_bin, ["bash", str(runner)], _maybe_timeout(1200)))
@@ -1156,14 +1224,11 @@ async def phase_06_JSINTEL(outdir: Path, t: Tools, only: PhaseSet, skip: PhaseSe
                     "-o",
                     str(outdir / "nuclei_exposures.txt"),
                 ] + _extra_http_args() + _nuc_proxy,
-                _maybe_timeout(min(3000, 7200)),
+                min(_maybe_timeout(3000), 7200),
             )
         )
-    await run_parallel(jobs, outdir)
-    # Merge endpoints discovered by JS tools back into urls_all.txt so
-    # downstream phases (params, fuzz, authz) can discover fresh API surface.
-    # xnLinkFinder often discovers URLs embedded in JS (API routes, endpoints).
-    xnlink_out = outdir / "urls_xnlinkfinder.txt"
+    if jobs:
+        await run_parallel(jobs, outdir)
     if xnlink_out.exists() and read_lines(xnlink_out):
         merge_unique(
             [xnlink_out],
@@ -1210,6 +1275,8 @@ async def phase_07_PARAMS(
 ) -> Dict[str, Any]:
     if skip & {"07-PARAMS"}:
         return {}
+    if only and "07-PARAMS" not in only:
+        return {}
     _d_out = outdir / "params.txt"
     if _d_out.exists() and not force:
         return {"07-PARAMS": str(_d_out), "count": count_nonblank(_d_out)}
@@ -1219,6 +1286,10 @@ async def phase_07_PARAMS(
     for old in outdir.glob("params_*.txt"):
         if old.name != "params.txt":
             old.unlink(missing_ok=True)
+    # Also nuke old arjun JSON so a failed forced re-run doesn't
+    # silently reuse stale results from a previous successful run.
+    if force:
+        (outdir / "params_arjun.json").unlink(missing_ok=True)
     urls = outdir / "urls_all.txt"
     if not urls.exists() or not read_lines(urls):
         log("warn", "07-PARAMS: no URLs; skipping")
@@ -1236,21 +1307,20 @@ async def phase_07_PARAMS(
         if arjun_urls:
             arjun_had_input = True
             arjun_in.write_text("\n".join(arjun_urls) + "\n")
-            runner = outdir / "logs" / "arjun_runner.sh"
-            ensure(runner)
-            runner.write_text(
-                "#!/usr/bin/env bash\n"
-                "set -eu\n"
-                f"IN={shlex.quote(str(arjun_in))}\n"
-                f"OUT={shlex.quote(str(outdir / 'params_arjun.json'))}\n"
-                'arjun -i "$IN" -o "$OUT" 2>/dev/null || true\n'
-            )
-            runner.chmod(0o755)
+            arjun_cmd = [
+                "arjun", "-i", str(arjun_in), "-o", str(outdir / "params_arjun.json"),
+                "-T", "60", "--rate-limit", "50",
+                "--disable-redirects",
+            ]
+            _arjun_headers = _extra_headers_dict()
+            if _arjun_headers:
+                arjun_cmd += ["--headers", "\n".join(f"{k}: {v}" for k, v in _arjun_headers.items())]
             timeout = _maybe_timeout(600) if waf_detected else _maybe_timeout(1800)
-            jobs.append(("arjun", ["bash", str(runner)], timeout))
-            if waf_detected:
+            jobs.append(("arjun", arjun_cmd, timeout))
+            if waf_detected and sample_size < _PIPELINE_CFG.sample_urls_params:
                 log("info", f"07-PARAMS: WAF detected, reduced arjun sample to {sample_size} URLs with {timeout}s timeout")
-    await run_parallel(jobs, outdir)
+    if jobs:
+        await run_parallel(jobs, outdir)
     # Normalize arjun JSON output to plain URL-per-line text.
     raw = outdir / "params_arjun.json"
     if raw.exists():
@@ -1335,24 +1405,22 @@ async def phase_08_FUZZ(outdir: Path, t: Tools, only: PhaseSet, skip: PhaseSet, 
         wordlist = ""
     if t.has("ffuf") and wordlist:
         for u in sample:
+            parsed_u = urllib.parse.urlparse(u)
+            base_url = urllib.parse.urlunparse((
+                parsed_u.scheme, parsed_u.netloc,
+                parsed_u.path.rstrip("/"), None, None, None,
+            ))
             out_json = outdir / f"ffuf_{safe_suffix(u)}.json"
             jobs.append(
                 (
                     f"ffuf-{_safe_name(u)}",
                     [
-                        "ffuf",
-                        "-s",
-                        "-ac",
-                        "-u",
-                        u.rstrip("/") + "/FUZZ",
-                        "-w",
-                        wordlist,
-                        "-mc",
-                        "200,301,302,403",
-                        "-o",
-                        str(out_json),
-                    ]
-                    + _proxy_opt + _extra_http_args(),
+                        "ffuf", "-s", "-ac",
+                        "-u", base_url + "/FUZZ",
+                        "-w", wordlist,
+                        "-mc", "200,301,302,403",
+                        "-o", str(out_json),
+                    ] + _proxy_opt + _extra_http_args(),
                     _ffuf_timeout,
                 )
             )
@@ -1360,42 +1428,48 @@ async def phase_08_FUZZ(outdir: Path, t: Tools, only: PhaseSet, skip: PhaseSet, 
         # using a lightweight wordlist (common.txt) with the -e flag.
         ext_wordlist = os.environ.get(
             "FFUF_EXT_WORDLIST",
-            "/usr/share/seclists/Discovery/Web-Content/common.txt",
+            str(_seclists_base / "Discovery/Web-Content/common.txt"),
         )
         if Path(ext_wordlist).exists():
             for u in sample:
+                parsed_u = urllib.parse.urlparse(u)
+                base_url = urllib.parse.urlunparse((
+                    parsed_u.scheme, parsed_u.netloc,
+                    parsed_u.path.rstrip("/"), None, None, None,
+                ))
                 out_json = outdir / f"ffuf_ext_{safe_suffix(u)}.json"
                 jobs.append(
                     (
                         f"ffuf-ext-{_safe_name(u)}",
                         [
                             "ffuf", "-s", "-ac",
-                            "-u", u.rstrip("/") + "/FUZZ",
+                            "-u", base_url + "/FUZZ",
                             "-w", ext_wordlist,
                             "-e", ".php,.json,.bak,.old,.swp,.txt,.xml,.tar.gz,.zip",
                             "-mc", "200,301,302,403",
                             "-o", str(out_json),
-                        ]
-                        + _proxy_opt + _extra_http_args(),
+                        ] + _proxy_opt + _extra_http_args(),
                         _ffuf_ext_timeout,
                     )
                 )
 
-    # Clean up stale normalized .txt files from prior runs first
-    for old in outdir.glob("ffuf_*.txt"):
-        old.unlink(missing_ok=True)
-    await run_parallel(jobs, outdir)
-    normalized: List[Path] = []
-    for ffp in outdir.glob("ffuf_*.json"):
-        norm = ffp.with_suffix(".txt")
-        ensure(norm).write_text("\n".join(_extract_urls_from_ffuf_json(ffp)) + "\n")
-        normalized.append(norm)
-    n = merge_unique(normalized, outdir / "fuzz.txt")
-    for p in outdir.glob("ffuf_*.json"):
-        p.unlink(missing_ok=True)
-    if n == 0:
-        log("warn", "08-FUZZ: fuzzers produced no hits")
-    return {"08-FUZZ": str(outdir / "fuzz.txt"), "count": n}
+    if jobs:
+        for old in outdir.glob("ffuf_*.txt"):
+            old.unlink(missing_ok=True)
+        await run_parallel(jobs, outdir)
+        normalized: List[Path] = []
+        for ffp in outdir.glob("ffuf_*.json"):
+            norm = ffp.with_suffix(".txt")
+            ensure(norm).write_text("\n".join(_extract_urls_from_ffuf_json(ffp)) + "\n")
+            normalized.append(norm)
+        n = merge_unique(normalized, outdir / "fuzz.txt")
+        for p in outdir.glob("ffuf_*.json"):
+            p.unlink(missing_ok=True)
+        if n == 0:
+            log("warn", "08-FUZZ: fuzzers produced no hits")
+        return {"08-FUZZ": str(outdir / "fuzz.txt"), "count": n}
+    log("info", "08-FUZZ: ffuf not available or no wordlist; keeping prior fuzz results")
+    return {"08-FUZZ": str(outdir / "fuzz.txt"), "count": count_nonblank(_f_out)}
 
 
 async def _update_nuclei_templates(outdir: Path) -> None:
@@ -1412,18 +1486,26 @@ async def _update_nuclei_templates(outdir: Path) -> None:
         except (ValueError, OSError):
             pass
     log("info", "09-VULNSCAN: updating nuclei templates…")
+    _nu_cmd = ["nuclei", "-update-templates", "-silent"]
+    if _PIPELINE_CFG.proxy:
+        _nu_cmd += ["-proxy", _PIPELINE_CFG.proxy]
+    _nu_cmd = _proxify_cmd(_nu_cmd)
     proc = await asyncio.create_subprocess_exec(
-        "nuclei", "-update-templates", "-silent",
+        *_nu_cmd,
         stdin=asyncio.subprocess.DEVNULL,
         stdout=asyncio.subprocess.DEVNULL,
         stderr=asyncio.subprocess.DEVNULL,
     )
     try:
-        await asyncio.wait_for(proc.wait(), timeout=120)
-        cache_stamp.write_text(str(time.time()))
+        rc = await asyncio.wait_for(proc.wait(), timeout=120)
+        if rc == 0:
+            cache_stamp.write_text(str(time.time()))
+        else:
+            log("warn", f"nuclei -update-templates returned {rc}")
     except asyncio.TimeoutError:
         proc.kill()
         await proc.wait()
+        log("warn", "nuclei -update-templates timed out")
 
 
 async def phase_09_VULNSCAN(outdir: Path, t: Tools, only: PhaseSet, skip: PhaseSet, force: bool = False) -> Dict[str, Any]:
@@ -1474,16 +1556,23 @@ async def phase_09_VULNSCAN(outdir: Path, t: Tools, only: PhaseSet, skip: PhaseS
         )
         # Headless scan for DOM-based / client-side issues (needs nuclei with
         # headless engine — silently skipped if unsupported).
-        jobs.append(
-            (
-                "nuclei-headless",
-                nuclei_base
-                + ["-headless", "-tags", "headless", "-severity", "medium,high,critical",
-                   "-o", str(outdir / "nuclei_headless.txt")]
-                + _proxy_opt,
-                3600,
-            )
+        _has_browser = any(
+            shutil.which(b) for b in
+            ("google-chrome", "chromium-browser", "chromium", "chrome", "google-chrome-stable")
         )
+        if _has_browser:
+            jobs.append(
+                (
+                    "nuclei-headless",
+                    nuclei_base
+                    + ["-headless", "-tags", "headless", "-severity", "medium,high,critical",
+                       "-o", str(outdir / "nuclei_headless.txt")]
+                    + _proxy_opt,
+                    3600,
+                )
+            )
+        else:
+            log("info", "nuclei-headless: no Chrome/Chromium found; skipping")
         # tech-scanner uses the same nuclei binary; do not double-gate on httpx.
         jobs.append(
             (
@@ -1537,7 +1626,9 @@ async def phase_10_TLSCMS(outdir: Path, t: Tools, only: PhaseSet, skip: PhaseSet
                 f"OUT={shlex.quote(str(per_host))}\n"
                 f"H={shlex.quote(h)}\n"
                 f"BIN={shlex.quote(testssl_bin)}\n"
-                '"$BIN" --quiet --color 0 "$H" > "$OUT" 2>&1 || true\n'
+                '# testssl expects a bare hostname, not a URL — strip scheme\n'
+                'HOST=$(echo "$H" | sed "s|^https\\?://||" | sed "s|/.*$||")\n'
+                '"$BIN" --quiet --color 0 "$HOST" > "$OUT" 2>&1\n'
             )
             runner.chmod(0o755)
             testssl_jobs.append((f"testssl-{_safe_name(h)}", ["bash", str(runner)], 3600))
@@ -1861,16 +1952,6 @@ async def phase_11_INJECT(
     elif oast_domain and ssrf_urls:
         log("warn", "11-INJECT: interactsh domain has unsafe characters, skipping SSRF probes")
     await run_parallel(jobs, outdir)
-    # Extract actual SQLi findings from sqlmap output instead of dumping raw log
-    sqlmap_findings: List[str] = []
-    sqlmap_log = outdir / "sqlmap.log"
-    if sqlmap_log.exists():
-        for ln in read_lines(sqlmap_log):
-            lower = ln.lower()
-            if any(kw in lower for kw in ("sql injection", "parameter", "payload:", "type: ", "title:")):
-                sqlmap_findings.append(ln)
-    if sqlmap_findings:
-        ensure(outdir / "sqlmap_findings.txt").write_text("\n".join(sqlmap_findings) + "\n")
     # LDAP injection probes on param-bearing URLs
     ldap_findings: List[str] = []
     _ld_urlopen = _get_urlopener()
@@ -2000,7 +2081,7 @@ async def phase_11b_SQLMAP(
             f'sqlmap -m "$IN" --batch --level={_PIPELINE_CFG.sqlmap_level} --risk={_PIPELINE_CFG.sqlmap_risk} --random-agent '
             f'--delay={max(_PIPELINE_CFG.delay, 2)} --time-sec=10 '
             f'{_sql_extra}'
-            f' --output-dir="$DIR" > "{shlex.quote(str(outdir / "sqlmap_11b.log"))}" 2>&1 || true\n'
+             f' --output-dir="$DIR" > "{shlex.quote(str(outdir / "sqlmap_11b.log"))}" 2>&1\n'
         )
         runner.chmod(0o755)
         await _run("sqlmap-11b", ["bash", str(runner)], 7200, outdir)
@@ -2226,7 +2307,10 @@ async def phase_14_ORIGIN(
     # 3. MX records (often not proxied by Cloudflare)
     # Use public DNS resolver to avoid local stub resolver issues over proxychains
     mx_file = outdir / "mx_records.txt"
-    _DNS_RESOLVER = os.environ.get("DNS_RESOLVER", "@8.8.8.8")
+    _DNS_RESOLVER = "@8.8.8.8"
+    _raw_dns_resolver = os.environ.get("DNS_RESOLVER", "")
+    if _raw_dns_resolver and re.match(r'^@[A-Za-z0-9.\-:\[\]]+$', _raw_dns_resolver):
+        _DNS_RESOLVER = _raw_dns_resolver
     if t.has("dig"):
         _dig_cmd = _proxify_cmd(["dig", "+short", _DNS_RESOLVER, "mx", domain])
         proc = await asyncio.create_subprocess_exec(
@@ -2452,7 +2536,7 @@ async def phase_15_SECRETS(outdir: Path, t: Tools, only: PhaseSet, skip: PhaseSe
             f"OUT={shlex.quote(str(unfurl_out))}\n"
             'cat "$IN" | unfurl paths >> "$OUT" 2>/dev/null\n'
             'cat "$IN" | unfurl keys >> "$OUT" 2>/dev/null\n'
-            'cat "$IN" | unfurl values >> "$OUT" 2>/dev/null || true\n'
+            'cat "$IN" | unfurl values >> "$OUT"\n'
         )
         runner.chmod(0o755)
         unfurl_jobs: List[Tuple[str, List[str], int]] = []
@@ -2544,7 +2628,7 @@ async def phase_15_SECRETS(outdir: Path, t: Tools, only: PhaseSet, skip: PhaseSe
                     "set -eu\n"
                     f"IN={shlex.quote(str(jf))}\n"
                     f"OUT={shlex.quote(str(truffle_out))}\n"
-                    'trufflehog filesystem "$IN" --no-verification 2>/dev/null > "$OUT" || true\n'
+                    'trufflehog filesystem "$IN" --no-verification > "$OUT"\n'
                 )
                 truffle_runner.chmod(0o755)
                 truffle_jobs.append((
@@ -2728,7 +2812,7 @@ async def phase_16A_AUTHZ(outdir: Path, t: Tools, only: PhaseSet, skip: PhaseSet
             "set -eu\n"
             f"IN={shlex.quote(str(qsreplace_in))}\n"
             f"OUT={shlex.quote(str(qsreplace_out))}\n"
-            'cat "$IN" | qsreplace "evil" > "$OUT" 2>/dev/null || true\n'
+            'cat "$IN" | qsreplace "evil" > "$OUT"\n'
         )
         runner.chmod(0o755)
         await _run(
@@ -3225,7 +3309,7 @@ async def phase_18_CLOUD(
             f"OUT={shlex.quote(str(cloudfox_outdir))}\n"
             '# Try common AWS profiles; silently skip if no credentials\n'
             'for profile in default dev staging prod; do\n'
-            '  cloudfox aws -p "$profile" --output-dir "$OUT" 2>/dev/null || true\n'
+            '  cloudfox aws -p "$profile" --output-dir "$OUT"\n'
             'done\n'
         )
         runner.chmod(0o755)
@@ -3345,7 +3429,7 @@ async def phase_19_GIT(
                         "set -eu\n"
                         f"DIR={shlex.quote(str(dump_dir))}\n"
                         f"OUT={shlex.quote(str(truffle_out))}\n"
-                        'trufflehog filesystem "$DIR" --no-verification 2>/dev/null > "$OUT" || true\n'
+                        'trufflehog filesystem "$DIR" --no-verification > "$OUT"\n'
                     )
                     runner.chmod(0o755)
                     await _run(
@@ -3366,6 +3450,29 @@ async def phase_19_GIT(
 
 
 # ────────────────── Phase 20-GRAPHQL: GraphQL Introspection ──────────────────
+
+
+async def _gql_precheck(url: str, timeout: int = 10) -> bool:
+    """Quick probe: POST a minimal GraphQL query and check for GraphQL-like response.
+    Returns True if the endpoint likely speaks GraphQL."""
+    probe_query = '{"query":"{ __typename }"}'
+    try:
+        req = urllib.request.Request(
+            url, method="POST",
+            data=probe_query.encode(),
+            headers={"Content-Type": "application/json", "User-Agent": "Mozilla/5.0"},
+        )
+        opener = _get_urlopener()
+        status, _, body_bytes = await _async_urlopen(opener, req, timeout=timeout)
+        if status != 200:
+            return False
+        body = body_bytes.decode("utf-8", errors="ignore")
+        # GraphQL responses contain 'data', 'errors', or '__typename'
+        return '"data"' in body or '"errors"' in body or '__typename' in body
+    except Exception:
+        return False
+
+
 _GRAPHQL_ENDPOINTS = [
     "/graphql", "/gql", "/v1/graphql", "/v2/graphql",
     "/api/graphql", "/api/gql", "/graph", "/query",
@@ -3405,78 +3512,98 @@ async def phase_20_GRAPHQL(
     if not targets:
         log("warn", "Phase 20-GRAPHQL: no HTTP targets; skipping")
         return {"20-GRAPHQL": str(_o_out), "count": 0}
-    # inql integration
-    if t.has("inql"):
+
+    # ── Smart pre-check: probe all target×endpoint combos in parallel ──
+    # Only run expensive tools (inql, clairvoyance, graphinder) on endpoints
+    # that actually respond with GraphQL-like content, avoiding timeouts
+    # on non-existent or WAF-blocked endpoints.
+    async def _alive_gql_endpoints() -> List[str]:
+        alive: List[str] = []
+        probe_urls = [f"{tgt}{ep}" for tgt in targets for ep in _GRAPHQL_ENDPOINTS]
+        probe_tasks = []
+        for url in probe_urls:
+            probe_tasks.append(_gql_precheck(url))
+        results = await asyncio.gather(*probe_tasks, return_exceptions=True)
+        for url, ok in zip(probe_urls, results):
+            if ok and not isinstance(ok, Exception):
+                alive.append(url)
+        return alive
+
+    _live_gql = await _alive_gql_endpoints()
+    if _live_gql:
+        log("ok", f"20-GRAPHQL: {len(_live_gql)} responsive GraphQL endpoint(s) found")
+        for u in _live_gql:
+            findings.append(f"[alive] {u}")
+
+    # inql integration (only on live endpoints)
+    if t.has("inql") and _live_gql:
         inql_out = outdir / "inql_results"
         inql_out.mkdir(parents=True, exist_ok=True)
-        for tgt in targets:
-            for ep in _GRAPHQL_ENDPOINTS:
-                url = f"{tgt}{ep}"
-                runner = outdir / "logs" / f"inql_{_safe_name(url)}_runner.sh"
-                ensure(runner)
-                runner.write_text(
-                    "#!/usr/bin/env bash\n"
-                    "set -eu\n"
-                    f"URL={shlex.quote(url)}\n"
-                    f"OUT={shlex.quote(str(inql_out))}\n"
-                    'inql -t "$URL" -o "$OUT" 2>/dev/null || true\n'
-                )
-                runner.chmod(0o755)
-                await _run(
-                    f"inql-{_safe_name(url)}",
-                    ["bash", str(runner)],
-                    300, outdir,
-                )
-    # Clairvoyance GraphQL introspection abuse
-    if t.has("clairvoyance"):
-        clairvoyance_out = outdir / "clairvoyance_results"
-        clairvoyance_out.mkdir(parents=True, exist_ok=True)
-        for tgt in targets:
-            for ep in _GRAPHQL_ENDPOINTS:
-                url = f"{tgt}{ep}"
-                cv_out = clairvoyance_out / f"{_safe_name(url)}.json"
-                runner = outdir / "logs" / f"clairvoyance_{_safe_name(url)}_runner.sh"
-                ensure(runner)
-                runner.write_text(
-                    "#!/usr/bin/env bash\n"
-                    "set -eu\n"
-                    f"URL={shlex.quote(url)}\n"
-                    f"OUT={shlex.quote(str(cv_out))}\n"
-                    'clairvoyance "$URL" -o "$OUT" 2>/dev/null || true\n'
-                )
-                runner.chmod(0o755)
-                await _run(
-                    f"clairvoyance-{_safe_name(url)}",
-                    ["bash", str(runner)],
-                    300, outdir,
-                )
-        cv_reports = list(clairvoyance_out.glob("*.json"))
-        if cv_reports:
-            findings.append(f"[clairvoyance] {len(cv_reports)} schema reports → {clairvoyance_out}")
-    # Graphinder GraphQL endpoint discovery
-    if t.has("graphinder"):
-        graphinder_out = outdir / "graphinder_results"
-        graphinder_out.mkdir(parents=True, exist_ok=True)
-        for tgt in targets:
-            runner = outdir / "logs" / f"graphinder_{_safe_name(tgt)}_runner.sh"
-            out_file = graphinder_out / f"{_safe_name(tgt)}.json"
+        inql_jobs: List[Tuple[str, List[str], int]] = []
+        for url in _live_gql:
+            runner = outdir / "logs" / f"inql_{_safe_name(url)}_runner.sh"
             ensure(runner)
             runner.write_text(
                 "#!/usr/bin/env bash\n"
                 "set -eu\n"
-                f"TARGET={shlex.quote(tgt)}\n"
-                f"OUT={shlex.quote(str(out_file))}\n"
-                'graphinder -t "$TARGET" -o "$OUT" 2>/dev/null || true\n'
+                f"URL={shlex.quote(url)}\n"
+                f"OUT={shlex.quote(str(inql_out))}\n"
+                'inql -t "$URL" -o "$OUT"\n'
             )
             runner.chmod(0o755)
-            await _run(
-                f"graphinder-{_safe_name(tgt)}",
-                ["bash", str(runner)],
-                300, outdir,
+            inql_jobs.append((f"inql-{_safe_name(url)}", ["bash", str(runner)], 300))
+        if inql_jobs:
+            await run_parallel(inql_jobs, outdir)
+
+    # Clairvoyance GraphQL introspection abuse (only on live endpoints)
+    if t.has("clairvoyance") and _live_gql:
+        clairvoyance_out = outdir / "clairvoyance_results"
+        clairvoyance_out.mkdir(parents=True, exist_ok=True)
+        cv_jobs: List[Tuple[str, List[str], int]] = []
+        for url in _live_gql:
+            cv_out = clairvoyance_out / f"{_safe_name(url)}.json"
+            runner = outdir / "logs" / f"clairvoyance_{_safe_name(url)}_runner.sh"
+            ensure(runner)
+            runner.write_text(
+                "#!/usr/bin/env bash\n"
+                "set -eu\n"
+                f"URL={shlex.quote(url)}\n"
+                f"OUT={shlex.quote(str(cv_out))}\n"
+                'clairvoyance "$URL" -o "$OUT"\n'
             )
+            runner.chmod(0o755)
+            cv_jobs.append((f"clairvoyance-{_safe_name(url)}", ["bash", str(runner)], 300))
+        if cv_jobs:
+            await run_parallel(cv_jobs, outdir)
+        cv_reports = list(clairvoyance_out.glob("*.json"))
+        if cv_reports:
+            findings.append(f"[clairvoyance] {len(cv_reports)} schema reports → {clairvoyance_out}")
+
+    # Graphinder GraphQL endpoint discovery (only on live endpoints)
+    if t.has("graphinder") and _live_gql:
+        graphinder_out = outdir / "graphinder_results"
+        graphinder_out.mkdir(parents=True, exist_ok=True)
+        gi_jobs: List[Tuple[str, List[str], int]] = []
+        for url in _live_gql:
+            runner = outdir / "logs" / f"graphinder_{_safe_name(url)}_runner.sh"
+            out_file = graphinder_out / f"{_safe_name(url)}.json"
+            ensure(runner)
+            runner.write_text(
+                "#!/usr/bin/env bash\n"
+                "set -eu\n"
+                f"URL={shlex.quote(url)}\n"
+                f"OUT={shlex.quote(str(out_file))}\n"
+                'DOMAIN=$(echo "$URL" | sed "s|^https\\?://||" | sed "s|/.*$||")\n'
+                'graphinder --domain "$DOMAIN" --output-file "$OUT"\n'
+            )
+            runner.chmod(0o755)
+            gi_jobs.append((f"graphinder-{_safe_name(url)}", ["bash", str(runner)], 300))
+        if gi_jobs:
+            await run_parallel(gi_jobs, outdir)
         gi_reports = list(graphinder_out.glob("*.json"))
         if gi_reports:
             findings.append(f"[graphinder] {len(gi_reports)} endpoint reports → {graphinder_out}")
+
     # Custom introspection probes (no-redirect to avoid following redirects away from the endpoint)
     _gql_no_redirect = _get_no_redirect_urlopener()
     async def _probe_graphql(url: str) -> List[str]:
@@ -3603,9 +3730,12 @@ async def phase_21_WAF(
              "-o", str(waf_out), "-a"],
             600, outdir,
         )
-        if waf_out.exists():
+        if waf_out.exists() and waf_out.stat().st_size > 0:
             for ln in read_lines(waf_out):
                 findings.append(f"[wafw00f] {ln}")
+        elif waf_out.exists():
+            waf_out.unlink(missing_ok=True)
+            log("warn", "wafw00f: output file is empty (target unreachable or crashed)")
     # Custom passive WAF detection (check response headers and body)
     async def _passive_waf_check(url: str) -> List[str]:
         results: List[str] = []
@@ -3944,7 +4074,7 @@ async def phase_24_JWT(
                     if alg == "RS256":
                         try:
                             import hmac as _hmac
-                            hmac_sig = _hmac.new(b"-----BEGIN PUBLIC KEY-----\nMIGfMA0GCSqGSIb3DQEBAQUAA4GNADCBiQKBgQC", (parts[0] + "." + parts[1]).encode(), "sha256").digest()
+                            _hmac.new(b"-----BEGIN PUBLIC KEY-----\nMIGfMA0GCSqGSIb3DQEBAQUAA4GNADCBiQKBgQC", (parts[0] + "." + parts[1]).encode(), "sha256").digest()
                             results.append(f"[jwt-alg-confusion-test] try RS256→HS256 with public key as HMAC secret on {url}")
                         except Exception:
                             pass
@@ -4066,7 +4196,7 @@ async def phase_26_CMDINJECT(
                 "set -eu\n"
                 f"URL={shlex.quote(u)}\n"
                 f"OUT={shlex.quote(str(commix_outdir))}\n"
-                'commix -u "$URL" --batch --output-dir="$OUT" 2>/dev/null || true\n'
+                'commix -u "$URL" --batch --output-dir="$OUT"\n'
             )
             runner.chmod(0o755)
             await _run(
@@ -4602,7 +4732,7 @@ async def phase_33_CRLF(
             "set -eu\n"
             f"IN={shlex.quote(str(crlfuzz_in))}\n"
             f"OUT={shlex.quote(str(crlfuzz_out))}\n"
-            'crlfuzz -l "$IN" -o "$OUT" 2>/dev/null || true\n'
+            'crlfuzz -l "$IN" -o "$OUT"\n'
         )
         runner.chmod(0o755)
         await _run("crlfuzz", ["bash", str(runner)], 600, outdir)
@@ -4725,7 +4855,7 @@ async def phase_35_CORSADV(
             "set -eu\n"
             f"IN={shlex.quote(str(corsy_in))}\n"
             f"OUT={shlex.quote(str(corsy_out))}\n"
-            'corsy -i "$IN" -o "$OUT" 2>/dev/null || true\n'
+            'corsy -i "$IN" -o "$OUT"\n'
         )
         runner.chmod(0o755)
         await _run("corsy", ["bash", str(runner)], 600, outdir)
@@ -4747,8 +4877,7 @@ async def phase_35_CORSADV(
             _, ch, _ = await _async_urlopen_no_redirect(_cors_urlopen, req, timeout=8)
             acao = ch.get("Access-Control-Allow-Origin", "")
             acac = ch.get("Access-Control-Allow-Credentials", "")
-            acm = ch.get("Access-Control-Allow-Methods", "")
-            ach = ch.get("Access-Control-Allow-Headers", "")
+
             if origin in acao or "*" in acao:
                 creds = " with credentials" if acac == "true" else ""
                 return f"[cors-misconfig] {url} ACAO={acao} origin={origin}{creds}"
@@ -5001,7 +5130,11 @@ async def phase_38_SMUGGLE(
             "set -eu\n"
             f"IN={shlex.quote(str(smuggler_in))}\n"
             f"OUT={shlex.quote(str(smuggler_out))}\n"
-            'smuggler -l "$IN" -o "$OUT" 2>/dev/null || true\n'
+            'while IFS= read -r url; do\n'
+            '  [ -z "$url" ] && continue\n'
+            '  safe=$(echo "$url" | tr -c "a-zA-Z0-9" "_")\n'
+            '  smuggler -u "$url" --no-color > "$OUT/${safe}_smuggler.txt" || true\n'
+            'done < "$IN"\n'
         )
         runner.chmod(0o755)
         await _run("smuggler", ["bash", str(runner)], 600, outdir)
@@ -5030,8 +5163,6 @@ async def phase_38_SMUGGLE(
                     import ssl as _ssl
                     if port == 443:
                         ctx = _ssl.create_default_context()
-                        ctx.check_hostname = False
-                        ctx.verify_mode = _ssl.CERT_NONE
                         sock = ctx.wrap_socket(sock, server_hostname=host_clean)
                     sock.connect((host_clean, port))
                     sock.sendall(payload.encode())
@@ -5109,13 +5240,11 @@ async def phase_39_OAUTH(
                 headers={"User-Agent": "Mozilla/5.0", **_oa_extra_headers})
             s, h, _ = await _async_urlopen_no_redirect(_oa_urlopen, req, timeout=8)
             if s in (200, 201, 302, 301, 405):
-                body_text = ""
                 if s not in (302, 301):
                     try:
                         req2 = urllib.request.Request(ep_url, method="GET",
                             headers={"User-Agent": "Mozilla/5.0", **_oa_extra_headers})
-                        _, _, b2 = await _async_urlopen_no_redirect(_oa_urlopen, req2, timeout=8)
-                        body_text = b2.decode("utf-8", errors="ignore")
+                        _, _, _ = await _async_urlopen_no_redirect(_oa_urlopen, req2, timeout=8)
                     except Exception:
                         pass
                 return f"[oauth-endpoint] {ep_url} -> HTTP {s}"
@@ -5205,7 +5334,6 @@ async def phase_40_PWRESET(
             req = urllib.request.Request(ep_url, method="GET",
                 headers={"User-Agent": "Mozilla/5.0", **_pw_extra_headers})
             s, h, b = await _async_urlopen_no_redirect(_pw_urlopen, req, timeout=8)
-            body_text = b.decode("utf-8", errors="ignore")
             if s in (200, 201, 302, 301):
                 findings.append(f"[pwreset-endpoint] {ep_url} -> HTTP {s}")
                 for pname in _PWRESET_EMAIL_PARAMS:
@@ -5293,8 +5421,6 @@ async def phase_41_WEBSOCKET(
                             pass
                     if scheme == "wss":
                         ctx = _ssl.create_default_context()
-                        ctx.check_hostname = False
-                        ctx.verify_mode = _ssl.CERT_NONE
                         sock = ctx.wrap_socket(sock, server_hostname=host_clean)
                     sock.connect((host_clean, port))
                     ws_key = _b64.b64encode(os.urandom(16)).decode()

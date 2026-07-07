@@ -48,7 +48,7 @@ def _banner() -> None:
 {C["r"]}
 {C["g"]}   ╔══════════════════════════════════════════════════════╗
 {C["g"]}   ║  {C["c"]}ReconChain v{__version__}{C["g"]}  —  {C["y"]}Bug Bounty Recon & Vuln Pipeline{C["g"]}   ║
-{C["g"]}   ║  {C["d"]}41+ tools  |  71 phases  |  DAG stages  |  Resumable{C["g"]}   ║
+{C["g"]}   ║  {C["d"]}41+ tools  |  73 phases  |  DAG stages  |  Resumable{C["g"]}   ║
 {C["g"]}   ╚══════════════════════════════════════════════════════╝{C["r"]}
 """
     print(banner, flush=True)
@@ -82,6 +82,8 @@ def interactive_setup() -> argparse.Namespace:
     sample_fuzz = _prompt("Number of URLs to fuzz (enter 'all' for every URL, more = thorough but slow)", default="5", validator=_validate_count, error_msg="Enter a positive number or 'all'")
     sample_params = _prompt("Number of URLs for parameter discovery (enter 'all' for every URL, more = thorough but slow)", default="50", validator=_validate_count, error_msg="Enter a positive number or 'all'")
     speed = _prompt_yes_no("Fast mode — reduce sample sizes for quicker scans (thorough but slow by default)", default=False)
+    print(f"\n{C['b']}Reporting:{C['r']}")
+    report_format = _prompt("Report format (html, md, json, sarif)", default="html", validator=lambda v: v in ("html", "md", "json", "sarif"), error_msg="Enter html, md, json, or sarif")
     print(f"\n{C['b']}Authentication:{C['r']}")
     cookie = _prompt("Cookie string (e.g. 'session=abc123'), or leave empty", default="")
     extra_headers_raw = _prompt("Extra HTTP headers, comma-separated (e.g. 'Authorization: Bearer xyz,X-Custom: val'), or leave empty", default="")
@@ -104,6 +106,7 @@ def interactive_setup() -> argparse.Namespace:
             ("19-GIT", "Git exposure scanning (.git + trufflehog)"),
             ("20-GRAPHQL", "GraphQL introspection + schema analysis + deep probes"),
             ("21-WAF", "WAF detection (50+ vendor signatures)"),
+            ("21b-WAFBYPASS", "WAF bypass technique testing (Cloudflare, Akamai, AWS WAF, ModSecurity)"),
             ("22-NOSQLI", "NoSQL injection probes"),
             ("23-RACE", "Race condition detection"),
             ("24-JWT", "JWT token analysis"),
@@ -147,6 +150,7 @@ def interactive_setup() -> argparse.Namespace:
             ("61-OAUTH-ADV", "OAuth redirect_uri bypass variants"),
             ("62-LOG-INJECT", "Log injection / log forging detection"),
             ("63-DOC-ATTACK", "Document-based attacks (DDE, macro, XXE, SVG-XSS)"),
+            ("64-IDEMPOTENCY", "Idempotency key replay testing (POST endpoints)"),
         ]
         print(f"\n{C['b']}Additional phases:{C['r']}")
         for p, desc in _all_extra:
@@ -181,6 +185,7 @@ def interactive_setup() -> argparse.Namespace:
     print(f"   Extra headers:    {C['y']}{len(extra_headers_list)} set{C['r']}")
     print(f"   Resume:           {C['y']}{'yes' if resume else 'no'}{C['r']}")
     print(f"   Force:            {C['y']}{'yes' if force else 'no'}{C['r']}")
+    print(f"   Report:           {C['y']}{report_format}{C['r']}")
     print(f"   Fast mode:        {C['y']}{'yes' if speed else 'no'}{C['r']}")
     print(f" {C['b']}{'─' * 60}{C['r']}")
     if not _prompt_yes_no("Start scan", default=True):
@@ -215,6 +220,7 @@ def interactive_setup() -> argparse.Namespace:
     ns.extra_headers = extra_headers_list if extra_headers_list else []
     ns.daemon = False
     ns.status = ""
+    ns.format = report_format
     ns.sample_urls_nosqli = 30
     ns.sample_endpoints_race = 10
     ns.sample_hosts_jwt = 20
@@ -345,6 +351,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--sample-hosts-websocket", type=int, default=10, help="number of hosts for WebSocket testing (default: 10)")
     p.add_argument("--sample-urls-ldap", type=int, default=20, help="number of URLs for LDAP injection testing (default: 20)")
     p.add_argument("--sample-endpoints-deserial", type=int, default=10, help="number of API endpoints for deserialization testing (default: 10)")
+    p.add_argument("--format", type=str, default="html", choices=["html", "md", "json", "sarif"], help="report format (default: html; sarif produces results.sarif for GitHub/GitLab CI)")
     p.add_argument("--daemon", action="store_true", help="run in background; check progress with --status <domain>")
     p.add_argument("--status", type=str, default="", help="show live progress of a running scan (provide domain name, or 'list' to show all active scans)")
     return p

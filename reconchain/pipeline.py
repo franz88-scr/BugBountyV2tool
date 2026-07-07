@@ -22,8 +22,10 @@ from reconchain.process import (
     _maybe_timeout, _atomic_write_json, _update_nuclei_templates,
 )
 from reconchain.reporting import (
-    _counts, write_summary, write_html, write_markdown, write_full_summary,
+    _counts, _coverage, write_summary, write_html, write_markdown,
+    write_full_summary, write_sarif,
 )
+from reconchain.config import VALID_PHASES
 from reconchain.tools import Tools
 from reconchain.utils import (
     Progress, ScanStatus, ensure, log, read_lines,
@@ -348,6 +350,7 @@ async def run_pipeline(args: argparse.Namespace) -> int:
             except Exception as _gw_exc:
                 log("warn", f"gowitness failed: {_gw_exc}")
         try:
+            state["coverage"] = _coverage(outdir, phases_to_run)
             sj = write_summary(outdir, args.domain, state, counts)
             if sj.exists():
                 try:
@@ -364,6 +367,10 @@ async def run_pipeline(args: argparse.Namespace) -> int:
             log("ok", f"report  → {hj}")
             log("ok", f"report  → {mj}")
             log("ok", f"details → {tj}")
+            report_format = getattr(args, 'format', 'html')
+            if report_format == "sarif":
+                sj_path = write_sarif(outdir, args.domain, counts, state)
+                log("ok", f"sarif   → {sj_path}")
         except Exception as _rep_exc:
             log("warn", f"report generation failed: {_rep_exc}")
         progress.close()

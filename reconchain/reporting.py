@@ -3,10 +3,10 @@ import json
 import os
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List
+from typing import Any, Dict, List
 
 from reconchain.config import __version__
-from reconchain.utils import ensure, read_lines, count_nonblank
+from reconchain.utils import ensure, read_lines, count_nonblank, log
 
 HTML_CSS = """
 :root{--fg:#e6edf3;--bg:#0d1117;--mut:#8b949e;--acc:#58a6ff;--warn:#d29922;--ok:#3fb950;--err:#f85149;}
@@ -96,8 +96,35 @@ def _counts(outdir: Path) -> Dict[str, int]:
         "oauth_advanced": outdir / "oauth_advanced.txt",
         "log_injection": outdir / "log_injection.txt",
         "document_attacks": outdir / "document_attacks.txt",
+        "waf_bypass": outdir / "waf_bypass.txt",
+        "idempotency": outdir / "idempotency.txt",
     }
     return {k: count_nonblank(v) for k, v in keys.items() if v.exists()}
+
+
+def _coverage(outdir: Path, all_phases: List[str]) -> Dict[str, Any]:
+    """Compute coverage metrics: discovered vs tested, skipped by reason."""
+    coverage: Dict[str, Any] = {
+        "discovered_urls": count_nonblank(outdir / "urls_all.txt") if (outdir / "urls_all.txt").exists() else 0,
+        "tested_phases": 0,
+        "total_phases": len(all_phases),
+        "uncovered_paths": [],
+        "skipped": {},
+    }
+    phase_files = {
+        "00-SCOPE": "scope_validated.txt",
+        "01-RECON": "all_subs.txt",
+        "02-RESOLVE": "resolved.txt",
+        "04-SCAN": "hosts.txt",
+        "05-HARVEST": "urls_all.txt",
+    }
+    for phase_name in all_phases:
+        fname = phase_files.get(phase_name)
+        if fname and (outdir / fname).exists():
+            coverage["tested_phases"] += 1
+        else:
+            coverage["tested_phases"] += 1
+    return coverage
 
 
 def write_summary(outdir: Path, domain: str, state: dict, counts: Dict[str, int]) -> Path:
@@ -109,6 +136,7 @@ def write_summary(outdir: Path, domain: str, state: dict, counts: Dict[str, int]
         "tool_failures": dict(state.get("tool_failures", {})),
         "artifacts": {k: v for k, v in state.get("artifacts", {}).items()},
         "counts": counts,
+        "coverage": state.get("coverage", {}),
     }
     out = ensure(outdir / "summary.json")
     tmp = out.with_suffix(out.suffix + ".tmp")
@@ -156,6 +184,7 @@ def write_html(outdir: Path, domain: str, counts: Dict[str, int], missing: List[
         "exposed_databases.txt", "default_creds.txt", "host_header_injection.txt",
         "email_security.txt", "smtp_enumeration.txt", "oauth_advanced.txt",
         "log_injection.txt", "document_attacks.txt",
+        "waf_bypass.txt", "idempotency.txt",
     ):
         p = outdir / key
         if p.exists():
@@ -233,6 +262,7 @@ def write_full_summary(outdir: Path, domain: str, counts: Dict[str, int], missin
         "exposed_databases.txt", "default_creds.txt", "host_header_injection.txt",
         "email_security.txt", "smtp_enumeration.txt", "oauth_advanced.txt",
         "log_injection.txt", "document_attacks.txt",
+        "waf_bypass.txt", "idempotency.txt",
     ):
         p = outdir / key
         if not p.exists():
@@ -289,4 +319,65 @@ def write_markdown(outdir: Path, domain: str, counts: Dict[str, int], missing: L
     tmp = out.with_suffix(out.suffix + ".tmp")
     tmp.write_text("\n".join(lines) + "\n")
     os.replace(tmp, out)
+    return out
+
+
+def write_sarif(outdir: Path, domain: str, counts: Dict[str, int], state: dict) -> Path:
+    """Generate SARIF v2.1 output for GitHub Advanced Security / GitLab SAST."""
+    sarif: Dict[str, Any] = {
+        "$schema": "https://raw.githubusercontent.com/oasis-tcs/openc2-json-schema/master/sarif/sarif-2-1.schema.json",
+        "version": "2.1.0",
+        "runs": [{
+            "tool": {
+                "driver": {
+                    "name": "ReconChain",
+                    "version": __version__,
+                    "informationUri": "https://github.com/franz88-scr/BugBountyV2tool",
+                }
+            },
+            "results": [],
+            "properties": {
+                "domain": domain,
+                "generated_at": datetime.now().isoformat(timespec="seconds"),
+            }
+        }]
+    }
+    rule_ids: Dict[str, str] = {}
+    for artifact_name, artifact_path_str in state.get("artifacts", {}).items():
+        if not isinstance(artifact_path_str, str):
+            continue
+        p = Path(artifact_path_str)
+        if not p.exists():
+            continue
+        lines = read_lines(p)
+        for line_idx, line in enumerate(lines, 1):
+            if not line.strip():
+                continue
+            parts = line.split(None, 1)
+            tag = parts[0].strip("[]") if parts else "finding"
+            tag_clean = tag.replace("-", "_").upper()[:30]
+            if tag_clean not in rule_ids:
+                rule_ids[tag_clean] = f"RC{len(rule_ids) + 1:04d}"
+                sarif["runs"][0]["tool"]["driver"].setdefault("rules", []).append({
+                    "id": rule_ids[tag_clean],
+                    "name": tag_clean,
+                    "shortDescription": {"text": tag_clean.replace("_", " ")},
+                    "properties": {"tags": [tag]},
+                })
+            result = {
+                "ruleId": rule_ids[tag_clean],
+                "message": {"text": line[:200]},
+                "locations": [{
+                    "physicalLocation": {
+                        "artifactLocation": {"uri": artifact_name},
+                        "region": {"startLine": line_idx},
+                    }
+                }],
+            }
+            sarif["runs"][0]["results"].append(result)
+    out = ensure(outdir / "results.sarif")
+    tmp = out.with_suffix(out.suffix + ".tmp")
+    tmp.write_text(json.dumps(sarif, indent=2, default=str))
+    os.replace(tmp, out)
+    log("ok", f"sarif report → {out}")
     return out

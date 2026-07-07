@@ -1,6 +1,6 @@
 # ReconChain v1.6.0
 
-Chains 71 recon and vulnerability phases into a single resumable pipeline — no config files required.
+Chains 73 recon and vulnerability phases into a single resumable pipeline — no config files required.
 
 ```bash
 # Interactive wizard (recommended)
@@ -14,6 +14,9 @@ reconchain -d example.com,test.org -o ./out
 
 # Quick recon only
 reconchain -d example.com --fast
+
+# SARIF output for CI/CD (GitHub Advanced Security / GitLab SAST)
+reconchain -d example.com --format sarif
 ```
 
 ## Install
@@ -32,12 +35,13 @@ chmod +x install.sh && ./install.sh
 | `--fast` | Basic recon only (subdomains, DNS, ports, URLs) |
 | `--only 01-RECON,14-ORIGIN` | Run specific phases |
 | `--skip 10-TLSCMS,11-INJECT` | Skip slow phases |
+| `--format sarif` | Generate SARIF v2.1 report (`results.sarif`) |
 | `--resume` | Resume cancelled scan |
 | `--force` | Re-run all phases |
 | `-j 32` | Parallelism (default: cpu×2) |
 | `--proxy socks5://127.0.0.1:9050` | Route through SOCKS/Tor |
 
-Recon levels: **Basic** (recon only), **Standard** (recon + vuln scan), **Full** (all 71 phases).
+Recon levels: **Basic** (recon only), **Standard** (recon + vuln scan), **Full** (all 73 phases).
 
 ## Generate AI Report
 
@@ -52,9 +56,9 @@ cat out/example.com/summary.txt | llm "Summarize these security findings for a n
 # "Review the scan results in ./out/example.com/ and write a pentest report"
 ```
 
-The `summary.txt` and `summary.json` files contain all findings in a machine-readable format that AI tools can analyze directly.
+The `summary.txt` and `summary.json` files contain all findings in a machine-readable format that AI tools can analyze directly. The `summary.json` now includes coverage metrics (`discovered_urls`, `tested_phases`, `total_phases`) under a `"coverage"` key.
 
-## Pipeline Stages (71 phases in DAG)
+## Pipeline Stages (73 phases in DAG)
 
 **Discovery & Reconnaissance:**
 ```
@@ -68,18 +72,21 @@ The `summary.txt` and `summary.json` files contain all findings in a machine-rea
 
 **Vulnerability Scanning:**
 ```
-09-VULNSCAN → nuclei + tech detection
-10-TLSCMS   → TLS + WordPress
-11-INJECT   → XSS, SSRF, SQLi, SSTI, NoSQLi, XXE, CMDi, LDAP
-11a-DOMXSS  → DOM XSS via browser automation (Playwright)
-11b-SQLMAP  → SQL injection via sqlmap
-20-GRAPHQL  → GraphQL introspection + schema analysis
-28-CACHED   → Web cache poisoning/deception + v2 probes
+09-VULNSCAN   → nuclei + tech detection
+10-TLSCMS     → TLS + WordPress
+11-INJECT     → XSS, SSRF, SQLi, SSTI, NoSQLi, XXE, CMDi, LDAP
+11a-DOMXSS    → DOM XSS via browser automation (Playwright)
+11b-SQLMAP    → SQL injection via sqlmap
+20-GRAPHQL    → GraphQL introspection + schema analysis
+21-WAF        → WAF detection (50+ vendor signatures)
+21b-WAFBYPASS → WAF bypass technique testing (Cloudflare, Akamai, AWS WAF, ModSecurity)
+28-CACHED     → Web cache poisoning/deception + v2 probes
+35-CORSADV    → Advanced CORS + JSONP endpoint detection
 38b-H2SMUGGLE → HTTP/2 + HTTP/3 attack surface
-41-WEBSOCKET → WebSocket security testing + deep probes
+41-WEBSOCKET  → WebSocket security testing + deep probes
 ```
 
-**New in v1.6.0 — Enhancement Phases:**
+**Enhancement Phases:**
 ```
 50-BUCKET-PERMS  → Bucket permission auditing (public read/write on S3/Azure/GCP)
 51-HPP           → HTTP parameter pollution detection
@@ -89,27 +96,32 @@ The `summary.txt` and `summary.json` files contain all findings in a machine-rea
 55-CSV-INJECT    → CSV/Excel formula injection (DDE, HYPERLINK, WEBSERVICE)
 56-EXPOSED-DB    → Exposed database probing (Elasticsearch, Redis, Mongo, K8s)
 57-DEFAULT-CREDS → Default credentials on admin panels and services
-58-HOST-INJECT   → Host header injection / cache poisoning variants
+58-HOST-INJECT   → Host header injection / cache poisoning variants (+ CRLF/unicode)
 59-EMAIL-SEC     → Email security posture (SPF/DMARC/DKIM)
 60-SMTP-ENUM     → SMTP enumeration / email bombing detection
 61-OAUTH-ADV     → OAuth redirect_uri bypass variants
 62-LOG-INJECT    → Log injection / log forging detection
 63-DOC-ATTACK    → Document-based attacks (DDE, macro, XXE, SVG-XSS)
+64-IDEMPOTENCY   → Idempotency key replay testing on POST endpoints
 ```
 
-All 71 phases run in a DAG with 22 ordered stages — see `reconchain -h` or the code for the full list.
+All 73 phases run in a DAG with 21 ordered stages — see `reconchain -h` or the code for the full list.
 
 ## Output
 
 ```
 out/example.com/
-├── summary.json           # Machine-readable (feed to AI)
+├── summary.json           # Machine-readable (feed to AI) + coverage metrics
 ├── summary.txt            # Human-readable
 ├── report.html            # HTML report with severity badges
 ├── report.md              # Markdown report
+├── results.sarif          # SARIF v2.1 (GitHub Advanced Security / GitLab SAST)
 ├── hosts.txt              # Live hosts with tech
 ├── urls_all.txt           # All discovered URLs
 ├── nuclei_combined.txt    # Vulnerability findings
+├── cors_advanced.txt      # CORS misconfig + JSONP endpoint findings
+├── waf_bypass.txt         # WAF bypass test results
+├── idempotency.txt        # Idempotency key replay findings
 ├── bucket_permissions.txt # S3/Azure/GCP bucket public access
 ├── csp_analysis.txt       # CSP header analysis + bypasses
 ├── csv_injection.txt      # CSV formula injection findings

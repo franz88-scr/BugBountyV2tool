@@ -6,17 +6,16 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Set
+from typing import Callable, List, Optional, Set
 
-from reconchain.config import VALID_PHASES, FAST_PHASES, _HOSTNAME_RE, __version__
+from reconchain.config import __version__
 from reconchain.phases import _RECON_LEVELS
 from reconchain.pipeline import run_pipeline
-from reconchain.process import _parse_phase_csv, _domain_arg, _cleanup_child_procs, MAX_PARALLEL_JOBS
+from reconchain.process import _parse_phase_csv, MAX_PARALLEL_JOBS
 from reconchain.utils import (
     C, log, ScanStatus, _is_valid_hostname, _auto_detect_proxy,
     disable_color,
 )
-from reconchain.utils import log as _orig_log
 
 
 def _prompt(prompt_text: str, default: str = "", validator: Optional[Callable[[str], bool]] = None, error_msg: str = "") -> str:
@@ -49,7 +48,7 @@ def _banner() -> None:
 {C["r"]}
 {C["g"]}   ╔══════════════════════════════════════════════════════╗
 {C["g"]}   ║  {C["c"]}ReconChain v{__version__}{C["g"]}  —  {C["y"]}Bug Bounty Recon & Vuln Pipeline{C["g"]}   ║
-{C["g"]}   ║  {C["d"]}41+ tools  |  51 phases  |  DAG stages  |  Resumable{C["g"]}   ║
+{C["g"]}   ║  {C["d"]}41+ tools  |  57 phases  |  DAG stages  |  Resumable{C["g"]}   ║
 {C["g"]}   ╚══════════════════════════════════════════════════════╝{C["r"]}
 """
     print(banner, flush=True)
@@ -92,6 +91,7 @@ def interactive_setup() -> argparse.Namespace:
         _all_extra = [
             ("04b-TAKEOVER-VALIDATE", "Confirm dangling CNAME exploitability"),
             ("05b-APISPEC", "API spec discovery (Swagger/OpenAPI/GraphQL SDL)"),
+            ("11a-DOMXSS", "DOM-based XSS via browser automation (Playwright)"),
             ("11b-SQLMAP", "SQL injection via sqlmap (pre-filtered)"),
             ("12-SSTI", "SSTI fuzzing"),
             ("14-ORIGIN", "Origin IP bypass (Cloudflare)"),
@@ -102,7 +102,7 @@ def interactive_setup() -> argparse.Namespace:
             ("17B-SSRFMETA", "Cloud metadata exfiltration (SSRF confirmed)"),
             ("18-CLOUD", "Cloud bucket discovery (AWS/GCP/Azure)"),
             ("19-GIT", "Git exposure scanning (.git + trufflehog)"),
-            ("20-GRAPHQL", "GraphQL introspection + schema analysis"),
+            ("20-GRAPHQL", "GraphQL introspection + schema analysis + deep probes"),
             ("21-WAF", "WAF detection (50+ vendor signatures)"),
             ("22-NOSQLI", "NoSQL injection probes"),
             ("23-RACE", "Race condition detection"),
@@ -110,7 +110,7 @@ def interactive_setup() -> argparse.Namespace:
             ("25-XXE", "XML external entity injection"),
             ("26-CMDINJECT", "OS command injection detection"),
             ("27-SSPP", "Server-side prototype pollution"),
-            ("28-CACHED", "Web cache poisoning/deception"),
+            ("28-CACHED", "Web cache poisoning/deception + v2 probes (WCD, key confusion)"),
             ("29-DEPCHECK", "JS dependency vulnerability scan"),
             ("30-LFI", "Local file inclusion / path traversal"),
             ("31-OPENREDIR", "Open redirect detection"),
@@ -121,16 +121,18 @@ def interactive_setup() -> argparse.Namespace:
             ("36-JWTADV", "Advanced JWT attacks"),
             ("37-FILEUPLOAD", "File upload vulnerability testing"),
             ("38-SMUGGLE", "HTTP request smuggling detection"),
+            ("38b-H2SMUGGLE", "HTTP/2 + HTTP/3 attack surface (H2 smugg, QUIC, HPACK)"),
             ("39-OAUTH", "OAuth misconfiguration testing"),
             ("40-PWRESET", "Password reset logic testing"),
-            ("41-WEBSOCKET", "WebSocket security testing"),
+            ("41-WEBSOCKET", "WebSocket security testing + deep probes"),
             ("42-LDAP", "LDAP injection detection"),
             ("43-DESERIAL", "Deserialization attack detection"),
             ("44-CHAIN", "Cross-phase finding correlation"),
-            ("45-EVIDENCE", "Capture request/response for confirmed findings"),
+            ("45-EVIDENCE", "Capture request/response + auto PoC generation for findings"),
             ("46-BUCKET", "Cloud storage bucket enumeration (S3/Azure/GCP)"),
             ("47-CDN", "CDN provider detection + origin IP discovery"),
             ("48-CONTENT", "Content discovery via common path probing"),
+            ("49-FRAMEWORKS", "Framework detection + edge runtime vulnerability checks"),
         ]
         print(f"\n{C['b']}Additional phases:{C['r']}")
         for p, desc in _all_extra:
@@ -222,6 +224,9 @@ def interactive_setup() -> argparse.Namespace:
     ns.sample_endpoints_oauth = 10
     ns.sample_endpoints_pwreset = 10
     ns.sample_hosts_websocket = 10
+    ns.sample_hosts_h2smuggle = 10
+    ns.sample_hosts_frameworks = 20
+    ns.sample_urls_domxss = 30
     ns.sample_urls_ldap = 20
     ns.sample_endpoints_deserial = 10
     ns.sample_hosts_ssl = 10
@@ -251,6 +256,9 @@ def interactive_setup() -> argparse.Namespace:
         ns.sample_hosts_ratelimit = min(ns.sample_hosts_ratelimit, 3)
         ns.sample_hosts_smuggle = min(ns.sample_hosts_smuggle, 3)
         ns.sample_hosts_websocket = min(ns.sample_hosts_websocket, 3)
+        ns.sample_hosts_h2smuggle = min(ns.sample_hosts_h2smuggle, 3)
+        ns.sample_hosts_frameworks = min(ns.sample_hosts_frameworks, 5)
+        ns.sample_urls_domxss = min(ns.sample_urls_domxss, 5)
         ns.sample_endpoints_race = min(ns.sample_endpoints_race, 3)
         ns.sample_endpoints_cors = min(ns.sample_endpoints_cors, 3)
         ns.sample_endpoints_corsadv = min(ns.sample_endpoints_corsadv, 3)
@@ -295,6 +303,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--sample-hosts-waf", type=int, default=5, help="number of hosts for WAF detection (default: 5)")
     p.add_argument("--sample-endpoints-l", type=int, default=20, help="number of endpoints to sample for auth bypass / mass assignment probes (default: 20)")
     p.add_argument("--sample-urls-xss-blind", type=int, default=20, help="number of URLs to probe for blind XSS via OAST (default: 20)")
+    p.add_argument("--sample-urls-domxss", type=int, default=30, help="number of URLs for DOM XSS browser automation (default: 30)")
+    p.add_argument("--sample-hosts-h2smuggle", type=int, default=10, help="number of hosts for H2/H3 attack surface testing (default: 10)")
+    p.add_argument("--sample-hosts-frameworks", type=int, default=20, help="number of hosts for framework detection and vuln checks (default: 20)")
     p.add_argument("--exclude-tags", type=str, default="", help="nuclei tags to exclude (comma-separated), e.g. 'info,tech'")
     p.add_argument("--sample-urls-ssti", type=int, default=5, help="number of SSTI probe URLs (default: 5)")
     p.add_argument("--sample-endpoints-post", type=int, default=5, help="number of endpoints for POST mass-assignment probes (default: 5)")

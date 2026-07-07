@@ -10,15 +10,15 @@ import shutil
 import signal
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Set
+from typing import Any, Dict
 
 from reconchain.config import PipelineConfig, FAST_PHASES
 from reconchain.phases import (
     STAGES, PIPELINE as _PIPELINE,
 )
 from reconchain.process import (
-    _JOB_SEM, _PIPELINE_CFG, _TOOL_RC_REGISTRY,
-    _USE_PROXYCHAINS, _run, _cleanup_child_procs, _csv_from_phases,
+    _TOOL_RC_REGISTRY,
+    _run, _cleanup_child_procs, _csv_from_phases,
     _maybe_timeout, _atomic_write_json, _update_nuclei_templates,
 )
 from reconchain.reporting import (

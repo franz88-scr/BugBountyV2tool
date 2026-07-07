@@ -15,7 +15,7 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
-from reconchain.process import _wait_proc, _USE_PROXYCHAINS, _proxify_cmd
+from reconchain.process import _wait_proc, _proxify_cmd
 from reconchain.utils import ensure, log
 
 

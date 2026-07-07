@@ -3,10 +3,10 @@ import json
 import os
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Dict, List
 
 from reconchain.config import __version__
-from reconchain.utils import ensure, read_lines, log, count_nonblank
+from reconchain.utils import ensure, read_lines, count_nonblank
 
 HTML_CSS = """
 :root{--fg:#e6edf3;--bg:#0d1117;--mut:#8b949e;--acc:#58a6ff;--warn:#d29922;--ok:#3fb950;--err:#f85149;}
@@ -77,6 +77,9 @@ def _counts(outdir: Path) -> Dict[str, int]:
         "lfi": outdir / "lfi.txt",
         "mass_assign": outdir / "mass_assign.txt",
         "authz_bypass": outdir / "authz_bypass.txt",
+        "domxss": outdir / "domxss_findings.txt",
+        "h2_smuggling": outdir / "h2_smuggling.txt",
+        "framework_vulns": outdir / "framework_vulns.txt",
         "chain_correlation": outdir / "chain_correlation.txt",
         "evidence": outdir / "evidence.txt",
     }
@@ -131,8 +134,9 @@ def write_html(outdir: Path, domain: str, counts: Dict[str, int], missing: List[
         "crlf_injection.txt", "rate_limiting.txt", "cors_advanced.txt",
         "jwt_advanced.txt", "file_upload.txt", "smuggling.txt",
         "oauth_misconfig.txt", "password_reset.txt", "websocket.txt",
-        "ldap_injection.txt", "deserialization.txt", "chain_correlation.txt",
-        "evidence.txt",
+        "ldap_injection.txt",         "deserialization.txt", "chain_correlation.txt",
+        "evidence.txt", "domxss_findings.txt", "h2_smuggling.txt",
+        "framework_vulns.txt",
     ):
         p = outdir / key
         if p.exists():
@@ -204,6 +208,7 @@ def write_full_summary(outdir: Path, domain: str, counts: Dict[str, int], missin
         "file_upload.txt", "smuggling.txt", "oauth_misconfig.txt",
         "password_reset.txt", "websocket.txt", "ldap_injection.txt",
         "deserialization.txt", "chain_correlation.txt", "evidence.txt",
+        "domxss_findings.txt", "h2_smuggling.txt", "framework_vulns.txt",
     ):
         p = outdir / key
         if not p.exists():

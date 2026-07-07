@@ -14,14 +14,14 @@ VALID_PHASES = {
     "00-SCOPE", "01-RECON", "02-RESOLVE", "03-PERMUTE", "04-SCAN",
     "04b-TAKEOVER-VALIDATE", "05-HARVEST", "05b-APISPEC", "06-JSINTEL",
     "07-PARAMS", "08-FUZZ", "09-VULNSCAN", "10-TLSCMS", "11-INJECT",
-    "11b-SQLMAP", "12-SSTI", "13-OOB", "14-ORIGIN", "15-SECRETS",
+    "11a-DOMXSS", "11b-SQLMAP", "12-SSTI", "13-OOB", "14-ORIGIN", "15-SECRETS",
     "16A-AUTHZ", "16B-MASSASSIGN", "17-IDOR", "17B-SSRFMETA", "18-CLOUD",
     "19-GIT", "20-GRAPHQL", "21-WAF", "22-NOSQLI", "23-RACE", "24-JWT",
     "25-XXE", "26-CMDINJECT", "27-SSPP", "28-CACHED", "29-DEPCHECK",
     "30-LFI", "31-OPENREDIR", "32-CLICKJACK", "33-CRLF", "34-RATELIMIT",
-    "35-CORSADV", "36-JWTADV", "37-FILEUPLOAD", "38-SMUGGLE", "39-OAUTH",
-    "40-PWRESET", "41-WEBSOCKET", "42-LDAP", "43-DESERIAL", "44-CHAIN",
-    "45-EVIDENCE", "46-BUCKET", "47-CDN", "48-CONTENT",
+    "35-CORSADV", "36-JWTADV", "37-FILEUPLOAD", "38-SMUGGLE", "38b-H2SMUGGLE",
+    "39-OAUTH", "40-PWRESET", "41-WEBSOCKET", "42-LDAP", "43-DESERIAL", "44-CHAIN",
+    "45-EVIDENCE", "46-BUCKET", "47-CDN", "48-CONTENT", "49-FRAMEWORKS",
 }
 FAST_PHASES = {"00-SCOPE", "01-RECON", "02-RESOLVE", "04-SCAN", "05-HARVEST"}
 PhaseSet = Set[str]
@@ -77,6 +77,9 @@ class PipelineConfig:
     sample_urls_lfi: int = 30
     sample_urls_idor: int = 50
     sample_urls_apisec: int = 50
+    sample_urls_domxss: int = 30
+    sample_hosts_h2smuggle: int = 10
+    sample_hosts_frameworks: int = 20
     takeover_validate: bool = True
     waf_detected: bool = False
     waf_evasion_throttle: float = 0.0

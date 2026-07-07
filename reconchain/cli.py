@@ -93,9 +93,11 @@ def interactive_setup() -> argparse.Namespace:
         _all_extra = [
             ("04b-TAKEOVER-VALIDATE", "Confirm dangling CNAME exploitability"),
             ("05b-APISPEC", "API spec discovery (Swagger/OpenAPI/GraphQL SDL)"),
+            ("11-INJECT", "XSS (dalfox/kxss), SSRF probes, parameter injection"),
             ("11a-DOMXSS", "DOM-based XSS via browser automation (Playwright)"),
             ("11b-SQLMAP", "SQL injection via sqlmap (pre-filtered)"),
             ("12-SSTI", "SSTI fuzzing"),
+            ("13-OOB", "OOB interaction tracking (DNS/HTTP Callback)"),
             ("14-ORIGIN", "Origin IP bypass (Cloudflare)"),
             ("15-SECRETS", "Deep JS secret scanning"),
             ("16A-AUTHZ", "Auth bypass header injection"),

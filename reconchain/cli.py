@@ -8,7 +8,7 @@ import tempfile
 from pathlib import Path
 from typing import Callable, List, Optional, Set
 
-from reconchain.config import __version__
+from reconchain.config import __version__, VALID_PHASES
 from reconchain.phases import _RECON_LEVELS
 from reconchain.pipeline import run_pipeline
 from reconchain.process import _parse_phase_csv, MAX_PARALLEL_JOBS
@@ -154,9 +154,23 @@ def interactive_setup() -> argparse.Namespace:
             ("63-DOC-ATTACK", "Document-based attacks (DDE, macro, XXE, SVG-XSS)"),
             ("64-IDEMPOTENCY", "Idempotency key replay testing (POST endpoints)"),
         ]
+        extra_set = {p for p, _ in _all_extra}
+        base_only = [p for p in sorted(VALID_PHASES) if p not in extra_set]
+        if base_only:
+            print(f"\n{C['b']}Core phases (always included for level '{level}'):{C['r']}")
+            _phase_tag = {"00-SCOPE": "Scope validation", "01-RECON": "Passive recon (subfinder, amass, etc.)",
+                "02-RESOLVE": "DNS resolution & live probing", "03-PERMUTE": "Subdomain permutation",
+                "04-SCAN": "Port scanning (naabu/nmap)", "05-HARVEST": "URL gathering (gau, wayback, katana)",
+                "06-JSINTEL": "JavaScript analysis (linkfinder, secretfinder)",
+                "07-PARAMS": "Parameter discovery (arjun/x8)", "08-FUZZ": "Endpoint fuzzing (ffuf)",
+                "09-VULNSCAN": "Vulnerability scanning (nuclei)", "10-TLSCMS": "TLS/CMS fingerprinting"}
+            for p in base_only:
+                desc = _phase_tag.get(p, "")
+                print(f"  {C['g']}{p:20}{C['r']} {desc}")
         print(f"\n{C['b']}Additional phases:{C['r']}")
         for p, desc in _all_extra:
-            print(f"  {C['y']}{p:20}{C['r']} {desc}")
+            in_base = "  (included in base)" if p in base_phases else ""
+            print(f"  {C['y']}{p:20}{C['r']} {desc}{in_base}")
         if level == "full":
             skip_raw = _prompt("Phases to SKIP (comma-separated, or empty to run all)", default="")
             skipped = {s.strip().upper() for s in skip_raw.split(",") if s.strip()}

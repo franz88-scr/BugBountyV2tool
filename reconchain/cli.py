@@ -48,7 +48,7 @@ def _banner() -> None:
 {C["r"]}
 {C["g"]}   ╔══════════════════════════════════════════════════════╗
 {C["g"]}   ║  {C["c"]}ReconChain v{__version__}{C["g"]}  —  {C["y"]}Bug Bounty Recon & Vuln Pipeline{C["g"]}   ║
-{C["g"]}   ║  {C["d"]}41+ tools  |  57 phases  |  DAG stages  |  Resumable{C["g"]}   ║
+{C["g"]}   ║  {C["d"]}41+ tools  |  71 phases  |  DAG stages  |  Resumable{C["g"]}   ║
 {C["g"]}   ╚══════════════════════════════════════════════════════╝{C["r"]}
 """
     print(banner, flush=True)
@@ -133,6 +133,20 @@ def interactive_setup() -> argparse.Namespace:
             ("47-CDN", "CDN provider detection + origin IP discovery"),
             ("48-CONTENT", "Content discovery via common path probing"),
             ("49-FRAMEWORKS", "Framework detection + edge runtime vulnerability checks"),
+            ("50-BUCKET-PERMS", "Cloud bucket permission auditing (public read/write)"),
+            ("51-HPP", "HTTP parameter pollution detection"),
+            ("52-SERVERLESS", "Serverless/cloud function endpoint discovery"),
+            ("53-CSP", "CSP header analysis + bypass detection"),
+            ("54-WS-FUZZ", "WebSocket message fuzzing"),
+            ("55-CSV-INJECT", "CSV/Excel formula injection (DDE, HYPERLINK)"),
+            ("56-EXPOSED-DB", "Exposed database / storage probing (ES, Redis, Mongo, K8s)"),
+            ("57-DEFAULT-CREDS", "Default credentials testing on admin services"),
+            ("58-HOST-INJECT", "Host header injection / cache poisoning variants"),
+            ("59-EMAIL-SEC", "Email security posture (SPF/DMARC/DKIM)"),
+            ("60-SMTP-ENUM", "SMTP enumeration / email bombing detection"),
+            ("61-OAUTH-ADV", "OAuth redirect_uri bypass variants"),
+            ("62-LOG-INJECT", "Log injection / log forging detection"),
+            ("63-DOC-ATTACK", "Document-based attacks (DDE, macro, XXE, SVG-XSS)"),
         ]
         print(f"\n{C['b']}Additional phases:{C['r']}")
         for p, desc in _all_extra:

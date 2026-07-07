@@ -82,6 +82,20 @@ def _counts(outdir: Path) -> Dict[str, int]:
         "framework_vulns": outdir / "framework_vulns.txt",
         "chain_correlation": outdir / "chain_correlation.txt",
         "evidence": outdir / "evidence.txt",
+        "bucket_permissions": outdir / "bucket_permissions.txt",
+        "hpp": outdir / "hpp.txt",
+        "serverless_endpoints": outdir / "serverless_endpoints.txt",
+        "csp_analysis": outdir / "csp_analysis.txt",
+        "websocket_fuzz": outdir / "websocket_fuzz.txt",
+        "csv_injection": outdir / "csv_injection.txt",
+        "exposed_databases": outdir / "exposed_databases.txt",
+        "default_creds": outdir / "default_creds.txt",
+        "host_header_injection": outdir / "host_header_injection.txt",
+        "email_security": outdir / "email_security.txt",
+        "smtp_enumeration": outdir / "smtp_enumeration.txt",
+        "oauth_advanced": outdir / "oauth_advanced.txt",
+        "log_injection": outdir / "log_injection.txt",
+        "document_attacks": outdir / "document_attacks.txt",
     }
     return {k: count_nonblank(v) for k, v in keys.items() if v.exists()}
 
@@ -137,6 +151,11 @@ def write_html(outdir: Path, domain: str, counts: Dict[str, int], missing: List[
         "ldap_injection.txt",         "deserialization.txt", "chain_correlation.txt",
         "evidence.txt", "domxss_findings.txt", "h2_smuggling.txt",
         "framework_vulns.txt",
+        "bucket_permissions.txt", "hpp.txt", "serverless_endpoints.txt",
+        "csp_analysis.txt", "websocket_fuzz.txt", "csv_injection.txt",
+        "exposed_databases.txt", "default_creds.txt", "host_header_injection.txt",
+        "email_security.txt", "smtp_enumeration.txt", "oauth_advanced.txt",
+        "log_injection.txt", "document_attacks.txt",
     ):
         p = outdir / key
         if p.exists():
@@ -209,6 +228,11 @@ def write_full_summary(outdir: Path, domain: str, counts: Dict[str, int], missin
         "password_reset.txt", "websocket.txt", "ldap_injection.txt",
         "deserialization.txt", "chain_correlation.txt", "evidence.txt",
         "domxss_findings.txt", "h2_smuggling.txt", "framework_vulns.txt",
+        "bucket_permissions.txt", "hpp.txt", "serverless_endpoints.txt",
+        "csp_analysis.txt", "websocket_fuzz.txt", "csv_injection.txt",
+        "exposed_databases.txt", "default_creds.txt", "host_header_injection.txt",
+        "email_security.txt", "smtp_enumeration.txt", "oauth_advanced.txt",
+        "log_injection.txt", "document_attacks.txt",
     ):
         p = outdir / key
         if not p.exists():

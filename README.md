@@ -1,6 +1,6 @@
-# ReconChain v1.5.1
+# ReconChain v1.6.0
 
-Chains 57 recon and vulnerability phases into a single resumable pipeline — no config files required.
+Chains 71 recon and vulnerability phases into a single resumable pipeline — no config files required.
 
 ```bash
 # Interactive wizard (recommended)
@@ -37,7 +37,7 @@ chmod +x install.sh && ./install.sh
 | `-j 32` | Parallelism (default: cpu×2) |
 | `--proxy socks5://127.0.0.1:9050` | Route through SOCKS/Tor |
 
-Recon levels: **Basic** (recon only), **Standard** (recon + vuln scan), **Full** (all 57 phases).
+Recon levels: **Basic** (recon only), **Standard** (recon + vuln scan), **Full** (all 71 phases).
 
 ## Generate AI Report
 
@@ -54,54 +54,81 @@ cat out/example.com/summary.txt | llm "Summarize these security findings for a n
 
 The `summary.txt` and `summary.json` files contain all findings in a machine-readable format that AI tools can analyze directly.
 
-## Key Pipeline Stages
+## Pipeline Stages (71 phases in DAG)
 
+**Discovery & Reconnaissance:**
 ```
 00-SCOPE   → scope validation
 01-RECON   → subdomains (subfinder, amass)
 02-RESOLVE → DNS resolution (massdns → dnsx → socket)
+03-PERMUTE → subdomain permutation (alterx, dnsgen)
 04-SCAN    → ports, HTTP probing, service detection
 05-HARVEST → URL harvesting (gau, gospider, katana, waymore)
-09-VULNSCAN → nuclei + tech detection
-10-TLSCMS  → TLS + WordPress
-11-INJECT  → XSS, SSRF, SQLi, SSTI, NoSQLi, XXE, CMDi, LDAP
-11a-DOMXSS → DOM XSS via browser automation (Playwright)
-20-GRAPHQL → GraphQL introspection + schema analysis + deep probes
-28-CACHED  → Web cache poisoning/deception + v2 probes
-38b-H2SMUGGLE → HTTP/2 + HTTP/3 attack surface (Rapid Reset, HPACK, QUIC)
-41-WEBSOCKET → WebSocket security testing + deep probes
-45-EVIDENCE → Evidence capture + auto PoC generation
-49-FRAMEWORKS → Framework detection + edge runtime vuln checks
 ```
 
-All 57 phases run in a DAG with 18 ordered stages — see `reconchain -h` or the code for the full list.
+**Vulnerability Scanning:**
+```
+09-VULNSCAN → nuclei + tech detection
+10-TLSCMS   → TLS + WordPress
+11-INJECT   → XSS, SSRF, SQLi, SSTI, NoSQLi, XXE, CMDi, LDAP
+11a-DOMXSS  → DOM XSS via browser automation (Playwright)
+11b-SQLMAP  → SQL injection via sqlmap
+20-GRAPHQL  → GraphQL introspection + schema analysis
+28-CACHED   → Web cache poisoning/deception + v2 probes
+38b-H2SMUGGLE → HTTP/2 + HTTP/3 attack surface
+41-WEBSOCKET → WebSocket security testing + deep probes
+```
+
+**New in v1.6.0 — Enhancement Phases:**
+```
+50-BUCKET-PERMS  → Bucket permission auditing (public read/write on S3/Azure/GCP)
+51-HPP           → HTTP parameter pollution detection
+52-SERVERLESS    → Serverless/cloud function endpoint discovery
+53-CSP           → CSP header analysis + bypass detection
+54-WS-FUZZ       → WebSocket message fuzzing (injection, auth bypass)
+55-CSV-INJECT    → CSV/Excel formula injection (DDE, HYPERLINK, WEBSERVICE)
+56-EXPOSED-DB    → Exposed database probing (Elasticsearch, Redis, Mongo, K8s)
+57-DEFAULT-CREDS → Default credentials on admin panels and services
+58-HOST-INJECT   → Host header injection / cache poisoning variants
+59-EMAIL-SEC     → Email security posture (SPF/DMARC/DKIM)
+60-SMTP-ENUM     → SMTP enumeration / email bombing detection
+61-OAUTH-ADV     → OAuth redirect_uri bypass variants
+62-LOG-INJECT    → Log injection / log forging detection
+63-DOC-ATTACK    → Document-based attacks (DDE, macro, XXE, SVG-XSS)
+```
+
+All 71 phases run in a DAG with 22 ordered stages — see `reconchain -h` or the code for the full list.
 
 ## Output
 
 ```
 out/example.com/
-├── summary.json       # Machine-readable (feed to AI)
-├── summary.txt        # Human-readable
-├── report.html        # HTML report with severity badges
-├── report.md          # Markdown report
-├── hosts.txt          # Live hosts with tech
-├── urls_all.txt       # All discovered URLs
-├── nuclei_combined.txt # Vulnerability findings
-├── ssti.txt           # SSTI findings
-├── vulns.txt          # XSS/SSRF findings
-├── sqlmap_findings.txt # SQL injection candidates
-├── ...                # 50+ artifact files
-├── domxss_findings.txt  # DOM XSS candidates
-├── h2_smuggling.txt     # H2/H3 attack surface results
-├── framework_vulns.txt  # Framework detection + vuln checks
-├── websocket.txt        # WebSocket endpoint findings
-├── cache_poison.txt     # Cache poisoning/deception results
-├── graphql_introspection.txt # GraphQL introspection + deep probe results
-├── evidence/            # Auto-generated PoCs
-│   └── poc/             # Per-finding PoC files + index
-├── screenshots/         # Gowitness browser screenshots
-├── logs/                # Raw tool output
-└── state.json           # Resume state
+├── summary.json           # Machine-readable (feed to AI)
+├── summary.txt            # Human-readable
+├── report.html            # HTML report with severity badges
+├── report.md              # Markdown report
+├── hosts.txt              # Live hosts with tech
+├── urls_all.txt           # All discovered URLs
+├── nuclei_combined.txt    # Vulnerability findings
+├── bucket_permissions.txt # S3/Azure/GCP bucket public access
+├── csp_analysis.txt       # CSP header analysis + bypasses
+├── csv_injection.txt      # CSV formula injection findings
+├── default_creds.txt      # Default credentials found
+├── document_attacks.txt   # Document-based attack vectors
+├── email_security.txt     # SPF/DMARC/DKIM posture
+├── exposed_databases.txt  # Open DB services
+├── host_header_injection.txt # Host header poisoning
+├── hpp.txt                # HTTP parameter pollution
+├── log_injection.txt      # Log forging findings
+├── oauth_advanced.txt     # OAuth redirect_uri bypasses
+├── serverless_endpoints.txt # Lambda/GAE/Netlify endpoints
+├── smtp_enumeration.txt   # SMTP user enumeration
+├── websocket_fuzz.txt     # WebSocket message fuzzing results
+├── evidence/              # Auto-generated PoCs
+│   └── poc/               # Per-finding PoC files + index
+├── screenshots/           # Gowitness browser screenshots
+├── logs/                  # Raw tool output
+└── state.json             # Resume state
 ```
 
 ## Proxy Support

@@ -1,0 +1,67 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 820 460" font-family="'SFMono-Regular', 'Consolas', 'Liberation Mono', 'Menlo', monospace" font-size="13">
+  <defs>
+    <linearGradient id="titlebar" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#2d2d2d"/>
+      <stop offset="100%" stop-color="#1a1a1a"/>
+    </linearGradient>
+    <filter id="shadow">
+      <feDropShadow dx="0" dy="4" stdDeviation="8" flood-opacity="0.4"/>
+    </filter>
+  </defs>
+
+  <!-- Window shadow -->
+  <rect x="8" y="8" width="804" height="444" rx="8" fill="rgba(0,0,0,0.25)" filter="url(#shadow)"/>
+
+  <!-- Window background -->
+  <rect x="0" y="0" width="804" height="444" rx="8" fill="#1e1e1e"/>
+
+  <!-- Title bar -->
+  <rect x="0" y="0" width="804" height="36" rx="8" fill="url(#titlebar)"/>
+  <rect x="0" y="26" width="804" height="10" fill="url(#titlebar)"/>
+
+  <!-- Traffic lights -->
+  <circle cx="18" cy="18" r="6" fill="#ff5f57"/>
+  <circle cx="38" cy="18" r="6" fill="#ffbd2e"/>
+  <circle cx="58" cy="18" r="6" fill="#28c840"/>
+
+  <!-- Title text -->
+  <text x="402" y="24" text-anchor="middle" fill="#cccccc" font-size="12">bash — reconchain -i</text>
+
+  <!-- Terminal content -->
+  <text x="20" y="62" fill="#98c379" font-family="monospace" font-size="13" xml:space="preserve">
+    <tspan x="20" dy="0">    ██████╗ ██████╗ ████████╗</tspan>
+    <tspan x="20" dy="18">    ██╔══██╗██╔══██╗╚══██╔══╝</tspan>
+    <tspan x="20" dy="18">    ██████╔╝██████╔╝   ██║</tspan>
+    <tspan x="20" dy="18">    ██╔══██╗██╔══██╗   ██║</tspan>
+    <tspan x="20" dy="18">    ██████╔╝██████╔╝   ██║</tspan>
+    <tspan x="20" dy="18">    ╚═════╝ ╚═════╝    ╚═╝</tspan>
+  </text>
+
+  <text x="20" y="180" fill="#cccccc" font-family="monospace" font-size="13" xml:space="preserve">
+    <tspan x="20" dy="0">╔══════════════════════════════════════════════════════════════╗</tspan>
+    <tspan x="20" dy="16">║  ReconChain v1.6.0  —  Bug Bounty Recon &amp; Vuln Pipeline        ║</tspan>
+    <tspan x="20" dy="16">║  41+ tools  |  80 phases  |  DAG stages  |  Resumable         ║</tspan>
+    <tspan x="20" dy="16">╚══════════════════════════════════════════════════════════════╝</tspan>
+  </text>
+
+  <!-- Status line -->
+  <text x="20" y="258" fill="#569cd6" font-family="monospace" font-size="13">[I] Interactive setup — press Ctrl+C anytime to abort</text>
+
+  <text x="20" y="282" fill="#569cd6" font-family="monospace" font-size="13">[I] Multi-domain: comma-separated (e.g. example.com,test.org)</text>
+
+  <!-- Prompt -->
+  <text x="20" y="316" fill="#cccccc" font-family="monospace" font-size="13">  Target domain(s) (e.g. example.com or example.com,test.org):</text>
+
+  <!-- Cursor -->
+  <text x="20" y="340" fill="#cccccc" font-family="monospace" font-size="13">  </text>
+  <rect x="20" y="328" width="8" height="15" fill="#cccccc" opacity="0.7">
+    <animate attributeName="opacity" values="0.7;0;0.7" dur="1s" repeatCount="indefinite"/>
+  </rect>
+
+  <!-- Menu options -->
+  <text x="20" y="370" fill="#cccccc" font-family="monospace" font-size="13">Recon levels:</text>
+  <text x="20" y="390" fill="#dcdcaa" font-family="monospace" font-size="13">  1    Basic reconnaissance</text>
+  <text x="42" y="406" fill="#808080" font-family="monospace" font-size="12">Scope → Subs → DNS → Ports/HTTP → URLs → Report (fast)</text>
+  <text x="20" y="426" fill="#dcdcaa" font-family="monospace" font-size="13">  2    Standard assessment</text>
+  <text x="42" y="442" fill="#808080" font-family="monospace" font-size="12">Basic + JS + params + fuzzing + nuclei + TLS + origin + ...</text>
+</svg>

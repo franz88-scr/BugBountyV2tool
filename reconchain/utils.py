@@ -1,0 +1,917 @@
+"""Utility functions: file I/O, logging, validation, proxy config."""
+from __future__ import annotations
+import contextlib
+import hashlib
+import json
+import os
+import re
+import struct
+import sys
+import ssl
+import threading
+import urllib.error
+import urllib.parse
+import urllib.request
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Callable, Dict, Iterator, List, Optional, Set, Tuple
+
+from reconchain.config import _HOSTNAME_RE
+
+_re = re
+
+_HOSTNAME_RE = _HOSTNAME_RE
+_MERGE_LOCK = threading.Lock()
+
+def _is_valid_hostname(s: str) -> bool:
+    if not s:
+        return False
+    s = s.rstrip(".").lower()
+    if "." not in s or any(c.isspace() or c in "[]()<>{}" for c in s):
+        return False
+    # Reject IP addresses (octets look like valid hostname labels)
+    try:
+        import ipaddress
+        ipaddress.ip_address(s)
+        return False
+    except ValueError:
+        pass
+    return bool(_HOSTNAME_RE.match(s))
+
+def _is_under_domain(host: str, domain: str) -> bool:
+    h = host.rstrip(".").lower()
+    d = domain.rstrip(".").lower()
+    return h == d or h.endswith("." + d)
+
+def _target_token(line: str) -> str:
+    token = line.strip().split()[0] if line.strip() else ""
+    token = token.rstrip(".")
+    if not _is_valid_hostname(token) and not token.startswith("http"):
+        return ""
+    return token
+
+def _target_lines(path: Path) -> List[str]:
+    return [_target_token(line) for line in read_lines(path) if _target_token(line)]
+
+def _write_target_tokens(src: Path, dst: Path) -> int:
+    seen: Set[str] = set()
+    for token in _target_lines(src):
+        if token not in seen:
+            seen.add(token)
+    if not seen:
+        log("warn", f"_write_target_tokens: no valid tokens found in {src.name}")
+    ensure(dst).write_text("\n".join(sorted(seen)) + "\n")
+    return len(seen)
+
+def _color() -> bool:
+    return sys.stdout.isatty() and os.environ.get("NO_COLOR") is None
+
+C = {
+    "r": "\033[0m" if _color() else "",
+    "d": "\033[2m" if _color() else "",
+    "g": "\033[32m" if _color() else "",
+    "y": "\033[33m" if _color() else "",
+    "b": "\033[34m" if _color() else "",
+    "c": "\033[36m" if _color() else "",
+    "m": "\033[35m" if _color() else "",
+    "red": "\033[31m" if _color() else "",
+}
+LVL = {"info": C["c"], "ok": C["g"], "warn": C["y"], "err": C["red"], "skip": C["d"]}
+
+def disable_color() -> None:
+    global LVL, C
+    C = {k: "" for k in C}
+    LVL = {k: "" for k in LVL}
+
+_active_progress: Optional["Progress"] = None
+
+def log(lvl: str, msg: str) -> None:
+    text = f"{LVL[lvl]}[{lvl[0].upper()}]{C['r']} {msg}"
+    prog = _active_progress
+    if prog and prog._enabled and sys.stderr.isatty():
+        prog._write_above(text)
+    else:
+        _log_write(text)
+
+_log_write = print
+_tqdm_available = False
+try:
+    from tqdm import tqdm as _real_tqdm
+    _log_write = _real_tqdm.write
+    _tqdm_available = True
+    tqdm = _real_tqdm
+except ImportError:
+    class tqdm:
+        _global_pos = 0
+        def __init__(self, *args: Any, total: Optional[int] = None, desc: Optional[str] = None, **kwargs: Any) -> None:
+            self.total = total
+            self.desc = desc
+            self._n = 0
+            self._closed = False
+        def update(self, n: int = 1) -> None:
+            self._n += n
+            if self.desc:
+                print(f"  [{self._n}/{self.total}] {self.desc}", flush=True)
+        def set_description(self, desc: Optional[str] = None, refresh: bool = True) -> None:
+            if desc != self.desc:
+                self.desc = desc
+                if not self._closed:
+                    print(f"  [{self._n}/{self.total}] {desc}", flush=True)
+        def close(self) -> None:
+            self._closed = True
+        @classmethod
+        def write(cls, msg: str = "", *args: Any, **kwargs: Any) -> None:
+            print(msg, flush=True)
+
+def _auto_detect_proxy() -> str:
+    for var in ("ALL_PROXY", "HTTPS_PROXY", "HTTP_PROXY", "PROXY",
+                "all_proxy", "https_proxy", "http_proxy", "proxy"):
+        val = os.environ.get(var, "")
+        if val:
+            return val
+    return ""
+
+def _set_proxy_env(proxy: str) -> None:
+    _PROXY_VARS = ["ALL_PROXY", "all_proxy", "HTTPS_PROXY", "https_proxy",
+                   "HTTP_PROXY", "http_proxy", "PROXY"]
+    if not proxy:
+        for v in _PROXY_VARS:
+            os.environ.pop(v, None)
+        return
+    for v in _PROXY_VARS:
+        os.environ[v] = proxy
+
+def _auto_detect_cookies(outdir: Optional[Path] = None) -> str:
+    val = os.environ.get("COOKIE", "")
+    if val:
+        return val
+    if outdir:
+        cookie_file = outdir / "cookies.txt"
+        if cookie_file.exists():
+            try:
+                mode = cookie_file.stat().st_mode & 0o777
+                if mode & 0o077:
+                    log("warn", f"cookies.txt has overly permissive permissions ({oct(mode)}); consider: chmod 600 {cookie_file}")
+            except OSError:
+                pass
+            return _sanitize_header_value(cookie_file.read_text(encoding="utf-8", errors="ignore").strip())
+    else:
+        cookie_file = Path("cookies.txt")
+        if cookie_file.exists():
+            log("warn", "cookies.txt found in CWD — use --cookie or COOKIE env var instead")
+            return _sanitize_header_value(cookie_file.read_text(encoding="utf-8", errors="ignore").strip())
+    return ""
+
+def _sanitize_header_value(v: str) -> str:
+    v = v.translate({ord(c): ord(" ") for c in "\r\n\t\x00\x0b\x0c"})
+    return v.strip()
+
+def _extra_headers_dict() -> Dict[str, str]:
+    headers: Dict[str, str] = {}
+    cookie = os.environ.get("COOKIE", "")
+    if cookie:
+        headers["Cookie"] = _sanitize_header_value(cookie)
+    headers_raw = os.environ.get("EXTRA_HEADERS", "")
+    if headers_raw:
+        for hdr in headers_raw.split("\n"):
+            hdr = hdr.strip()
+            if hdr and ":" in hdr:
+                k, v = hdr.split(":", 1)
+                headers[k.strip()] = _sanitize_header_value(v.strip())
+    return headers
+
+def _extra_http_args() -> List[str]:
+    args: List[str] = []
+    cookie = os.environ.get("COOKIE", "")
+    if cookie:
+        args += ["-H", f"Cookie: {_sanitize_header_value(cookie)}"]
+    headers_raw = os.environ.get("EXTRA_HEADERS", "")
+    if headers_raw:
+        for h in headers_raw.split("\n"):
+            h = h.strip()
+            if h and ":" in h:
+                k, v = h.split(":", 1)
+                safe_h = f"{k.strip()}: {_sanitize_header_value(v.strip())}"
+                args += ["-H", safe_h]
+    return args
+
+_original_socket_class = None
+_SOCKS_PATCH_LOCK = threading.Lock()
+
+def _patch_socks(proxy: str) -> bool:
+    """Globally patch socket to route through SOCKS proxy via PySocks."""
+    global _socks_patched, _original_socket_class
+    with _SOCKS_PATCH_LOCK:
+        import socket as _sk
+        if _original_socket_class is None:
+            _original_socket_class = _sk.socket
+        try:
+            import socks as _socks
+            _parsed = urllib.parse.urlparse(proxy)
+            _pt = _socks.SOCKS5 if _parsed.scheme.startswith("socks5") else _socks.SOCKS4
+            _socks.set_default_proxy(_pt, _parsed.hostname, _parsed.port or 1080)
+            _socks.wrap_module(_sk)
+            _socks_patched = True
+            return True
+        except ImportError:
+            log("warn", "PySocks not installed; SOCKS proxy won't work for Python HTTP. Run: pip install pysocks")
+            return False
+        except Exception as _e:
+            log("warn", f"SOCKS patch failed: {_e}")
+            return False
+
+def _unpatch_socks() -> None:
+    """Restore original socket class after SOCKS patching."""
+    global _socks_patched, _original_socket_class
+    with _SOCKS_PATCH_LOCK:
+        if _socks_patched and _original_socket_class is not None:
+            import socket as _sk
+            _sk.socket = _original_socket_class
+            _socks_patched = False
+
+_socks_patched: bool = False
+
+def _ssl_context() -> ssl.SSLContext:
+    return ssl.create_default_context()
+
+
+def _get_urlopener() -> Callable[..., Any]:
+    from reconchain.process import _PIPELINE_CFG
+    ctx = _ssl_context()
+    proxy = _PIPELINE_CFG.proxy or os.environ.get("PROXY", "")
+    if proxy:
+        if proxy.startswith(("http://", "https://")):
+            handler = urllib.request.ProxyHandler({
+                "http": proxy,
+                "https": proxy,
+            })
+            opener = urllib.request.build_opener(handler)
+            return lambda *a, **kw: opener.open(*a, **{**kw, "context": ctx})
+        if proxy.startswith(("socks4://", "socks5://", "socks5h://", "socks4a://")):
+            global _socks_patched
+            if not _socks_patched:
+                _socks_patched = _patch_socks(proxy)
+    return lambda *a, **kw: urllib.request.urlopen(*a, **{**kw, "context": ctx})
+
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+def _get_no_redirect_urlopener() -> Callable[..., Any]:
+    from reconchain.process import _PIPELINE_CFG
+    ctx = _ssl_context()
+    proxy = _PIPELINE_CFG.proxy or os.environ.get("PROXY", "")
+    if proxy:
+        if proxy.startswith(("http://", "https://")):
+            handler = urllib.request.ProxyHandler({
+                "http": proxy,
+                "https": proxy,
+            })
+            opener = urllib.request.build_opener(_NoRedirectHandler, handler)
+            return lambda *a, **kw: opener.open(*a, **{**kw, "context": ctx})
+        if proxy.startswith(("socks4://", "socks5://", "socks5h://", "socks4a://")):
+            global _socks_patched
+            if not _socks_patched:
+                _socks_patched = _patch_socks(proxy)
+    opener = urllib.request.build_opener(_NoRedirectHandler)
+    return lambda *a, **kw: opener.open(*a, **{**kw, "context": ctx})
+
+async def _async_urlopen(urlopen_func: Any, req: urllib.request.Request, timeout: int = 10) -> Tuple[int, Any, bytes]:
+    import asyncio
+    import threading as _thr
+    result: List[Any] = [None]
+    exc: List[Optional[Exception]] = [None]
+    _resp_holder: List[Any] = [None]
+    done_event = _thr.Event()
+    abort_event = _thr.Event()
+    result_lock = _thr.Lock()
+    def _fetch() -> None:
+        try:
+            if abort_event.is_set():
+                return
+            resp = urlopen_func(req, timeout=timeout)
+            _resp_holder[0] = resp
+            if abort_event.is_set():
+                with contextlib.suppress(Exception):
+                    resp.close()
+                return
+            data = resp.read()
+            with result_lock:
+                result[0] = (resp.status, resp.headers, data)
+        except Exception as e:
+            with result_lock:
+                exc[0] = e
+        finally:
+            done_event.set()
+    t = _thr.Thread(target=_fetch, daemon=True)
+    t.start()
+    try:
+        await asyncio.wait_for(asyncio.to_thread(done_event.wait), timeout=timeout + 5)
+    except asyncio.TimeoutError:
+        abort_event.set()
+        resp = _resp_holder[0]
+        if resp is not None:
+            with contextlib.suppress(Exception):
+                resp.close()
+        raise
+    with result_lock:
+        if exc[0] is not None:
+            raise exc[0]
+        return result[0]
+
+_no_redirect_urlopener_cache: Optional[Callable] = None
+
+async def _async_urlopen_no_redirect(urlopen_func: Any, req: urllib.request.Request, timeout: int = 10) -> Tuple[int, Any, bytes]:
+    global _no_redirect_urlopener_cache
+    if _no_redirect_urlopener_cache is None:
+        _no_redirect_urlopener_cache = _get_no_redirect_urlopener()
+    return await _async_urlopen(_no_redirect_urlopener_cache, req, timeout=timeout)
+
+async def _throttle() -> None:
+    import asyncio
+    from reconchain.process import _PIPELINE_CFG
+    delay = _PIPELINE_CFG.delay
+    if delay > 0:
+        await asyncio.sleep(delay)
+
+async def _throttle_rate() -> None:
+    import asyncio
+    from reconchain.process import _PIPELINE_CFG
+    delay = _PIPELINE_CFG.delay
+    rate = _PIPELINE_CFG.rate_limit
+    if rate > 0:
+        await asyncio.sleep(1.0 / rate)
+    elif delay > 0:
+        await asyncio.sleep(delay)
+
+def _throttle_sync() -> None:
+    import time
+    from reconchain.process import _PIPELINE_CFG
+    delay = _PIPELINE_CFG.delay
+    if delay > 0:
+        time.sleep(delay)
+
+def ensure(p: Path) -> Path:
+    p.parent.mkdir(parents=True, exist_ok=True)
+    if p.is_dir():
+        raise IsADirectoryError(f"{p} is a directory, expected a file")
+    return p
+
+def _existing_artifacts(d: Dict[str, str]) -> Dict[str, str]:
+    return {k: v for k, v in d.items() if Path(v).exists()}
+
+def read_lines(p: Path, max_lines: int = 0) -> List[str]:
+    if not p.is_file():
+        return []
+    lines: List[str] = []
+    with p.open(errors="ignore") as f:
+        for ln in f:
+            ln = ln.strip()
+            if ln and not ln.lstrip().startswith("#"):
+                lines.append(ln)
+                if max_lines and len(lines) >= max_lines:
+                    break
+    return lines
+
+def iter_lines(p: Path) -> Iterator[str]:
+    if not p.is_file():
+        return
+    with p.open(errors="ignore") as f:
+        for ln in f:
+            ln = ln.strip()
+            if ln and not ln.lstrip().startswith("#"):
+                yield ln
+
+def count_nonblank(p: Path) -> int:
+    if not p.is_file():
+        return 0
+    count = 0
+    with p.open(errors="ignore") as f:
+        for ln in f:
+            if ln.strip():
+                count += 1
+    return count
+
+def merge_unique(srcs: List[Path], dst: Path, validator: Optional[Callable[[str], bool]] = None) -> int:
+    seen: Dict[str, None] = {}
+    if dst.exists():
+        try:
+            with dst.open(errors="ignore") as f:
+                for ln in f:
+                    ln = ln.strip()
+                    if not ln or ln.startswith("#"):
+                        continue
+                    if validator is not None and not validator(ln):
+                        continue
+                    seen[ln] = None
+        except (OSError, IOError):
+            pass
+    for s in srcs:
+        if not s:
+            continue
+        try:
+            with s.open(errors="ignore") as f:
+                for ln in f:
+                    ln = ln.strip()
+                    if not ln or ln.startswith("#"):
+                        continue
+                    if validator is not None and not validator(ln):
+                        continue
+                    if ln not in seen:
+                        seen[ln] = None
+        except (OSError, IOError):
+            continue
+    if not seen:
+        return 0
+    ensure(dst)
+    import tempfile
+    fd, tmp_path = tempfile.mkstemp(dir=dst.parent, suffix=".merge_tmp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write("\n".join(sorted(seen)) + "\n")
+        os.replace(tmp_path, dst)
+    except Exception:
+        with contextlib.suppress(Exception):
+            os.unlink(tmp_path)
+        raise
+    return len(seen)
+
+
+def merge_unique_incremental(srcs: List[Path], dst: Path, validator: Optional[Callable[[str], bool]] = None) -> int:
+    """Streaming merge: reads dst to build seen set, then appends only new lines from srcs.
+    Avoids re-sorting the entire output on every call."""
+    seen: Set[str] = set()
+    if dst.exists():
+        try:
+            with dst.open(errors="ignore") as f:
+                for ln in f:
+                    ln = ln.strip()
+                    if ln and not ln.startswith("#"):
+                        if validator is None or validator(ln):
+                            seen.add(ln)
+        except (OSError, IOError):
+            pass
+    new_lines: List[str] = []
+    for s in srcs:
+        if not s:
+            continue
+        try:
+            with s.open(errors="ignore") as f:
+                for ln in f:
+                    ln = ln.strip()
+                    if not ln or ln.startswith("#"):
+                        continue
+                    if validator is not None and not validator(ln):
+                        continue
+                    if ln not in seen:
+                        seen.add(ln)
+                        new_lines.append(ln)
+        except (OSError, IOError):
+            continue
+    if not new_lines:
+        return 0
+    ensure(dst)
+    with dst.open("a") as f:
+        f.write("\n".join(new_lines) + "\n")
+    return len(new_lines)
+
+def merge_unique_str(entry: str, dst: Path) -> bool:
+    with _MERGE_LOCK:
+        seen: Set[str] = set()
+        if dst.exists():
+            try:
+                with dst.open(errors="ignore") as f:
+                    for ln in f:
+                        ln = ln.strip()
+                        if ln:
+                            seen.add(ln)
+            except (OSError, IOError):
+                pass
+        if entry in seen:
+            return False
+        seen.add(entry)
+        ensure(dst)
+        import tempfile
+        fd, tmp_path = tempfile.mkstemp(dir=dst.parent, suffix=".merge_tmp")
+        try:
+            with os.fdopen(fd, "w") as f:
+                f.write("\n".join(sorted(seen)) + "\n")
+            os.replace(tmp_path, dst)
+        except Exception:
+            with contextlib.suppress(Exception):
+                os.unlink(tmp_path)
+            raise
+        return True
+
+def _downsample_file(path: Path, n: int = 1) -> None:
+    if not path.is_file():
+        return
+    import tempfile
+    fd, tmp_path = tempfile.mkstemp(dir=path.parent, suffix=".ds_tmp")
+    try:
+        written = 0
+        too_many = False
+        with path.open(encoding="utf-8", errors="ignore") as src, os.fdopen(fd, "w", encoding="utf-8") as dst:
+            for ln in src:
+                if ln.strip() and not ln.lstrip().startswith("#"):
+                    if written < n:
+                        dst.write(ln if ln.endswith("\n") else ln + "\n")
+                    written += 1
+                    if written > n:
+                        too_many = True
+        if too_many:
+            os.replace(tmp_path, path)
+        else:
+            os.unlink(tmp_path)
+    except Exception:
+        with contextlib.suppress(Exception):
+            os.unlink(tmp_path)
+        raise
+
+def safe_suffix(s: str) -> str:
+    return hashlib.sha1(s.encode("utf-8", errors="ignore")).hexdigest()[:12]
+
+def _safe_name(s: str, maxlen: int = 80) -> str:
+    safe = (
+        s.replace("/", "_").replace(":", "_").replace("?", "_")
+        .replace("&", "_").replace("=", "_").replace("#", "_")
+        .replace("%", "_").replace("\n", "").replace("\r", "")
+    )
+    return safe[:maxlen]
+
+def read_jsonl(p: Path) -> List[Any]:
+    if not p.exists():
+        return []
+    out: List[Any] = []
+    try:
+        size = p.stat().st_size
+    except OSError:
+        return []
+    with p.open(errors="ignore") as f:
+        first = f.readline().strip()
+        if first.startswith("{"):
+            try:
+                out.append(json.loads(first))
+            except json.JSONDecodeError:
+                pass
+            for ln in f:
+                ln = ln.strip()
+                if not ln or not ln.startswith("{"):
+                    continue
+                try:
+                    out.append(json.loads(ln))
+                except json.JSONDecodeError:
+                    continue
+            if out:
+                return out
+        # Fallback: only read entire file if it's small (< 10MB)
+        if size > 10 * 1024 * 1024:
+            log("warn", f"read_jsonl: {p.name} is {size // 1024}KB, returning partial results only")
+            return out
+        f.seek(0)
+        raw = f.read()
+    if not raw:
+        return []
+    try:
+        d = json.loads(raw)
+    except json.JSONDecodeError:
+        return []
+    return d if isinstance(d, list) else [d]
+
+def _extract_urls_from_ffuf_json(p: Path) -> List[str]:
+    out: List[str] = []
+    if not p.exists():
+        return out
+    try:
+        data = json.loads(p.read_text(encoding="utf-8", errors="ignore"))
+    except json.JSONDecodeError:
+        return out
+    results = data.get("results") if isinstance(data, dict) else None
+    if not isinstance(results, list):
+        return out
+    for r in results:
+        if not isinstance(r, dict):
+            continue
+        url = r.get("url")
+        status = r.get("status")
+        if url and status is not None:
+            out.append(f"{status}\t{url}")
+    return out
+
+def _merge_dnsx_output(src: Path, hosts_out: Path, full_out: Path) -> int:
+    seen_hosts: Set[str] = set()
+    seen_full_lines: Set[str] = set()
+    if hosts_out.exists():
+        for h in read_lines(hosts_out):
+            if h.strip():
+                seen_hosts.add(h.strip().lower())
+    if full_out.exists():
+        for ln in read_lines(full_out):
+            line = ln.strip()
+            if line:
+                seen_full_lines.add(line)
+                host = line.split()[0].rstrip(".").lower()
+                seen_hosts.add(host)
+    new_lines: List[str] = []
+    for ln in read_lines(src):
+        ln = ln.strip()
+        if not ln or ln.lstrip().startswith("#"):
+            continue
+        if ln in seen_full_lines:
+            continue
+        host = ln.split()[0].rstrip(".")
+        if _is_valid_hostname(host):
+            seen_full_lines.add(ln)
+            seen_hosts.add(host.lower())
+            new_lines.append(ln)
+    if new_lines:
+        with full_out.open("a") as f:
+            f.write("\n".join(new_lines) + "\n")
+        hosts_out.write_text("\n".join(sorted(seen_hosts)) + "\n")
+    return len(new_lines)
+
+def _dedupe_by_host_path(urls: List[str]) -> List[str]:
+    seen: Set[Tuple[str, str, str]] = set()
+    result: List[str] = []
+    for u in urls:
+        parsed = urllib.parse.urlparse(u)
+        key = (parsed.scheme, parsed.hostname or "", parsed.path.rstrip("/"))
+        if key not in seen:
+            seen.add(key)
+            result.append(u)
+    return result
+
+def _dedupe_by_host_params(urls: List[str]) -> List[str]:
+    seen: Set[Tuple[str, str, str, str]] = set()
+    result: List[str] = []
+    for u in urls:
+        parsed = urllib.parse.urlparse(u)
+        qs = frozenset(urllib.parse.parse_qs(parsed.query))
+        key = (parsed.scheme, parsed.hostname or "", parsed.path.rstrip("/"), str(sorted(qs)))
+        if key not in seen:
+            seen.add(key)
+            result.append(u)
+    return result
+
+def _parse_httpx_tech(src: Path, dst: Path) -> int:
+    seen: Set[str] = set()
+    for line in read_lines(src):
+        line = line.strip()
+        if not line:
+            continue
+        url = line.split()[0]
+        brackets = re.findall(r"\[.*?\]", line)
+        if len(brackets) >= 3:
+            status = brackets[0]
+            title = brackets[1]
+            tech = brackets[2]
+            entry = f"{url} {status} {title} {tech}".rstrip()
+            if entry not in seen:
+                seen.add(entry)
+    if seen:
+        ensure(dst).write_text("\n".join(sorted(seen)) + "\n")
+    return len(seen)
+
+def _mmh3_hash(data: bytes) -> int:
+    seed = 0
+    c1 = 0xCC9E2D51
+    c2 = 0x1B873593
+    r1 = 15
+    r2 = 13
+    m = 5
+    n = 0xE6546B64
+    h = seed
+    length = len(data)
+    nblocks = length // 4
+    for i in range(nblocks):
+        k = struct.unpack_from("<I", data, i * 4)[0]
+        k = (k * c1) & 0xFFFFFFFF
+        k = ((k << r1) | (k >> (32 - r1))) & 0xFFFFFFFF
+        k = (k * c2) & 0xFFFFFFFF
+        h ^= k
+        h = ((h << r2) | (h >> (32 - r2))) & 0xFFFFFFFF
+        h = (h * m + n) & 0xFFFFFFFF
+    tail = data[nblocks * 4:]
+    k = 0
+    tail_len = length & 3
+    if tail_len == 3:
+        k ^= tail[2] << 16
+    if tail_len >= 2:
+        k ^= tail[1] << 8
+    if tail_len >= 1:
+        k ^= tail[0]
+        k = (k * c1) & 0xFFFFFFFF
+        k = ((k << r1) | (k >> (32 - r1))) & 0xFFFFFFFF
+        k = (k * c2) & 0xFFFFFFFF
+        h ^= k
+    h ^= length
+    h ^= h >> 16
+    h = (h * 0x85EBCA6B) & 0xFFFFFFFF
+    h ^= h >> 13
+    h = (h * 0xC2B2AE35) & 0xFFFFFFFF
+    h ^= h >> 16
+    return h if h < 0x80000000 else h - 0x100000000
+
+def html_escape(s: str) -> str:
+    return (
+        s.replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace('"', "&quot;")
+        .replace("'", "&#39;")
+    )
+
+def md_escape(s: str) -> str:
+    return (
+        s.replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+    )
+
+class Progress:
+    def __init__(self, phases: List[str], stages: Optional[List[List[str]]] = None):
+        from reconchain.phases import _PHASE_WEIGHTS
+        self.phases = phases
+        self.phase_set = set(phases)
+        self._weight_done = 0
+        self._completed = 0
+        self._total_weight = sum(_PHASE_WEIGHTS.get(p, 1) for p in phases)
+        self._enabled = sys.stderr.isatty()
+        self._last_bar = ""
+        global _active_progress
+        _active_progress = self
+
+    def _fmt_bar(self) -> str:
+        from reconchain.phases import _PHASE_WEIGHTS
+        if self._total_weight == 0:
+            return ""
+        pct = min(100.0, (self._weight_done / self._total_weight) * 100)
+        w = int(40 * self._weight_done / self._total_weight)
+        bar = "█" * w + "░" * (40 - w)
+        return f"[{pct:5.1f}%] {bar}  {self._completed}/{len(self.phases)}  {self.phases[self._completed - 1] if self._completed <= len(self.phases) else ''}"
+
+    def _draw(self):
+        """Redraw the progress bar on the bottom line of the terminal."""
+        if not self._enabled:
+            return
+        bar = self._fmt_bar()
+        if bar == self._last_bar:
+            return
+        self._last_bar = bar
+        sys.stderr.write(f"\033[999;0H\033[K{bar}")
+        sys.stderr.flush()
+
+    def _write_above(self, text: str):
+        """Write a log line above the progress bar."""
+        if not self._enabled:
+            return
+        sys.stderr.write(f"\033[999;0H\033[K{text}\n\033[999;0H\033[K{self._last_bar}")
+        sys.stderr.flush()
+
+    def next(self, name: str):
+        from reconchain.phases import _PHASE_WEIGHTS
+        w = _PHASE_WEIGHTS.get(name, 1)
+        self._weight_done += w
+        self._completed += 1
+        self._draw()
+
+    def close(self):
+        global _active_progress
+        _active_progress = None
+        if self._enabled:
+            sys.stderr.write(f"\033[999;0H\033[K")
+            sys.stderr.flush()
+        self._last_bar = ""
+
+
+class ScanStatus:
+    """Lightweight progress persistence for terminal-reconnect support."""
+    _CONTAINER_ID = os.environ.get("HOSTNAME", "")[:8] or os.urandom(4).hex()
+    _SCAN_STATUS_DIR = Path(
+        os.environ.get("XDG_RUNTIME_DIR") or os.environ.get("TMPDIR") or "/tmp"
+    ) / f"reconchain_status_{os.getuid()}_{_CONTAINER_ID}"
+    _write_lock = threading.Lock()
+
+    def __init__(self, domain: str, outdir: Path) -> None:
+        self.domain = domain
+        self.outdir = outdir
+        self._SCAN_STATUS_DIR.mkdir(parents=True, exist_ok=True)
+        try:
+            os.chmod(str(self._SCAN_STATUS_DIR), 0o700)
+        except OSError:
+            pass
+        self._path = self._SCAN_STATUS_DIR / f"{domain.replace('.', '_')}.json"
+        self._data: Dict[str, Any] = {
+            "domain": domain,
+            "outdir": str(outdir),
+            "started_at": datetime.now().isoformat(timespec="seconds"),
+            "updated_at": datetime.now().isoformat(timespec="seconds"),
+            "phase": "",
+            "phase_progress": "",
+            "completed_phases": [],
+            "running_phases": [],
+            "total_phases": 0,
+            "errors": [],
+            "missing_tools": [],
+        }
+        self._write()
+
+    def _write(self) -> None:
+        with self._write_lock:
+            self._data["updated_at"] = datetime.now().isoformat(timespec="seconds")
+            try:
+                self._SCAN_STATUS_DIR.mkdir(parents=True, exist_ok=True)
+                if self._path.is_symlink():
+                    real = self._path.resolve()
+                    if not real.is_relative_to(self._SCAN_STATUS_DIR):
+                        self._path.unlink()
+                import tempfile
+                fd, tmp_path = tempfile.mkstemp(dir=self._SCAN_STATUS_DIR, suffix=".tmp")
+                with os.fdopen(fd, "w") as f:
+                    json.dump(self._data, f, indent=2, default=str)
+                os.replace(tmp_path, self._path)
+                # Post-write verification: ensure the target wasn't swapped to a symlink
+                if self._path.is_symlink():
+                    real = self._path.resolve()
+                    if not real.is_relative_to(self._SCAN_STATUS_DIR):
+                        self._path.unlink()
+            except Exception as exc:
+                log("err", f"ScanStatus write failed: {exc}")
+                self._data.setdefault("write_errors", []).append(str(exc))
+
+    def set_phase(self, name: str) -> None:
+        self._data["phase"] = name
+        self._data["phase_progress"] = ""
+        self._write()
+
+    def set_progress(self, msg: str) -> None:
+        self._data["phase_progress"] = msg
+        self._write()
+
+    def add_completed(self, name: str) -> None:
+        if name not in self._data["completed_phases"]:
+            self._data["completed_phases"].append(name)
+        if name in self._data["running_phases"]:
+            self._data["running_phases"].remove(name)
+        self._write()
+
+    def add_running(self, name: str) -> None:
+        if name not in self._data["running_phases"]:
+            self._data["running_phases"].append(name)
+        self._write()
+
+    def set_total(self, n: int) -> None:
+        self._data["total_phases"] = n
+        self._write()
+
+    def add_error(self, err: str) -> None:
+        self._data["errors"].append(err)
+        if len(self._data["errors"]) > 1000:
+            self._data["errors"] = self._data["errors"][-500:]
+        self._write()
+
+    def set_missing(self, tools: List[str]) -> None:
+        self._data["missing_tools"] = sorted(set(tools))
+        self._write()
+
+    def close(self) -> None:
+        self._data["status"] = "completed"
+        self._data["updated_at"] = datetime.now().isoformat(timespec="seconds")
+        if not self._write_lock.acquire(blocking=False):
+            return
+        try:
+            try:
+                self._SCAN_STATUS_DIR.mkdir(parents=True, exist_ok=True)
+                import tempfile
+                fd, tmp_path = tempfile.mkstemp(dir=self._SCAN_STATUS_DIR, suffix=".tmp")
+                with os.fdopen(fd, "w") as f:
+                    json.dump(self._data, f, indent=2, default=str)
+                os.replace(tmp_path, self._path)
+            except Exception as exc:
+                log("err", f"ScanStatus close failed: {exc}")
+        finally:
+            self._write_lock.release()
+
+    @classmethod
+    def load(cls, domain: str) -> Optional[Dict[str, Any]]:
+        path = cls._SCAN_STATUS_DIR / f"{domain.replace('.', '_')}.json"
+        if path.exists():
+            try:
+                return json.loads(path.read_text(encoding="utf-8", errors="ignore"))
+            except (json.JSONDecodeError, ValueError):
+                pass
+        return None
+
+    @classmethod
+    def list_active(cls) -> List[Dict[str, Any]]:
+        results: List[Dict[str, Any]] = []
+        if not cls._SCAN_STATUS_DIR.exists():
+            return results
+        for f in sorted(cls._SCAN_STATUS_DIR.glob("*.json")):
+            try:
+                data = json.loads(f.read_text(encoding="utf-8", errors="ignore"))
+                if data.get("status") != "completed":
+                    results.append(data)
+            except Exception:
+                continue
+        return results

@@ -1,0 +1,44 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "reconchain"
+version = "1.5.1"
+description = "A stdlib Python orchestrator for chained reconnaissance tooling."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "ReconChain contributors" }]
+keywords = ["reconnaissance", "security", "bug-bounty", "automation"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Topic :: Security",
+]
+dependencies = []
+
+[project.optional-dependencies]
+progress = [
+  "tqdm>=4.66",
+]
+dev = [
+  "pytest>=8",
+  "ruff>=0.5",
+  "tqdm>=4.66",
+]
+
+[project.scripts]
+reconchain = "reconchain:main"
+
+[tool.setuptools]
+packages = ["reconchain"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+
+[tool.ruff]
+line-length = 100
+target-version = "py39"
+

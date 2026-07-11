@@ -1,0 +1,16 @@
+services:
+  reconchain:
+    build: .
+    container_name: reconchain
+    deploy:
+      resources:
+        limits:
+          memory: 8G
+          cpus: "2.0"
+        reservations:
+          memory: 2G
+          cpus: "1.0"
+    volumes:
+      - ./out:/data/out
+    entrypoint: ["python3", "/opt/reconchain/reconchain.py"]
+    command: ["--help"]

@@ -110,14 +110,67 @@ def interactive_setup() -> argparse.Namespace:
     sqlmap_level = _prompt("SQLmap --level (1=fast/basic, 5=deep/slow)", default="1", validator=lambda v: v.isdigit() and 1 <= int(v) <= 5, error_msg="Enter a number between 1 and 5")
     sqlmap_risk = _prompt("SQLmap --risk (1=safe, 3=aggressive/destructive)", default="1", validator=lambda v: v.isdigit() and 1 <= int(v) <= 3, error_msg="Enter a number between 1 and 3")
     delay = _prompt("Delay between requests in seconds (0=fast, 2=polite, 5=stealth)", default="0", validator=lambda v: v.replace(".", "", 1).isdigit(), error_msg="Enter a number (e.g. 0, 0.5, 2)")
-    _suggested_procs = min(jobs, max(2, (os.cpu_count() or 4) // 2))
-    max_procs_str = _prompt(
-        f"Max concurrent tool subprocesses (prevents VM crashes, 0=auto)",
-        default=str(_suggested_procs),
-        validator=lambda v: v.isdigit() and int(v) >= 0,
-        error_msg="Enter 0 or a positive number"
-    )
-    max_procs = int(max_procs_str)
+    print(f"\n{C['b']}Adaptive concurrency (auto-tunes CPU/RAM usage):{C['r']}")
+    adaptive_enabled = _prompt_yes_no("Enable adaptive resource monitor (starts conservative, ramps up automatically)", default=True)
+    if adaptive_enabled:
+        _max_default = min((os.cpu_count() or 4) * 2, 16)
+        adaptive_start_str = _prompt(
+            "Starting concurrency (low = safer, high = faster start)",
+            default="2",
+            validator=lambda v: v.isdigit() and int(v) >= 1,
+            error_msg="Enter a number >= 1"
+        )
+        adaptive_max_str = _prompt(
+            f"Max concurrency (cap for auto-scaling, 0=auto={_max_default})",
+            default="0",
+            validator=lambda v: v.isdigit() and int(v) >= 0,
+            error_msg="Enter 0 or a positive number"
+        )
+        adaptive_interval_str = _prompt(
+            "Monitor check interval in seconds (how often to measure CPU/RAM)",
+            default="5",
+            validator=lambda v: v.replace(".", "", 1).isdigit() and float(v) >= 1,
+            error_msg="Enter a number >= 1"
+        )
+        adaptive_cpu_high_str = _prompt(
+            "CPU threshold to reduce concurrency (0-100%)",
+            default="80",
+            validator=lambda v: v.isdigit() and 1 <= int(v) <= 100,
+            error_msg="Enter a number between 1 and 100"
+        )
+        adaptive_ram_crit_str = _prompt(
+            "RAM free threshold to reduce concurrency in GB (below = reduce)",
+            default="1",
+            validator=lambda v: v.replace(".", "", 1).isdigit() and float(v) >= 0.1,
+            error_msg="Enter a number >= 0.1"
+        )
+        adaptive_max_procs_str = _prompt(
+            "Hard cap on concurrent subprocesses (nuclei/httpx/etc, 0=auto)",
+            default="0",
+            validator=lambda v: v.isdigit() and int(v) >= 0,
+            error_msg="Enter 0 or a positive number"
+        )
+        adaptive_start = int(adaptive_start_str)
+        adaptive_max = int(adaptive_max_str) if int(adaptive_max_str) > 0 else _max_default
+        adaptive_interval = float(adaptive_interval_str)
+        adaptive_cpu_high = int(adaptive_cpu_high_str)
+        adaptive_ram_crit = int(adaptive_ram_crit_str)
+        adaptive_max_procs = int(adaptive_max_procs_str)
+    else:
+        _suggested_procs = min(jobs, max(2, (os.cpu_count() or 4) // 2))
+        max_procs_str = _prompt(
+            "Max concurrent tool subprocesses (prevents VM crashes, 0=auto)",
+            default=str(_suggested_procs),
+            validator=lambda v: v.isdigit() and int(v) >= 0,
+            error_msg="Enter 0 or a positive number"
+        )
+        adaptive_start = 0
+        adaptive_max = 0
+        adaptive_interval = 5.0
+        adaptive_cpu_high = 80
+        adaptive_ram_crit = 1
+        adaptive_max_procs = 0
+        max_procs = int(max_procs_str)
     rate_limit_str = _prompt(
         "Rate limit: max requests/sec per tool (0=unlimited, 5=gentle, 10=polite, 50=fast)",
         default="10",
@@ -331,7 +384,12 @@ def interactive_setup() -> argparse.Namespace:
     print(f"   Proxy:            {C['y']}{proxy if proxy else 'none (auto-detected)'}{C['r']}")
     print(f"   Phases:           {C['y']}{', '.join(sorted(selected))}{C['r']}")
     print(f"   Jobs:             {C['y']}{jobs}{C['r']}")
-    print(f"   Max procs:        {C['y']}{max_procs if max_procs else 'auto'}{C['r']}")
+    if adaptive_enabled:
+        print(f"   Adaptive:         {C['y']}ON (start={adaptive_start}, max={adaptive_max}, max_procs={adaptive_max_procs}, interval={adaptive_interval}s){C['r']}")
+        print(f"   CPU threshold:    {C['y']}{adaptive_cpu_high}% to scale down{C['r']}")
+        print(f"   RAM threshold:    {C['y']}{adaptive_ram_crit}GB free to scale down{C['r']}")
+    else:
+        print(f"   Max procs:        {C['y']}{max_procs if max_procs else 'auto'}{C['r']}")
     print(f"   Rate limit:       {C['y']}{rate_limit if rate_limit else 'unlimited'} req/s{C['r']}")
     print(f"   SQLmap level/risk:{C['y']} {sqlmap_level}/{sqlmap_risk}{C['r']}")
     print(f"   Delay:            {C['y']}{delay}s{C['r']}")
@@ -356,7 +414,14 @@ def interactive_setup() -> argparse.Namespace:
     ns.only = selected
     ns.skip = set()
     ns.jobs = jobs
-    ns.max_procs = max_procs
+    ns.adaptive = adaptive_enabled
+    ns.adaptive_start = adaptive_start
+    ns.adaptive_max = adaptive_max
+    ns.adaptive_interval = adaptive_interval
+    ns.adaptive_cpu_high = adaptive_cpu_high
+    ns.adaptive_ram_crit = adaptive_ram_crit
+    ns.adaptive_max_procs = adaptive_max_procs
+    ns.max_procs = 0 if adaptive_enabled else max_procs
     ns.fast = False
     ns.dos_mode = dos_mode
     ns.resume = resume
@@ -538,6 +603,15 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--skip", default=set(), type=_parse_phase_csv, help="comma-separated phases to skip, e.g. 10-TLSCMS,23-RACE")
     p.add_argument("-j", "--jobs", type=int, default=MAX_PARALLEL_JOBS, help=f"max parallel phases (default: {MAX_PARALLEL_JOBS})")
     p.add_argument("--max-procs", type=int, default=0, help="max concurrent tool subprocesses across all phases (0 = unlimited, default: 0)")
+    p.add_argument("--adaptive", action="store_true", default=True, help="enable adaptive resource monitor (default: on)")
+    p.add_argument("--no-adaptive", action="store_false", dest="adaptive", help="disable adaptive monitor, use static concurrency")
+    p.add_argument("--adaptive-start", type=int, default=2, help="starting concurrency for adaptive monitor (default: 2)")
+    p.add_argument("--adaptive-max", type=int, default=0, help="max concurrency cap for adaptive monitor (0 = auto, default: 0)")
+    p.add_argument("--adaptive-max-procs", type=int, default=0, help="hard cap on concurrent subprocesses (nuclei/httpx/etc) (0 = auto, default: 0)")
+    p.add_argument("--adaptive-interval", type=float, default=5.0, help="monitor check interval in seconds (default: 5.0)")
+    p.add_argument("--adaptive-cpu-high", type=int, default=80, help="CPU%% threshold to reduce concurrency (default: 80)")
+    p.add_argument("--adaptive-ram-crit", type=float, default=1.0, help="RAM free GB threshold to reduce concurrency (default: 1.0)")
+    p.add_argument("--safe", action="store_true", default=False, help="very conservative mode for VMs: start=1, max=4, max_procs=2, low thresholds")
     p.add_argument("--fast", action="store_true", help="fast mode: only run essential recon phases (01-RECON, 02-RESOLVE, 04-SCAN, 05-HARVEST), skipping vuln scanning")
     p.add_argument("--dos", action="store_true", default=False, dest="dos_mode", help="enable DoS-like attack phases (race bursts, HTTP smuggling, GraphQL depth DoS, H2 rapid reset, credential spray) — disabled by default")
     p.add_argument("--no-dos", action="store_false", dest="dos_mode", help="disable DoS-like attack phases to avoid service disruption")

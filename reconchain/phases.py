@@ -714,13 +714,12 @@ async def phase_04_SCAN(
             "04-SCAN.takeover": str(outdir / "takeover.txt"),
             "count": count_nonblank(ports_file),
         }
-    log("info", "Phase 04-SCAN: ports / hosts / takeover (parallel)")
+    log("info", "Phase 04-SCAN: ports / hosts / takeover (sequential)")
     # naabu/httpx/nuclei-takeover accept host:port (or hosts from httpx)
     hosts = Path(prev.get("02-RESOLVE") or outdir / "resolved.txt")
     # nuclei takeover templates need CLEAN subdomains (no `[1.2.3.4]` suffix from dnsx -resp)
     subs = Path(prev.get("01-RECON") or outdir / "all_subs.txt")
     ports_file = outdir / "ports.txt"
-    jobs: List[Tuple[str, List[str], int]] = []
     have_hosts = hosts.exists() and bool(read_lines(hosts))
     have_subs = subs.exists() and bool(read_lines(subs))
     if not have_hosts and not have_subs:
@@ -738,72 +737,45 @@ async def phase_04_SCAN(
                 "04-SCAN.targets": str(outdir / "host_targets.txt"),
                 "04-SCAN.takeover": str(outdir / "takeover.txt"),
             })
+    # STEP 1: Port scan (naabu or nmap) — one tool at a time to keep RAM low
     if have_hosts and t.has("naabu"):
-        jobs.append(
-            (
-                "naabu",
-                [
-                    "naabu", "-silent", "-l", str(hosts), "-o", str(ports_file),
-                    "-top-ports", "1000",
-                ],
-                _maybe_timeout(1800),
-            )
-        )
-        # UDP scanning not supported by naabu 2.x; skipped
+        await run_parallel([(
+            "naabu",
+            ["naabu", "-silent", "-l", str(hosts), "-o", str(ports_file), "-top-ports", "1000"],
+            _maybe_timeout(1800),
+        )], outdir)
     elif have_hosts and t.has("nmap"):
         _nmap_cmd = ["nmap", "-iL", str(hosts), "-Pn", "--top-ports", "1000", "--open",
                      "--script=http-enum", "-oG", str(outdir / "ports.gnmap")]
-        jobs.append(("nmap", _nmap_cmd, _maybe_timeout(1800)))
-    # DNS takeover check via nuclei (separate from http/takeovers)
-    if t.has("nuclei"):
-        await _update_nuclei_templates(outdir)
-    if t.has("nuclei") and have_subs:
-        # dns/ directory contains individual takeover templates (no dns/takeovers/ subdir)
-        _nuc_proxy = []
-        if _PIPELINE_CFG.proxy:
-            _nuc_proxy = ["-proxy", _PIPELINE_CFG.proxy]
-        jobs.append(
-            (
-                "nuclei-dns-takeover",
-                [
-                    "nuclei", "-silent", "-l", str(subs),
-                    "-t", "dns/", "-tags", "takeover",
-                    "-timeout", "15", "-max-host-error", "10",
-                    "-o", str(outdir / "takeover_dns.txt"),
-                ] + _nuc_proxy + _rate_limit_args("nuclei"),
-                _maybe_timeout(1800),
-            )
-        )
+        await run_parallel([("nmap", _nmap_cmd, _maybe_timeout(1800))], outdir)
+    # STEP 2: HTTP probe (httpx or httprobe) — after port scan frees RAM
     if have_hosts and t.has("httpx"):
         _httpx_proxy = []
         if _PIPELINE_CFG.proxy:
             _httpx_proxy = ["-proxy", _PIPELINE_CFG.proxy]
-        jobs.append(
-            (
+        await run_parallel([(
+            "httpx",
+             [
                 "httpx",
-                 [
-                    "httpx",
-                    "-silent",
-                    "-l",
-                    str(hosts),
-                    "-o",
-                    str(outdir / "hosts.txt"),
-                    "-title",
-                    "-tech-detect",
-                    "-status-code",
-                    "-follow-redirects",
-                ] + _extra_http_args() + _httpx_proxy + _rate_limit_args("httpx"),
-                1800,
-            )
-        )
-    if have_hosts and t.has("httprobe"):
+                "-silent",
+                "-l",
+                str(hosts),
+                "-o",
+                str(outdir / "hosts.txt"),
+                "-title",
+                "-tech-detect",
+                "-status-code",
+                "-follow-redirects",
+            ] + _extra_http_args() + _httpx_proxy + _rate_limit_args("httpx"),
+            1800,
+        )], outdir)
+    elif have_hosts and t.has("httprobe"):
         httprobe_out = outdir / "hosts_httprobe.txt"
         httprobe_runner = outdir / "logs" / "httprobe_runner.sh"
         ensure(httprobe_runner)
         _httprobe_conc = "50"
         _httprobe_rl = _rate_limit_args("httprobe")
         if _httprobe_rl:
-            # Extract -c value from rate-limit args
             for i, a in enumerate(_httprobe_rl):
                 if a == "-c" and i + 1 < len(_httprobe_rl):
                     _httprobe_conc = _httprobe_rl[i + 1]
@@ -815,36 +787,48 @@ async def phase_04_SCAN(
             f'cat "$INPUT" | httprobe -c {_httprobe_conc} -t 3000 > "$OUTPUT"\n'
         )
         httprobe_runner.chmod(0o700)
-        jobs.append(
-            (
-                "httprobe",
-                ["bash", str(httprobe_runner)],
-                600,
-            )
-        )
+        await run_parallel([(
+            "httprobe",
+            ["bash", str(httprobe_runner)],
+            600,
+        )], outdir)
+    # STEP 3: Nuclei templates update (only once)
+    if t.has("nuclei"):
+        await _update_nuclei_templates(outdir)
+    # STEP 4: Takeover detection (nuclei) — after httpx freed RAM
+    if t.has("nuclei") and have_subs:
+        _nuc_proxy = []
+        if _PIPELINE_CFG.proxy:
+            _nuc_proxy = ["-proxy", _PIPELINE_CFG.proxy]
+        await run_parallel([(
+            "nuclei-dns-takeover",
+            [
+                "nuclei", "-silent", "-l", str(subs),
+                "-t", "dns/", "-tags", "takeover",
+                "-timeout", "15", "-max-host-error", "10",
+                "-o", str(outdir / "takeover_dns.txt"),
+            ] + _nuc_proxy + _rate_limit_args("nuclei"),
+            _maybe_timeout(1800),
+        )], outdir)
     if have_hosts and t.has("nuclei"):
         _nuc_proxy = []
         if _PIPELINE_CFG.proxy:
             _nuc_proxy = ["-proxy", _PIPELINE_CFG.proxy]
-        jobs.append(
-            (
-                "nuclei-takeover",
-                [
-                    "nuclei",
-                    "-silent",
-                    "-l",
-                    str(hosts),
-                    "-t",
-                    "http/takeovers",
-                    "-timeout", "30", "-max-host-error", "10",
-                    "-o",
-                    str(outdir / "takeover.txt"),
-                ] + _extra_http_args() + _nuc_proxy + _rate_limit_args("nuclei"),
-                _maybe_timeout(1800),
-            )
-        )
-    if jobs:
-        await run_parallel(jobs, outdir)
+        await run_parallel([(
+            "nuclei-takeover",
+            [
+                "nuclei",
+                "-silent",
+                "-l",
+                str(hosts),
+                "-t",
+                "http/takeovers",
+                "-timeout", "30", "-max-host-error", "10",
+                "-o",
+                str(outdir / "takeover.txt"),
+            ] + _extra_http_args() + _nuc_proxy + _rate_limit_args("nuclei"),
+            _maybe_timeout(1800),
+        )], outdir)
     # Deduplicate naabu port output (naabu can emit duplicates)
     if ports_file.exists():
         _deduped = sorted(set(read_lines(ports_file)))
@@ -1744,7 +1728,7 @@ async def phase_09_VULNSCAN(outdir: Path, t: Tools, only: PhaseSet, skip: PhaseS
     _f1_out = outdir / "nuclei_combined.txt"
     if _f1_out.exists() and not force:
         return {"09-VULNSCAN": str(_f1_out), "count": count_nonblank(_f1_out)}
-    log("info", "Phase 09-VULNSCAN: nuclei (full) + tech-scanner")
+    log("info", "Phase 09-VULNSCAN: nuclei (full) + tech-scanner (sequential)")
     hosts = outdir / "host_targets.txt"
     if not hosts.exists() or not read_lines(hosts):
         raw_hosts = outdir / "hosts.txt"
@@ -1755,7 +1739,6 @@ async def phase_09_VULNSCAN(outdir: Path, t: Tools, only: PhaseSet, skip: PhaseS
     if not hosts.exists() or not read_lines(hosts):
         log("warn", "09-VULNSCAN: no hosts; skipping")
         return {"09-VULNSCAN": str(outdir / "nuclei_combined.txt"), "count": 0}
-    jobs: List[Tuple[str, List[str], int]] = []
     _proxy_opt = []
     if _PIPELINE_CFG.proxy:
         _proxy_opt = ["-proxy", _PIPELINE_CFG.proxy]
@@ -1767,54 +1750,44 @@ async def phase_09_VULNSCAN(outdir: Path, t: Tools, only: PhaseSet, skip: PhaseS
         ] + _extra_http_args()
         if _PIPELINE_CFG.rate_limit:
             nuclei_base += ["-rl", str(_PIPELINE_CFG.rate_limit)]
-        # Bulk-size: process multiple templates per host for faster scans
         nuclei_base += ["-bs", "25"]
-        # Tags: prefer cves, exposures for high-signal findings; exclude
-        # info-severity templates that add noise on large targets.
         nuclei_tags = ["cves", "exposures", "misconfig", "vulnerabilities"]
         if _PIPELINE_CFG.nuclei_exclude_tags:
             nuclei_base += ["-et", _PIPELINE_CFG.nuclei_exclude_tags]
-        jobs.append(
-            (
-                "nuclei-cves",
-                nuclei_base
-                + ["-tags", ",".join(nuclei_tags), "-severity", "low,medium,high,critical",
-                   "-o", str(outdir / "nuclei.txt")]
-                + _proxy_opt,
-                3600,
-            )
-        )
-        # Headless scan for DOM-based / client-side issues (needs nuclei with
-        # headless engine — silently skipped if unsupported).
+        # STEP 1: nuclei CVE scan
+        await run_parallel([(
+            "nuclei-cves",
+            nuclei_base
+            + ["-tags", ",".join(nuclei_tags), "-severity", "low,medium,high,critical",
+               "-o", str(outdir / "nuclei.txt")]
+            + _proxy_opt,
+            3600,
+        )], outdir)
+        # STEP 2: tech-scanner
+        await run_parallel([(
+            "tech-scanner",
+            nuclei_base
+            + ["-t", "http/technologies",
+               "-o", str(outdir / "tech.txt")]
+            + _proxy_opt,
+            3600,
+        )], outdir)
+        # STEP 3: headless scan (optional, needs Chrome)
         _has_browser = any(
             shutil.which(b) for b in
             ("google-chrome", "chromium-browser", "chromium", "chrome", "google-chrome-stable")
         )
         if _has_browser:
-            jobs.append(
-                (
-                    "nuclei-headless",
-                    nuclei_base
-                    + ["-headless", "-ho", "--headless=new,--no-sandbox,--disable-gpu", "-tags", "headless", "-severity", "medium,high,critical",
-                       "-o", str(outdir / "nuclei_headless.txt")]
-                    + _proxy_opt,
-                    3600,
-                )
-            )
-        else:
-            log("info", "nuclei-headless: no Chrome/Chromium found; skipping")
-        # tech-scanner uses the same nuclei binary; do not double-gate on httpx.
-        jobs.append(
-            (
-                "tech-scanner",
+            await run_parallel([(
+                "nuclei-headless",
                 nuclei_base
-                + ["-t", "http/technologies",
-                   "-o", str(outdir / "tech.txt")]
+                + ["-headless", "-ho", "--headless=new,--no-sandbox,--disable-gpu", "-tags", "headless", "-severity", "medium,high,critical",
+                   "-o", str(outdir / "nuclei_headless.txt")]
                 + _proxy_opt,
                 3600,
-            )
-        )
-    await run_parallel(jobs, outdir)
+            )], outdir)
+        else:
+            log("info", "nuclei-headless: no Chrome/Chromium found; skipping")
     n = merge_unique(
         [outdir / "nuclei.txt", outdir / "nuclei_headless.txt", outdir / "tech.txt"],
         outdir / "nuclei_combined.txt",
@@ -1859,6 +1832,29 @@ async def phase_10_TLSCMS(outdir: Path, t: Tools, only: PhaseSet, skip: PhaseSet
         return {"10-TLSCMS": str(outdir / "tls_wp.txt"), "count": 0}
     sample = read_lines(hosts)[:_PIPELINE_CFG.sample_hosts_ssl]
     testssl_bin = "testssl.sh" if t.has("testssl.sh") else ("testssl" if t.has("testssl") else None)
+    # Pre-flight: verify testssl's bundled openssl actually works (old bundled
+    # openssl 1.0.2 segfaults on modern glibc when OPENSSL_CONF is set by testssl).
+    # `openssl version` works fine — must test s_client to trigger the real crash.
+    if testssl_bin:
+        _testssl_bin_path = shutil.which(testssl_bin)
+        if _testssl_bin_path:
+            # Resolve symlinks to find the REAL testssl installation directory
+            _testssl_real = str(Path(_testssl_bin_path).resolve().parent)
+            _openssl_bin = str(Path(_testssl_real) / "bin" / "openssl.Linux.x86_64")
+            if not os.path.isfile(_openssl_bin):
+                _openssl_bin = str(Path(_testssl_real) / "bin" / "openssl")
+            if os.path.isfile(_openssl_bin):
+                try:
+                    _test = subprocess.run(
+                        [_openssl_bin, "s_client", "-connect", "example.com:443", "-no_comp"],
+                        stdin=subprocess.DEVNULL, capture_output=True,
+                        timeout=10, env={**os.environ, "OPENSSL_CONF": "/dev/null"},
+                    )
+                    if _test.returncode < 0:
+                        log("warn", f"10-TLSCMS: {_openssl_bin} segfaults (signal {-_test.returncode}); skipping testssl — using Python TLS fallback only")
+                        testssl_bin = None
+                except Exception:
+                    pass
     # testssl: write PER-HOST files via a runner (no shared `>>` file ⇒ no race).
     # The Python TLS fallback below works correctly over proxychains (Python's
     # socket module is hooked by LD_PRELOAD) unlike testssl.sh's /dev/tcp.
@@ -2000,8 +1996,12 @@ async def phase_10_TLSCMS(outdir: Path, t: Tools, only: PhaseSet, skip: PhaseSet
         p.unlink(missing_ok=True)
     for p in outdir.glob("wpscan_*.txt"):
         p.unlink(missing_ok=True)
-    # run both groups in parallel; per-host files remove the race
-    await run_parallel(testssl_jobs + wpscan_jobs, outdir)
+    # STEP 1: TLS check (testssl or Python fallback) — sequential to keep RAM low
+    if testssl_jobs:
+        await run_parallel(testssl_jobs, outdir)
+    # STEP 2: WordPress scan — after TLS check freed RAM
+    if wpscan_jobs:
+        await run_parallel(wpscan_jobs, outdir)
     n = merge_unique(
         list(outdir.glob("testssl_*.txt")) + list(outdir.glob("testssl_py_*.txt")) + list(outdir.glob("wpscan_*.txt")),
         outdir / "tls_wp.txt",

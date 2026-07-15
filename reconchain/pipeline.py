@@ -23,7 +23,7 @@ from reconchain.process import (
     _TOOL_RC_REGISTRY,
     _run, _cleanup_child_procs, _csv_from_phases,
     _maybe_timeout, _atomic_write_json, _update_nuclei_templates,
-    _push_phase_proxy, _pop_phase_proxy,
+    _push_phase_proxy, _pop_phase_proxy, MAX_OS_PROCS,
 )
 from reconchain.reporting import (
     _counts, _coverage, write_summary, write_html, write_markdown,
@@ -39,6 +39,7 @@ from reconchain.interactsh import Interactsh
 from reconchain.dedup import DedupEngine
 from reconchain.monitor import MonitorEngine
 from reconchain.verify import filter_outputs
+from reconchain.resource_monitor import AdaptiveSemaphore, AdaptiveThreadSemaphore, ResourceMonitor, get_resource_monitor
 
 
 async def run_pipeline(args: argparse.Namespace) -> int:
@@ -118,6 +119,54 @@ async def run_pipeline(args: argparse.Namespace) -> int:
         else:
             t.seed_missing([m])
     global _JOB_SEM
+
+    # --- Concurrency setup: adaptive (ramp-up) or static ---
+    jobs = max(1, args.jobs)
+    _adaptive_enabled = getattr(args, 'adaptive', True)
+    _adaptive_start = getattr(args, 'adaptive_start', 2)
+    _adaptive_max = getattr(args, 'adaptive_max', 0)
+    _adaptive_interval = getattr(args, 'adaptive_interval', 5.0)
+    _adaptive_cpu_high = getattr(args, 'adaptive_cpu_high', 80)
+    _adaptive_ram_crit = getattr(args, 'adaptive_ram_crit', 1)
+
+    _adaptive_max_procs = getattr(args, 'adaptive_max_procs', 0)
+
+    # --safe mode: very conservative defaults for VMs / low-resource systems
+    if getattr(args, 'safe', False):
+        jobs = 1
+        _adaptive_start = max(_adaptive_start, 1)
+        _adaptive_max = min(_adaptive_max if _adaptive_max > 0 else 999, 4)
+        _adaptive_max_procs = min(_adaptive_max_procs if _adaptive_max_procs > 0 else 999, 2)
+        _adaptive_cpu_high = min(_adaptive_cpu_high, 60)
+        _adaptive_ram_crit = max(_adaptive_ram_crit, 2.0)
+        log("info", f"Safe mode: phases={jobs}, start={_adaptive_start}, max={_adaptive_max}, max_procs={_adaptive_max_procs}")
+
+    if _adaptive_enabled:
+        _adaptive_sem = AdaptiveSemaphore(initial=_adaptive_start)
+        _JOB_SEM = _adaptive_sem
+        _PHASE_SEM = asyncio.Semaphore(jobs)
+
+        _resmon = get_resource_monitor(
+            initial=_adaptive_start,
+            max_limit=_adaptive_max if _adaptive_max > 0 else None,
+            interval=_adaptive_interval,
+            cpu_high=float(_adaptive_cpu_high),
+            ram_crit_bytes=int(_adaptive_ram_crit * 1024 * 1024 * 1024),
+            max_os_procs=_adaptive_max_procs if _adaptive_max_procs > 0 else None,
+        )
+        _resmon.bind(_adaptive_sem, os_sem=_proc_mod._OS_PROC_SEM)
+        _resmon.start()
+        log("info", f"ResourceMonitor started: initial={_adaptive_start}, max={_resmon._max_limit}, os_procs={MAX_OS_PROCS}, interval={_adaptive_interval}s")
+    else:
+        max_procs = getattr(args, 'max_procs', 0) or 0
+        if max_procs <= 0:
+            max_procs = MAX_OS_PROCS
+        _JOB_SEM = asyncio.Semaphore(max_procs)
+        _PHASE_SEM = asyncio.Semaphore(jobs)
+        import reconchain.process as _proc_mod
+        _proc_mod._OS_PROC_SEM = AdaptiveThreadSemaphore(max_procs)
+        _resmon = None
+        log("info", f"Static concurrency: {max_procs} procs, {jobs} phases")
 
     cookie = getattr(args, 'cookie', '')
     if not cookie:
@@ -251,16 +300,7 @@ async def run_pipeline(args: argparse.Namespace) -> int:
     for _f in dataclasses.fields(_new_cfg):
         setattr(_proc_mod._PIPELINE_CFG, _f.name, getattr(_new_cfg, _f.name))
     jobs = max(1, args.jobs)
-    max_procs = getattr(args, 'max_procs', 0) or 0
-    # When --max-procs is 0 (default), use a conservative cap based on CPU count
-    if max_procs <= 0:
-        max_procs = min(jobs, max(2, (os.cpu_count() or 4) // 2))
-    _JOB_SEM = asyncio.Semaphore(max_procs)
     _PHASE_SEM = asyncio.Semaphore(jobs)
-
-    # Sync the hard OS process counter to match --max-procs
-    import reconchain.process as _proc_mod
-    _proc_mod._OS_PROC_SEM = threading.Semaphore(max_procs)
     oast = Interactsh(outdir)
     oast_started = False
     # Enhancement modules
@@ -313,6 +353,9 @@ async def run_pipeline(args: argparse.Namespace) -> int:
 
     async def _run_phase(name: str) -> Dict[str, Any]:
         async with _PHASE_SEM:
+            if _resmon is not None and _resmon.paused:
+                log("warn", f"Emergency pause active (low RAM) — waiting before {name}")
+                await _resmon.wait_if_paused()
             fn = phase_map[name]
             kwargs = {
                 "domain": args.domain,
@@ -331,9 +374,13 @@ async def run_pipeline(args: argparse.Namespace) -> int:
             scan_status.set_phase(name)
             scan_status.add_running(name)
             t0 = datetime.now()
+            result: Dict[str, Any] = {}
             await _push_phase_proxy(name, proxy, vuln_proxy)
             try:
                 result = await fn(**call)
+            except asyncio.CancelledError:
+                log("warn", f"phase {name} cancelled")
+                raise
             except Exception as e:
                 log("err", f"phase {name} crashed: {e}")
                 scan_status.add_error(str(e))
@@ -343,17 +390,17 @@ async def run_pipeline(args: argparse.Namespace) -> int:
                     await asyncio.shield(_pop_phase_proxy())
                 except (asyncio.CancelledError, Exception):
                     pass
-            t1 = datetime.now()
-            elapsed = (t1 - t0).total_seconds()
-            phase_timing[name] = {
-                "start": t0.isoformat(timespec="seconds"),
-                "end": t1.isoformat(timespec="seconds"),
-                "elapsed_seconds": round(elapsed, 1),
-            }
-            scan_status.add_completed(name)
-            scan_status.set_missing(state.get("missing_tools", []))
-            progress.next(name)
-            return result or {}
+                t1 = datetime.now()
+                elapsed = (t1 - t0).total_seconds()
+                phase_timing[name] = {
+                    "start": t0.isoformat(timespec="seconds"),
+                    "end": t1.isoformat(timespec="seconds"),
+                    "elapsed_seconds": round(elapsed, 1),
+                }
+                scan_status.add_completed(name)
+                scan_status.set_missing(state.get("missing_tools", []))
+                progress.next(name)
+            return result
 
     _shutdown_event = threading.Event()
     def _signal_handler(sig, frame):
@@ -398,18 +445,16 @@ async def run_pipeline(args: argparse.Namespace) -> int:
         phase_timeout = int(7200 * proxy_timeout_mult) if vuln_proxy else 7200
 
         def _check_memory() -> None:
-            """Warn if available memory is critically low."""
-            try:
-                with open("/proc/meminfo") as f:
-                    for line in f:
-                        if line.startswith("MemAvailable:"):
-                            avail_kb = int(line.split()[1])
-                            avail_gb = avail_kb / (1024 * 1024)
-                            if avail_gb < 1.0:
-                                log("warn", f"LOW MEMORY: {avail_gb:.1f} GB available — tools may be killed by OOM")
-                            break
-            except (OSError, ValueError):
-                pass
+            """Warn if resource monitor reports critically low memory."""
+            if _resmon is None:
+                return
+            ram_gb = _resmon.ram_available_gb
+            cpu = _resmon.cpu_percent
+            conc = _resmon.current_concurrency
+            if ram_gb < 1.0:
+                log("warn", f"LOW MEMORY: {ram_gb:.1f} GB available — concurrency={conc}, CPU={cpu:.0f}%")
+            elif cpu > 90:
+                log("warn", f"HIGH CPU: {cpu:.0f}% — concurrency={conc}, RAM={ram_gb:.1f}GB")
 
         _memory_check_counter = 0
         while len(completed_phases) < len(phases_to_run):
@@ -432,11 +477,13 @@ async def run_pipeline(args: argparse.Namespace) -> int:
                 timeout=phase_timeout,
             )
             if not done_set:
-                longest = max(phase_started, key=lambda n: phase_started[n])
+                longest = min(phase_started, key=lambda n: phase_started[n])
                 log("warn", f"phase {longest} timed out after {phase_timeout}s; cancelling")
                 pending_tasks[longest].cancel()
                 pending_tasks.pop(longest, None)
                 phase_started.pop(longest, None)
+                _apply(longest, {})
+                completed_phases.add(longest)
                 continue
             for name, task in list(pending_tasks.items()):
                 if task in done_set:
@@ -470,6 +517,8 @@ async def run_pipeline(args: argparse.Namespace) -> int:
                     except Exception as e:
                         log("warn", f"state.json write failed: {e}")
     finally:
+        if _resmon is not None:
+            _resmon.stop()
         if _cookie_file and _cookie_file.exists():
             with contextlib.suppress(Exception):
                 _cookie_file.unlink()

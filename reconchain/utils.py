@@ -536,7 +536,11 @@ def _safe_name(s: str, maxlen: int = 80) -> str:
         s.replace("/", "_").replace(":", "_").replace("?", "_")
         .replace("&", "_").replace("=", "_").replace("#", "_")
         .replace("%", "_").replace("\n", "").replace("\r", "")
+        .replace("\x00", "")
     )
+    # Collapse path traversal components
+    while ".." in safe:
+        safe = safe.replace("..", "_")
     return safe[:maxlen]
 
 def read_jsonl(p: Path) -> List[Any]:
@@ -748,7 +752,7 @@ class Progress:
         pct = min(100.0, (self._weight_done / self._total_weight) * 100)
         w = int(40 * self._weight_done / self._total_weight)
         bar = "█" * w + "░" * (40 - w)
-        return f"[{pct:5.1f}%] {bar}  {self._completed}/{len(self.phases)}  {self.phases[self._completed - 1] if self._completed <= len(self.phases) else ''}"
+        return f"[{pct:5.1f}%] {bar}  {self._completed}/{len(self.phases)}  {self.phases[self._completed - 1] if 0 < self._completed <= len(self.phases) else ''}"
 
     def _draw(self):
         """Redraw the progress bar on the bottom line of the terminal."""
@@ -877,6 +881,11 @@ class ScanStatus:
     def close(self) -> None:
         self._data["status"] = "completed"
         self._data["updated_at"] = datetime.now().isoformat(timespec="seconds")
+        if self._data.get("running_phases"):
+            for name in self._data["running_phases"]:
+                if name not in self._data["completed_phases"]:
+                    self._data["completed_phases"].append(name)
+            self._data["running_phases"] = []
         if not self._write_lock.acquire(blocking=False):
             return
         try:

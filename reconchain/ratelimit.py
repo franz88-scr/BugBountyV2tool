@@ -38,8 +38,9 @@ class RateLimiter:
         with self._sync_lock:
             now = time.monotonic()
             wait = self._compute_wait(now, domain)
-            if wait > 0:
-                time.sleep(wait + random.uniform(0, self._jitter))
+        if wait > 0:
+            time.sleep(wait + random.uniform(0, self._jitter))
+        with self._sync_lock:
             now = time.monotonic()
             self._global_last = now
             self._domain_last[domain] = now
@@ -54,10 +55,6 @@ class RateLimiter:
             await asyncio.sleep(wait + random.uniform(0, self._jitter))
         with self._sync_lock:
             now = time.monotonic()
-            wait = self._compute_wait(now, domain)
-            if wait > 0:
-                time.sleep(wait)
-            now = time.monotonic()
             self._global_last = now
             self._domain_last[domain] = now
 
@@ -67,9 +64,10 @@ class RateLimiter:
                 self._domain_failures[domain] += 1
 
     def record_success(self, domain: str = "") -> None:
-        if domain and domain in self._domain_failures:
+        if domain:
             with self._sync_lock:
-                self._domain_failures[domain] = max(0, self._domain_failures[domain] - 1)
+                if domain in self._domain_failures:
+                    self._domain_failures[domain] = max(0, self._domain_failures[domain] - 1)
 
     def reset(self) -> None:
         with self._sync_lock:

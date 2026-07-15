@@ -52,8 +52,10 @@ _PROXY_LOCK: asyncio.Lock = asyncio.Lock()
 _TOOL_RC_REGISTRY: Dict[str, int] = {}
 
 # Hard OS-level process counter — limits total concurrent subprocesses
-# across all semaphore/gather paths. Defaults to 3 to match typical VM vCPU count.
-_OS_PROC_SEM = threading.Semaphore(3)
+# across all semaphore/gather paths. Hard cap: max 8 concurrent subprocesses total.
+from reconchain.resource_monitor import AdaptiveThreadSemaphore
+MAX_OS_PROCS = 8
+_OS_PROC_SEM = AdaptiveThreadSemaphore(MAX_OS_PROCS)
 _OS_PROC_ACTIVE = 0
 _OS_PROC_ACTIVE_LOCK = threading.Lock()
 
@@ -66,15 +68,18 @@ _CHILD_FSIZE_LIMIT = 512 * 1024 * 1024        # 512 MB max output file size
 def reset_globals() -> None:
     """Reset module-level globals for clean re-invocation (e.g., in tests)."""
     global _USE_PROXYCHAINS, _JOB_SEM, _PIPELINE_CFG, _PROXY_TIMEOUT_MULTIPLIER
-    global _OS_PROC_ACTIVE
+    global _OS_PROC_ACTIVE, _OS_PROC_SEM
     _USE_PROXYCHAINS = False
     _JOB_SEM = None
     _PIPELINE_CFG = PipelineConfig()
     _PROXY_TIMEOUT_MULTIPLIER = 1.5
     _OS_PROC_ACTIVE = 0
+    _OS_PROC_SEM = AdaptiveThreadSemaphore(MAX_OS_PROCS)
     with _SPAWNED_PIDS_LOCK:
         _SPAWNED_PIDS.clear()
     _TOOL_RC_REGISTRY.clear()
+    from reconchain.resource_monitor import reset_resource_monitor
+    reset_resource_monitor()
 
 
 def _set_child_limits() -> None:
@@ -93,6 +98,12 @@ def _set_child_limits() -> None:
         pass
     try:
         resource.setrlimit(resource.RLIMIT_FSIZE, (_CHILD_FSIZE_LIMIT, _CHILD_FSIZE_LIMIT))
+    except (ValueError, OSError):
+        pass
+    # Disable core dumps entirely — prevents coredump storm from broken
+    # binaries (e.g. testssl openssl 1.0.2 segfaulting 80+ times)
+    try:
+        resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
     except (ValueError, OSError):
         pass
 
@@ -167,8 +178,12 @@ def _run_blocking(cmd: List[str], timeout: int, cwd: Optional[Path], log_path: P
 
     # Block until we're within the hard OS process cap
     _OS_PROC_SEM.acquire()
-    with _OS_PROC_ACTIVE_LOCK:
-        _OS_PROC_ACTIVE += 1
+    try:
+        with _OS_PROC_ACTIVE_LOCK:
+            _OS_PROC_ACTIVE += 1
+    except Exception:
+        _OS_PROC_SEM.release()
+        raise
     try:
         with log_path.open("wb") as logf, err_path.open("wb") as errf:
             proc: Optional[subprocess.Popen[bytes]] = None
@@ -389,7 +404,7 @@ async def _update_nuclei_templates(outdir: Path, proxy: str = "") -> None:
     _nu_cmd = _proxify_cmd(_nu_cmd)
     # Gate behind OS process counter so template updates don't consume
     # a slot that could be used by actual recon tools.
-    _OS_PROC_SEM.acquire()
+    await asyncio.to_thread(_OS_PROC_SEM.acquire)
     try:
         proc = await asyncio.create_subprocess_exec(
             *_nu_cmd,

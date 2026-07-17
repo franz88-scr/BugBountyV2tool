@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "reconchain"
-version = "1.5.1"
+version = "2.0.0"
 description = "A stdlib Python orchestrator for chained reconnaissance tooling."
 readme = "README.md"
 requires-python = ">=3.9"
@@ -32,7 +32,7 @@ dev = [
 reconchain = "reconchain:main"
 
 [tool.setuptools]
-packages = ["reconchain"]
+packages = ["reconchain", "reconchain.phases"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -41,4 +41,8 @@ pythonpath = ["."]
 [tool.ruff]
 line-length = 100
 target-version = "py39"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I"]
+ignore = ["E501", "F403", "F405"]
 

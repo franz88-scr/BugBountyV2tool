@@ -8,6 +8,8 @@ from typing import Dict
 
 
 class RateLimiter:
+    _MAX_DOMAINS = 10000  # Evict oldest entries when this many domains tracked
+
     def __init__(self, max_per_second: float = 0) -> None:
         self.max_per_second = max_per_second
         self._global_last = 0.0
@@ -17,6 +19,17 @@ class RateLimiter:
         self._max_backoff = 60.0
         self._jitter = 0.1
         self._sync_lock = threading.Lock()
+
+    def _evict_old_domains(self) -> None:
+        """Evict oldest domain entries when dict grows too large."""
+        if len(self._domain_last) <= self._MAX_DOMAINS:
+            return
+        now = time.monotonic()
+        # Remove entries older than 5 minutes
+        stale = [d for d, t in self._domain_last.items() if now - t > 300]
+        for d in stale[:len(stale) // 2]:  # remove half to avoid thrashing
+            self._domain_last.pop(d, None)
+            self._domain_failures.pop(d, None)
 
     def _min_interval(self) -> float:
         return 1.0 / self.max_per_second if self.max_per_second > 0 else 0.0
@@ -36,14 +49,16 @@ class RateLimiter:
         if self.max_per_second <= 0:
             return
         with self._sync_lock:
+            self._evict_old_domains()
             now = time.monotonic()
             wait = self._compute_wait(now, domain)
+            if wait > 0:
+                jitter = random.uniform(0, self._jitter)
+                next_time = now + wait + jitter
+                self._global_last = next_time
+                self._domain_last[domain] = next_time
         if wait > 0:
-            time.sleep(wait + random.uniform(0, self._jitter))
-        with self._sync_lock:
-            now = time.monotonic()
-            self._global_last = now
-            self._domain_last[domain] = now
+            time.sleep(wait + jitter)
 
     async def acquire_async(self, domain: str = "") -> None:
         if self.max_per_second <= 0:
@@ -51,12 +66,13 @@ class RateLimiter:
         with self._sync_lock:
             now = time.monotonic()
             wait = self._compute_wait(now, domain)
+            if wait > 0:
+                jitter = random.uniform(0, self._jitter)
+                next_time = now + wait + jitter
+                self._global_last = next_time
+                self._domain_last[domain] = next_time
         if wait > 0:
-            await asyncio.sleep(wait + random.uniform(0, self._jitter))
-        with self._sync_lock:
-            now = time.monotonic()
-            self._global_last = now
-            self._domain_last[domain] = now
+            await asyncio.sleep(wait + jitter)
 
     def record_failure(self, domain: str = "") -> None:
         if domain:

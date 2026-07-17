@@ -2,6 +2,7 @@
 from __future__ import annotations
 import asyncio
 import contextlib
+import hmac
 import json
 import os
 import re
@@ -28,7 +29,7 @@ _INSTANCE_LOCK = threading.Lock()
 def _make_callback_handler(instance_id: int) -> type:
     class _Handler(BaseHTTPRequestHandler):
         def do_POST(self) -> None:
-            length = int(self.headers.get("Content-Length", 0))
+            length = max(0, int(self.headers.get("Content-Length", 0)))
             max_body = 1 * 1024 * 1024  # 1 MB limit
             if length > max_body:
                 self.send_response(413)
@@ -44,7 +45,8 @@ def _make_callback_handler(instance_id: int) -> type:
                 secret = _INSTANCE_SECRETS.get(instance_id)
             if secret:
                 token = self.headers.get("X-Reconchain-Token", "")
-                if not data.get("_token") and token != secret:
+                body_token = data.get("_token", "")
+                if not hmac.compare_digest(str(body_token), secret) and not hmac.compare_digest(token, secret):
                     self.send_response(403)
                     self.end_headers()
                     self.wfile.write(b"forbidden")
@@ -64,6 +66,15 @@ def _make_callback_handler(instance_id: int) -> type:
             self.wfile.write(b"ok")
 
         def do_GET(self) -> None:
+            with _INSTANCE_LOCK:
+                secret = _INSTANCE_SECRETS.get(instance_id)
+            if secret:
+                token = self.headers.get("X-Reconchain-Token", "")
+                if not hmac.compare_digest(token, secret):
+                    self.send_response(403)
+                    self.end_headers()
+                    self.wfile.write(b"forbidden")
+                    return
             data = {"_path": self.path, "_method": "GET", "_ts": time.time()}
             with _INSTANCE_LOCK:
                 cb_list = _INSTANCE_CALLBACKS.get(instance_id)
@@ -97,13 +108,14 @@ class Interactsh:
         self._http_thread: Optional[threading.Thread] = None
         self._webhook_port: Optional[int] = None
         self._local_callbacks: List[Dict[str, Any]] = []
-        Interactsh._next_id += 1
-        self._instance_id = Interactsh._next_id
-        _INSTANCE_CALLBACKS[self._instance_id] = self._local_callbacks
-        _INSTANCE_HOOKS[self._instance_id] = None
-        import secrets
-        self._webhook_secret = secrets.token_hex(16)
-        _INSTANCE_SECRETS[self._instance_id] = self._webhook_secret
+        with _INSTANCE_LOCK:
+            Interactsh._next_id += 1
+            self._instance_id = Interactsh._next_id
+            _INSTANCE_CALLBACKS[self._instance_id] = self._local_callbacks
+            _INSTANCE_HOOKS[self._instance_id] = None
+            import secrets
+            self._webhook_secret = secrets.token_hex(16)
+            _INSTANCE_SECRETS[self._instance_id] = self._webhook_secret
 
     @property
     def available(self) -> bool:
@@ -112,6 +124,7 @@ class Interactsh:
     def start_webhook(self, port: int = 0) -> Optional[int]:
         if self._httpd is not None:
             return self._webhook_port
+        sock = None
         try:
             handler_cls = _make_callback_handler(self._instance_id)
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -128,6 +141,9 @@ class Interactsh:
             log("info", f"OOB webhook listening on port {self._webhook_port} (token required)")
             return self._webhook_port
         except Exception as e:
+            if sock is not None:
+                with contextlib.suppress(Exception):
+                    sock.close()
             log("warn", f"OOB webhook start failed: {e}")
             return None
 
@@ -166,9 +182,9 @@ class Interactsh:
         cmd = ["interactsh-client", "-v"]
         if token:
             cmd += ["-t", token]
-        from reconchain.process import _PIPELINE_CFG
-        if _PIPELINE_CFG.proxy:
-            cmd += ["-proxy", _PIPELINE_CFG.proxy]
+        from reconchain.process import _PIPELINE_CFG, _USE_PROXYCHAINS
+        if _PIPELINE_CFG.proxy and not _USE_PROXYCHAINS:
+            log("warn", "interactsh-client has no native -proxy flag; use SOCKS proxy for proxychains4 routing")
         cmd = _proxify_cmd(cmd)
         try:
             self._log_fh = self.log.open("ab")
@@ -225,10 +241,12 @@ class Interactsh:
             self._kill_proc()
             raise
         log("warn", "interactsh did not announce a domain in time")
+        self._kill_proc()
         return False
 
     def stop(self) -> Path:
         out = ensure(self.outdir / "oast" / "callbacks.txt")
+        self.stop_webhook()
         self._kill_proc()
         events: list[dict] = []
         try:

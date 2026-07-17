@@ -1,5 +1,6 @@
 """Utility functions: file I/O, logging, validation, proxy config."""
 from __future__ import annotations
+import concurrent.futures
 import contextlib
 import hashlib
 import json
@@ -9,6 +10,7 @@ import struct
 import sys
 import ssl
 import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -22,6 +24,17 @@ _re = re
 
 _HOSTNAME_RE = _HOSTNAME_RE
 _MERGE_LOCK = threading.Lock()
+
+# Bounded thread pool for HTTP requests — replaces unbounded thread-per-request.
+# 24 workers: HTTP is pure I/O, threads are cheap (~1MB each), caps total RAM.
+_http_pool = concurrent.futures.ThreadPoolExecutor(max_workers=24, thread_name_prefix="rc-http")
+
+# Ensure pool threads are daemon so Python doesn't hang at exit waiting for
+# in-flight HTTP requests (which may have long socket timeouts).
+import atexit as _atexit
+def _shutdown_http_pool() -> None:
+    _http_pool.shutdown(wait=False)
+_atexit.register(_shutdown_http_pool)
 
 def _is_valid_hostname(s: str) -> bool:
     if not s:
@@ -51,7 +64,7 @@ def _target_token(line: str) -> str:
     return token
 
 def _target_lines(path: Path) -> List[str]:
-    return [_target_token(line) for line in read_lines(path) if _target_token(line)]
+    return [t for line in read_lines(path) if (t := _target_token(line))]
 
 def _write_target_tokens(src: Path, dst: Path) -> int:
     seen: Set[str] = set()
@@ -62,6 +75,62 @@ def _write_target_tokens(src: Path, dst: Path) -> int:
         log("warn", f"_write_target_tokens: no valid tokens found in {src.name}")
     ensure(dst).write_text("\n".join(sorted(seen)) + "\n")
     return len(seen)
+
+
+def write_findings(path: Path, findings: List[str], phase_id: str = "") -> Dict[str, Any]:
+    """Write findings to a file only when non-empty. Returns result dict."""
+    if not findings:
+        if path.exists():
+            path.unlink()
+        if not phase_id:
+            return {"count": 0}
+        return {phase_id: str(path), "count": 0}
+    ensure(path).write_text("\n".join(findings) + "\n")
+    log("ok", f"{phase_id}: {len(findings)} findings -> {path}" if phase_id else f"{len(findings)} findings -> {path}")
+    if not phase_id:
+        return {"count": len(findings)}
+    return {phase_id: str(path), "count": len(findings)}
+
+
+def _load_live_hosts(outdir: Path, domain: str = "") -> List[str]:
+    """Load non-404 hosts from hosts.txt, optionally scoped to a domain.
+    Returns only the host portion (no scheme, no status tags), deduplicated.
+    If domain is provided, only returns hosts that are subdomains of (or equal to) that domain.
+    If domain is empty, tries to extract it from the outdir path (e.g. ./out/example.com/)."""
+    hosts_file = outdir / "hosts.txt"
+    if not hosts_file.exists():
+        return []
+    if not domain:
+        # Try to extract domain from outdir path (e.g. ./out/example.com/)
+        parts = outdir.resolve().parts
+        for i, p in enumerate(parts):
+            if p == "out" and i + 1 < len(parts):
+                domain = parts[i + 1]
+                break
+        if not domain:
+            log("warn", "_load_live_hosts: could not auto-detect domain from path; "
+                "returning unscoped host list. Pass domain= explicitly.")
+    seen: Set[str] = set()
+    live: List[str] = []
+    for ln in read_lines(hosts_file):
+        ln = ln.strip()
+        if not ln:
+            continue
+        tokens = ln.split()
+        if len(tokens) >= 2 and tokens[1] == "[404]":
+            continue
+        host = tokens[0] if tokens else ln
+        host = host.rstrip("/")
+        if host.startswith("http://") or host.startswith("https://"):
+            host = urllib.parse.urlparse(host).hostname or host
+        if not host:
+            continue
+        if domain and not _is_under_domain(host, domain):
+            continue
+        if host not in seen:
+            seen.add(host)
+            live.append(host)
+    return live
 
 def _color() -> bool:
     return sys.stdout.isatty() and os.environ.get("NO_COLOR") is None
@@ -84,10 +153,12 @@ def disable_color() -> None:
     LVL = {k: "" for k in LVL}
 
 _active_progress: Optional["Progress"] = None
+_active_progress_lock = threading.Lock()
 
 def log(lvl: str, msg: str) -> None:
-    text = f"{LVL[lvl]}[{lvl[0].upper()}]{C['r']} {msg}"
-    prog = _active_progress
+    text = f"{LVL.get(lvl, '')}[{lvl[0].upper() if lvl else '?'}]{C['r']} {msg}"
+    with _active_progress_lock:
+        prog = _active_progress
     if prog and prog._enabled and sys.stderr.isatty():
         prog._write_above(text)
     else:
@@ -132,16 +203,18 @@ def _auto_detect_proxy() -> str:
     return ""
 
 def _set_proxy_env(proxy: str) -> None:
+    from reconchain.process import _ENV_LOCK
     _PROXY_VARS = ["ALL_PROXY", "all_proxy", "HTTPS_PROXY", "https_proxy",
                    "HTTP_PROXY", "http_proxy", "PROXY"]
-    if not proxy:
+    with _ENV_LOCK:
+        if not proxy:
+            for v in _PROXY_VARS:
+                os.environ.pop(v, None)
+            return
         for v in _PROXY_VARS:
-            os.environ.pop(v, None)
-        return
-    for v in _PROXY_VARS:
-        os.environ[v] = proxy
+            os.environ[v] = proxy
 
-def _auto_detect_cookies(outdir: Optional[Path] = None) -> str:
+def _auto_detect_cookies(outdir: Optional[Path] = None, fix_permissions: bool = True) -> str:
     val = os.environ.get("COOKIE", "")
     if val:
         return val
@@ -151,7 +224,14 @@ def _auto_detect_cookies(outdir: Optional[Path] = None) -> str:
             try:
                 mode = cookie_file.stat().st_mode & 0o777
                 if mode & 0o077:
-                    log("warn", f"cookies.txt has overly permissive permissions ({oct(mode)}); consider: chmod 600 {cookie_file}")
+                    if fix_permissions:
+                        log("warn", f"cookies.txt has overly permissive permissions ({oct(mode)}); fixing to 0o600")
+                        try:
+                            cookie_file.chmod(0o600)
+                        except OSError:
+                            log("warn", f"could not fix permissions on {cookie_file}")
+                    else:
+                        log("warn", f"cookies.txt has overly permissive permissions ({oct(mode)}); consider: chmod 600 {cookie_file}")
             except OSError:
                 pass
             return _sanitize_header_value(cookie_file.read_text(encoding="utf-8", errors="ignore").strip())
@@ -159,12 +239,49 @@ def _auto_detect_cookies(outdir: Optional[Path] = None) -> str:
         cookie_file = Path("cookies.txt")
         if cookie_file.exists():
             log("warn", "cookies.txt found in CWD — use --cookie or COOKIE env var instead")
+            try:
+                mode = cookie_file.stat().st_mode & 0o777
+                if mode & 0o077:
+                    if fix_permissions:
+                        log("warn", f"CWD cookies.txt has overly permissive permissions ({oct(mode)}); fixing to 0o600")
+                        try:
+                            cookie_file.chmod(0o600)
+                        except OSError:
+                            log("warn", f"could not fix permissions on {cookie_file}")
+                    else:
+                        log("warn", f"CWD cookies.txt has overly permissive permissions ({oct(mode)}); consider: chmod 600 {cookie_file}")
+            except OSError:
+                pass
             return _sanitize_header_value(cookie_file.read_text(encoding="utf-8", errors="ignore").strip())
     return ""
 
 def _sanitize_header_value(v: str) -> str:
     v = v.translate({ord(c): ord(" ") for c in "\r\n\t\x00\x0b\x0c"})
     return v.strip()
+
+def _validate_cookie(value: str) -> str:
+    """Validate and sanitize a cookie string. Raises ValueError on empty result."""
+    value = _sanitize_header_value(value)
+    if not value:
+        raise ValueError("cookie string is empty after sanitization")
+    # Strip leading '--' fragments that could inject CLI arguments
+    while value.startswith("--"):
+        value = value[2:].lstrip()
+    parts = [p.strip() for p in value.split(";") if p.strip()]
+    for part in parts:
+        if "=" not in part:
+            log("warn", f"cookie part '{part[:40]}' does not look like name=value format")
+    return value
+
+def parse_set_cookie_headers(headers) -> list:
+    """Extract all Set-Cookie header values from an http.client.HTTPMessage or string."""
+    if hasattr(headers, "get_all"):
+        return headers.get_all("Set-Cookie") or []
+    result = []
+    for h in str(headers).split("\n"):
+        if h.lower().startswith("set-cookie:"):
+            result.append(h.split(":", 1)[1].strip())
+    return result
 
 def _extra_headers_dict() -> Dict[str, str]:
     headers: Dict[str, str] = {}
@@ -246,11 +363,21 @@ def _get_urlopener() -> Callable[..., Any]:
                 "https": proxy,
             })
             opener = urllib.request.build_opener(handler)
-            return lambda *a, **kw: opener.open(*a, **{**kw, "context": ctx})
+            return lambda *a, **kw: opener.open(*a, **{k: v for k, v in kw.items() if k != "context"})
         if proxy.startswith(("socks4://", "socks5://", "socks5h://", "socks4a://")):
-            global _socks_patched
-            if not _socks_patched:
-                _socks_patched = _patch_socks(proxy)
+            try:
+                from sockshandler import SocksiPyHandler
+                import socks as _socks
+                _parsed = urllib.parse.urlparse(proxy)
+                _pt = _socks.SOCKS5 if _parsed.scheme.startswith("socks5") else _socks.SOCKS4
+                _handler = SocksiPyHandler(_pt, _parsed.hostname, _parsed.port or 1080)
+                _opener = urllib.request.build_opener(_handler)
+                return lambda *a, **kw: _opener.open(*a, **{k: v for k, v in kw.items() if k != "context"})
+            except ImportError:
+                with _SOCKS_PATCH_LOCK:
+                    global _socks_patched
+                    if not _socks_patched:
+                        _socks_patched = _patch_socks(proxy)
     return lambda *a, **kw: urllib.request.urlopen(*a, **{**kw, "context": ctx})
 
 class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
@@ -268,64 +395,72 @@ def _get_no_redirect_urlopener() -> Callable[..., Any]:
                 "https": proxy,
             })
             opener = urllib.request.build_opener(_NoRedirectHandler, handler)
-            return lambda *a, **kw: opener.open(*a, **{**kw, "context": ctx})
+            return lambda *a, **kw: opener.open(*a, **{k: v for k, v in kw.items() if k != "context"})
         if proxy.startswith(("socks4://", "socks5://", "socks5h://", "socks4a://")):
-            global _socks_patched
-            if not _socks_patched:
-                _socks_patched = _patch_socks(proxy)
+            try:
+                from sockshandler import SocksiPyHandler
+                import socks as _socks
+                _parsed = urllib.parse.urlparse(proxy)
+                _pt = _socks.SOCKS5 if _parsed.scheme.startswith("socks5") else _socks.SOCKS4
+                _handler = SocksiPyHandler(_pt, _parsed.hostname, _parsed.port or 1080)
+                _opener = urllib.request.build_opener(_NoRedirectHandler, _handler)
+                return lambda *a, **kw: _opener.open(*a, **{k: v for k, v in kw.items() if k != "context"})
+            except ImportError:
+                with _SOCKS_PATCH_LOCK:
+                    global _socks_patched
+                    if not _socks_patched:
+                        _socks_patched = _patch_socks(proxy)
     opener = urllib.request.build_opener(_NoRedirectHandler)
     return lambda *a, **kw: opener.open(*a, **{**kw, "context": ctx})
 
 async def _async_urlopen(urlopen_func: Any, req: urllib.request.Request, timeout: int = 10) -> Tuple[int, Any, bytes]:
     import asyncio
-    import threading as _thr
-    result: List[Any] = [None]
-    exc: List[Optional[Exception]] = [None]
     _resp_holder: List[Any] = [None]
-    done_event = _thr.Event()
-    abort_event = _thr.Event()
-    result_lock = _thr.Lock()
-    def _fetch() -> None:
+    def _fetch() -> Tuple[int, Any, bytes]:
+        resp = urlopen_func(req, timeout=timeout)
+        _resp_holder[0] = resp
         try:
-            if abort_event.is_set():
-                return
-            resp = urlopen_func(req, timeout=timeout)
-            _resp_holder[0] = resp
-            if abort_event.is_set():
-                with contextlib.suppress(Exception):
-                    resp.close()
-                return
             data = resp.read()
-            with result_lock:
-                result[0] = (resp.status, resp.headers, data)
-        except Exception as e:
-            with result_lock:
-                exc[0] = e
+            status = resp.status
+            headers = resp.headers
+            return (status, headers, data)
         finally:
-            done_event.set()
-    t = _thr.Thread(target=_fetch, daemon=True)
-    t.start()
+            with contextlib.suppress(Exception):
+                resp.close()
+    loop = asyncio.get_running_loop()
     try:
-        await asyncio.wait_for(asyncio.to_thread(done_event.wait), timeout=timeout + 5)
-    except asyncio.TimeoutError:
-        abort_event.set()
+        return await asyncio.wait_for(
+            loop.run_in_executor(_http_pool, _fetch),
+            timeout=timeout + 5,
+        )
+    except (asyncio.TimeoutError, Exception):
         resp = _resp_holder[0]
         if resp is not None:
             with contextlib.suppress(Exception):
                 resp.close()
         raise
-    with result_lock:
-        if exc[0] is not None:
-            raise exc[0]
-        return result[0]
 
 _no_redirect_urlopener_cache: Optional[Callable] = None
+_no_redirect_urlopener_cache_proxy: str = ""  # tracks which proxy the cache was built for
+_urlopener_cache_lock = threading.Lock()  # protects urlopener cache check-and-build
+
+def invalidate_urlopener_cache() -> None:
+    """Invalidate the cached opener when proxy state changes."""
+    global _no_redirect_urlopener_cache, _no_redirect_urlopener_cache_proxy
+    with _urlopener_cache_lock:
+        _no_redirect_urlopener_cache = None
+        _no_redirect_urlopener_cache_proxy = ""
 
 async def _async_urlopen_no_redirect(urlopen_func: Any, req: urllib.request.Request, timeout: int = 10) -> Tuple[int, Any, bytes]:
-    global _no_redirect_urlopener_cache
-    if _no_redirect_urlopener_cache is None:
-        _no_redirect_urlopener_cache = _get_no_redirect_urlopener()
-    return await _async_urlopen(_no_redirect_urlopener_cache, req, timeout=timeout)
+    global _no_redirect_urlopener_cache, _no_redirect_urlopener_cache_proxy
+    from reconchain.process import _PIPELINE_CFG
+    current_proxy = _PIPELINE_CFG.proxy or ""
+    with _urlopener_cache_lock:
+        if _no_redirect_urlopener_cache is None or _no_redirect_urlopener_cache_proxy != current_proxy:
+            _no_redirect_urlopener_cache = _get_no_redirect_urlopener()
+            _no_redirect_urlopener_cache_proxy = current_proxy
+        opener = _no_redirect_urlopener_cache
+    return await _async_urlopen(opener, req, timeout=timeout)
 
 async def _throttle() -> None:
     import asyncio
@@ -440,39 +575,40 @@ def merge_unique(srcs: List[Path], dst: Path, validator: Optional[Callable[[str]
 def merge_unique_incremental(srcs: List[Path], dst: Path, validator: Optional[Callable[[str], bool]] = None) -> int:
     """Streaming merge: reads dst to build seen set, then appends only new lines from srcs.
     Avoids re-sorting the entire output on every call."""
-    seen: Set[str] = set()
-    if dst.exists():
-        try:
-            with dst.open(errors="ignore") as f:
-                for ln in f:
-                    ln = ln.strip()
-                    if ln and not ln.startswith("#"):
-                        if validator is None or validator(ln):
+    with _MERGE_LOCK:
+        seen: Set[str] = set()
+        if dst.exists():
+            try:
+                with dst.open(errors="ignore") as f:
+                    for ln in f:
+                        ln = ln.strip()
+                        if ln and not ln.startswith("#"):
+                            if validator is None or validator(ln):
+                                seen.add(ln)
+            except (OSError, IOError):
+                pass
+        new_lines: List[str] = []
+        for s in srcs:
+            if not s:
+                continue
+            try:
+                with s.open(errors="ignore") as f:
+                    for ln in f:
+                        ln = ln.strip()
+                        if not ln or ln.startswith("#"):
+                            continue
+                        if validator is not None and not validator(ln):
+                            continue
+                        if ln not in seen:
                             seen.add(ln)
-        except (OSError, IOError):
-            pass
-    new_lines: List[str] = []
-    for s in srcs:
-        if not s:
-            continue
-        try:
-            with s.open(errors="ignore") as f:
-                for ln in f:
-                    ln = ln.strip()
-                    if not ln or ln.startswith("#"):
-                        continue
-                    if validator is not None and not validator(ln):
-                        continue
-                    if ln not in seen:
-                        seen.add(ln)
-                        new_lines.append(ln)
-        except (OSError, IOError):
-            continue
-    if not new_lines:
-        return 0
-    ensure(dst)
-    with dst.open("a") as f:
-        f.write("\n".join(new_lines) + "\n")
+                            new_lines.append(ln)
+            except (OSError, IOError):
+                continue
+        if not new_lines:
+            return 0
+        ensure(dst)
+        with dst.open("a") as f:
+            f.write("\n".join(new_lines) + "\n")
     return len(new_lines)
 
 def merge_unique_str(entry: str, dst: Path) -> bool:
@@ -529,18 +665,23 @@ def _downsample_file(path: Path, n: int = 1) -> None:
         raise
 
 def safe_suffix(s: str) -> str:
-    return hashlib.sha1(s.encode("utf-8", errors="ignore")).hexdigest()[:12]
+    return hashlib.sha1(s.encode("utf-8", errors="ignore")).hexdigest()[:16]
 
 def _safe_name(s: str, maxlen: int = 80) -> str:
     safe = (
-        s.replace("/", "_").replace(":", "_").replace("?", "_")
+        s.replace("/", "_").replace("\\", "_").replace(":", "_")
+        .replace("?", "_").replace("*", "_").replace('"', "_")
+        .replace("<", "_").replace(">", "_").replace("|", "_")
         .replace("&", "_").replace("=", "_").replace("#", "_")
         .replace("%", "_").replace("\n", "").replace("\r", "")
-        .replace("\x00", "")
+        .replace("\x00", "").replace("'", "_").replace("`", "_")
+        .replace("$", "_").replace(";", "_").replace("!", "_")
     )
     # Collapse path traversal components
     while ".." in safe:
         safe = safe.replace("..", "_")
+    # Strip leading dots and hyphens (Windows hidden files / reserved names)
+    safe = safe.lstrip(".-")
     return safe[:maxlen]
 
 def read_jsonl(p: Path) -> List[Any]:
@@ -574,6 +715,7 @@ def read_jsonl(p: Path) -> List[Any]:
             return out
         f.seek(0)
         raw = f.read()
+        f.close()
     if not raw:
         return []
     try:
@@ -630,6 +772,12 @@ def _merge_dnsx_output(src: Path, hosts_out: Path, full_out: Path) -> int:
             new_lines.append(ln)
     if new_lines:
         with full_out.open("a") as f:
+            # Ensure file ends with newline before appending
+            if full_out.exists() and full_out.stat().st_size > 0:
+                f.seek(0, 2)  # Seek to end
+                f.seek(f.tell() - 1)  # Seek to last byte
+                if f.read(1) != b"\n":
+                    f.write(b"\n")
             f.write("\n".join(new_lines) + "\n")
         hosts_out.write_text("\n".join(sorted(seen_hosts)) + "\n")
     return len(new_lines)
@@ -742,8 +890,10 @@ class Progress:
         self._total_weight = sum(_PHASE_WEIGHTS.get(p, 1) for p in phases)
         self._enabled = sys.stderr.isatty()
         self._last_bar = ""
+        self._draw_lock = threading.Lock()  # serializes terminal writes
         global _active_progress
-        _active_progress = self
+        with _active_progress_lock:
+            _active_progress = self
 
     def _fmt_bar(self) -> str:
         from reconchain.phases import _PHASE_WEIGHTS
@@ -761,16 +911,18 @@ class Progress:
         bar = self._fmt_bar()
         if bar == self._last_bar:
             return
-        self._last_bar = bar
-        sys.stderr.write(f"\033[999;0H\033[K{bar}")
-        sys.stderr.flush()
+        with self._draw_lock:
+            self._last_bar = bar
+            sys.stderr.write(f"\033[999;0H\033[K{bar}")
+            sys.stderr.flush()
 
     def _write_above(self, text: str):
         """Write a log line above the progress bar."""
         if not self._enabled:
             return
-        sys.stderr.write(f"\033[999;0H\033[K{text}\n\033[999;0H\033[K{self._last_bar}")
-        sys.stderr.flush()
+        with self._draw_lock:
+            sys.stderr.write(f"\033[999;0H\033[K{text}\n\033[999;0H\033[K{self._last_bar}")
+            sys.stderr.flush()
 
     def next(self, name: str):
         from reconchain.phases import _PHASE_WEIGHTS
@@ -781,7 +933,8 @@ class Progress:
 
     def close(self):
         global _active_progress
-        _active_progress = None
+        with _active_progress_lock:
+            _active_progress = None
         if self._enabled:
             sys.stderr.write(f"\033[999;0H\033[K")
             sys.stderr.flush()
@@ -799,6 +952,7 @@ class ScanStatus:
     def __init__(self, domain: str, outdir: Path) -> None:
         self.domain = domain
         self.outdir = outdir
+        self._data_lock = threading.Lock()  # protects _data mutations
         self._SCAN_STATUS_DIR.mkdir(parents=True, exist_ok=True)
         try:
             os.chmod(str(self._SCAN_STATUS_DIR), 0o700)
@@ -818,11 +972,29 @@ class ScanStatus:
             "errors": [],
             "missing_tools": [],
         }
+        self._dirty = False
+        self._last_write = 0.0
         self._write()
 
     def _write(self) -> None:
+        """Mark dirty and flush at most once per second to reduce disk I/O."""
+        self._dirty = True
+        now = time.monotonic()
+        if now - self._last_write < 1.0:
+            return
+        self._flush()
+
+    def _flush(self) -> None:
+        """Actually write status to disk."""
+        self._dirty = False
+        self._last_write = time.monotonic()
         with self._write_lock:
-            self._data["updated_at"] = datetime.now().isoformat(timespec="seconds")
+            with self._data_lock:
+                self._data["updated_at"] = datetime.now().isoformat(timespec="seconds")
+                data_snapshot = dict(self._data)
+                data_snapshot["completed_phases"] = list(self._data["completed_phases"])
+                data_snapshot["running_phases"] = list(self._data["running_phases"])
+                data_snapshot["errors"] = list(self._data["errors"])
             try:
                 self._SCAN_STATUS_DIR.mkdir(parents=True, exist_ok=True)
                 if self._path.is_symlink():
@@ -832,74 +1004,70 @@ class ScanStatus:
                 import tempfile
                 fd, tmp_path = tempfile.mkstemp(dir=self._SCAN_STATUS_DIR, suffix=".tmp")
                 with os.fdopen(fd, "w") as f:
-                    json.dump(self._data, f, indent=2, default=str)
+                    json.dump(data_snapshot, f, indent=2, default=str)
                 os.replace(tmp_path, self._path)
-                # Post-write verification: ensure the target wasn't swapped to a symlink
                 if self._path.is_symlink():
                     real = self._path.resolve()
                     if not real.is_relative_to(self._SCAN_STATUS_DIR):
                         self._path.unlink()
             except Exception as exc:
                 log("err", f"ScanStatus write failed: {exc}")
-                self._data.setdefault("write_errors", []).append(str(exc))
+                with self._data_lock:
+                    self._data.setdefault("write_errors", []).append(str(exc))
 
     def set_phase(self, name: str) -> None:
-        self._data["phase"] = name
-        self._data["phase_progress"] = ""
+        with self._data_lock:
+            self._data["phase"] = name
+            self._data["phase_progress"] = ""
         self._write()
 
     def set_progress(self, msg: str) -> None:
-        self._data["phase_progress"] = msg
+        with self._data_lock:
+            self._data["phase_progress"] = msg
         self._write()
 
     def add_completed(self, name: str) -> None:
-        if name not in self._data["completed_phases"]:
-            self._data["completed_phases"].append(name)
-        if name in self._data["running_phases"]:
-            self._data["running_phases"].remove(name)
+        with self._data_lock:
+            if name not in self._data["completed_phases"]:
+                self._data["completed_phases"].append(name)
+            if name in self._data["running_phases"]:
+                self._data["running_phases"].remove(name)
         self._write()
 
     def add_running(self, name: str) -> None:
-        if name not in self._data["running_phases"]:
-            self._data["running_phases"].append(name)
+        with self._data_lock:
+            if name not in self._data["running_phases"]:
+                self._data["running_phases"].append(name)
         self._write()
 
     def set_total(self, n: int) -> None:
-        self._data["total_phases"] = n
+        with self._data_lock:
+            self._data["total_phases"] = n
         self._write()
 
     def add_error(self, err: str) -> None:
-        self._data["errors"].append(err)
-        if len(self._data["errors"]) > 1000:
-            self._data["errors"] = self._data["errors"][-500:]
+        with self._data_lock:
+            self._data["errors"].append(err)
+            if len(self._data["errors"]) > 1000:
+                self._data["errors"] = self._data["errors"][-500:]
         self._write()
 
     def set_missing(self, tools: List[str]) -> None:
-        self._data["missing_tools"] = sorted(set(tools))
+        with self._data_lock:
+            self._data["missing_tools"] = sorted(set(tools))
         self._write()
 
     def close(self) -> None:
-        self._data["status"] = "completed"
-        self._data["updated_at"] = datetime.now().isoformat(timespec="seconds")
-        if self._data.get("running_phases"):
-            for name in self._data["running_phases"]:
-                if name not in self._data["completed_phases"]:
-                    self._data["completed_phases"].append(name)
-            self._data["running_phases"] = []
-        if not self._write_lock.acquire(blocking=False):
-            return
-        try:
-            try:
-                self._SCAN_STATUS_DIR.mkdir(parents=True, exist_ok=True)
-                import tempfile
-                fd, tmp_path = tempfile.mkstemp(dir=self._SCAN_STATUS_DIR, suffix=".tmp")
-                with os.fdopen(fd, "w") as f:
-                    json.dump(self._data, f, indent=2, default=str)
-                os.replace(tmp_path, self._path)
-            except Exception as exc:
-                log("err", f"ScanStatus close failed: {exc}")
-        finally:
-            self._write_lock.release()
+        with self._data_lock:
+            self._data["status"] = "completed"
+            self._data["updated_at"] = datetime.now().isoformat(timespec="seconds")
+            if self._data.get("running_phases"):
+                for name in self._data["running_phases"]:
+                    if name not in self._data["completed_phases"]:
+                        self._data["completed_phases"].append(name)
+                self._data["running_phases"] = []
+            self._dirty = False
+        self._flush()
 
     @classmethod
     def load(cls, domain: str) -> Optional[Dict[str, Any]]:

@@ -176,6 +176,18 @@ def _counts(outdir: Path) -> Dict[str, int]:
         "lb_bypass": outdir / "load_balancer_bypass.txt",
         "vhost": outdir / "vhost_discovery.txt",
         "ratelimit_bypass": outdir / "rate_limit_bypass.txt",
+        "emails_finder": outdir / "137-EMAILFINDER.txt",
+        "metagoofil": outdir / "138-METAGOOFIL.txt",
+        "porchpirate": outdir / "139-PORCHPIRATE.txt",
+        "dork_hunter": outdir / "140-DORKHUNTER.txt",
+        "crtsh": outdir / "141-CRTSH.txt",
+        "github_sub": outdir / "142-GITHUBSUB.txt",
+        "tlsx": outdir / "143-TLSX.txt",
+        "analytics_rels": outdir / "144-ANALYTICSRELS.txt",
+        "favirecon": outdir / "145-FAVIRECON.txt",
+        "jsluice": outdir / "146-JSLUICE.txt",
+        "shortscan": outdir / "147-SHORTSCAN.txt",
+        "grpcurl": outdir / "148-GRPCURL.txt",
     }
     return {k: count_nonblank(v) for k, v in keys.items() if v.exists()}
 
@@ -288,13 +300,18 @@ def write_html(outdir: Path, domain: str, counts: Dict[str, int], missing: List[
         "terraform_exposure.txt", "env_files_found.txt",
         "graphql_abuse.txt", "api_version_bypass.txt", "load_balancer_bypass.txt",
         "vhost_discovery.txt", "rate_limit_bypass.txt",
+        "137-EMAILFINDER.txt", "138-METAGOOFIL.txt", "139-PORCHPIRATE.txt",
+        "140-DORKHUNTER.txt", "141-CRTSH.txt", "142-GITHUBSUB.txt",
+        "143-TLSX.txt", "144-ANALYTICSRELS.txt", "145-FAVIRECON.txt",
+        "146-JSLUICE.txt", "147-SHORTSCAN.txt", "148-GRPCURL.txt",
     ):
         p = outdir / key
         if p.exists():
             txt = p.read_text(encoding="utf-8", errors="ignore")
             if len(txt) > 50_000:
-                log("warn", f"report.html: {key} truncated from {len(txt)} to 50KB")
-                txt = txt[:50_000] + f"\n\n{'='*60}\n[WARNING: File truncated at 50KB — original size: {len(txt):,} bytes]\nFull content available in: {key}\n{'='*60}\n"
+                orig_size = len(txt)
+                log("warn", f"report.html: {key} truncated from {orig_size} to 50KB")
+                txt = txt[:50_000] + f"\n\n{'='*60}\n[WARNING: File truncated at 50KB — original size: {orig_size:,} bytes]\nFull content available in: {key}\n{'='*60}\n"
             sections.append(f"<h2>{html_escape(key)}</h2><pre>{html_escape(txt)}</pre>")
     oast_file = outdir / "oast" / "callbacks.txt"
     if oast_file.exists() and count_nonblank(oast_file):
@@ -395,6 +412,10 @@ def write_full_summary(outdir: Path, domain: str, counts: Dict[str, int], missin
         "terraform_exposure.txt", "env_files_found.txt",
         "graphql_abuse.txt", "api_version_bypass.txt", "load_balancer_bypass.txt",
         "vhost_discovery.txt", "rate_limit_bypass.txt",
+        "137-EMAILFINDER.txt", "138-METAGOOFIL.txt", "139-PORCHPIRATE.txt",
+        "140-DORKHUNTER.txt", "141-CRTSH.txt", "142-GITHUBSUB.txt",
+        "143-TLSX.txt", "144-ANALYTICSRELS.txt", "145-FAVIRECON.txt",
+        "146-JSLUICE.txt", "147-SHORTSCAN.txt", "148-GRPCURL.txt",
     ):
         p = outdir / key
         if not p.exists():
@@ -419,7 +440,9 @@ def write_full_summary(outdir: Path, domain: str, counts: Dict[str, int], missin
         lines.append("")
     lines.append("=" * 60)
     out = ensure(outdir / "summary.txt")
-    out.write_text("\n".join(lines) + "\n")
+    tmp = out.with_suffix(out.suffix + ".tmp")
+    tmp.write_text("\n".join(lines) + "\n")
+    os.replace(tmp, out)
     return out
 
 
@@ -433,7 +456,7 @@ def md_escape(s: str) -> str:
 
 def write_markdown(outdir: Path, domain: str, counts: Dict[str, int], missing: List[str]) -> Path:
     lines = [
-        f"# Recon Report \u2014 {domain}",
+        f"# Recon Report \u2014 {md_escape(domain)}",
         f"_generated {datetime.now().isoformat(timespec='seconds')}_",
         "",
     ]
@@ -515,4 +538,136 @@ def write_sarif(outdir: Path, domain: str, counts: Dict[str, int], state: dict) 
     tmp.write_text(json.dumps(sarif, indent=2, default=str))
     os.replace(tmp, out)
     log("ok", f"sarif report → {out}")
+    return out
+
+
+def write_faraday(outdir: Path, domain: str, counts: Dict[str, int], state: dict) -> Path:
+    """Generate Faraday-compatible JSON report for Faraday/CRITs."""
+    faraday = {
+        "host": domain,
+        "date": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "tool": "ReconChain",
+        "version": __version__,
+        "vulnerabilities": [],
+    }
+    severity_map = {
+        "nuclei": "critical",
+        "sqlmap": "high",
+        "xss": "high",
+        "ssrf": "high",
+        "lfi": "high",
+        "rce": "critical",
+        "idor": "medium",
+        "open_redirect": "medium",
+        "clickjacking": "low",
+        "cors": "low",
+        "info": "information",
+    }
+    for artifact_name, artifact_path_str in state.get("artifacts", {}).items():
+        if not isinstance(artifact_path_str, str):
+            continue
+        p = Path(artifact_path_str)
+        if not p.exists():
+            continue
+        lines = read_lines(p)
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            sev = "info"
+            lower = line.lower()
+            if "nuclei" in lower or "critical" in lower:
+                sev = "critical"
+            elif "sqlmap" in lower or "sqli" in lower:
+                sev = "high"
+            elif "xss" in lower or "ssrf" in lower or "lfi" in lower:
+                sev = "high"
+            elif "idor" in lower or "redirect" in lower:
+                sev = "medium"
+            elif "clickjack" in lower or "cors" in lower:
+                sev = "low"
+            faraday["vulnerabilities"].append({
+                "name": line[:200],
+                "severity": sev,
+                "description": f"Finding from {artifact_name}",
+                "data": line,
+                "status": "open",
+                "type": "vulnerability",
+            })
+    out = ensure(outdir / "results.faraday.json")
+    tmp = out.with_suffix(out.suffix + ".tmp")
+    tmp.write_text(json.dumps(faraday, indent=2, default=str))
+    os.replace(tmp, out)
+    log("ok", f"faraday report → {out}")
+    return out
+
+
+def write_html_dashboard(outdir: Path, domain: str, counts: Dict[str, int], missing: List[str]) -> Path:
+    """Generate enhanced interactive HTML dashboard with charts and filtering."""
+    total_findings = sum(counts.values())
+    critical = sum(v for k, v in counts.items() if any(x in k for x in ["nuclei", "sqlmap", "rce"]))
+    high = sum(v for k, v in counts.items() if any(x in k for x in ["xss", "ssrf", "lfi", "idor"]))
+    medium = sum(v for k, v in counts.items() if any(x in k for x in ["redirect", "cors"]))
+    low = sum(v for k, v in counts.items() if any(x in k for x in ["clickjack", "info"]))
+    severity_data = json.dumps([critical, high, medium, low])
+    cards_html = "\n".join(
+        f'<div class="card"><b>{n}</b><span>{html_escape(k)}</span></div>'
+        for k, n in counts.items() if n > 0
+    )
+    html = f"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<title>ReconChain Dashboard — {html_escape(domain)}</title>
+<style>
+{HTML_CSS}
+.chart {{ display: flex; gap: 4px; margin: 16px 0; height: 20px; }}
+.chart div {{ border-radius: 4px; min-width: 10px; }}
+.critical {{ background: var(--err); }}
+.high {{ background: #f0883e; }}
+.medium {{ background: var(--warn); }}
+.low {{ background: var(--ok); }}
+.filter {{ margin: 12px 0; padding: 8px; background: #161b22; border: 1px solid #30363d; border-radius: 6px; }}
+.filter input {{ background: #0d1117; border: 1px solid #30363d; color: var(--fg); padding: 6px 10px; border-radius: 4px; width: 300px; }}
+.stats {{ display: flex; gap: 24px; margin: 16px 0; }}
+.stat {{ text-align: center; }}
+.stat b {{ display: block; font-size: 2em; }}
+.stat span {{ color: var(--mut); font-size: 0.85em; }}
+</style>
+<script>
+function filterCards() {{
+    const q = document.getElementById('search').value.toLowerCase();
+    document.querySelectorAll('.card').forEach(c => {{
+        c.style.display = c.textContent.toLowerCase().includes(q) ? '' : 'none';
+    }});
+}}
+</script>
+</head><body>
+<h1>ReconChain Dashboard: {html_escape(domain)}</h1>
+<small>generated {datetime.now().isoformat(timespec="seconds")} · reconchain v{__version__}</small>
+<div class="stats">
+    <div class="stat"><b>{total_findings:,}</b><span>Total Findings</span></div>
+    <div class="stat"><b>{critical}</b><span>Critical</span></div>
+    <div class="stat"><b>{high}</b><span>High</span></div>
+    <div class="stat"><b>{medium}</b><span>Medium</span></div>
+    <div class="stat"><b>{low}</b><span>Low</span></div>
+</div>
+<h2>Severity Distribution</h2>
+<div class="chart">
+    <div class="critical" style="width:{critical*100//max(total_findings,1)}%"></div>
+    <div class="high" style="width:{high*100//max(total_findings,1)}%"></div>
+    <div class="medium" style="width:{medium*100//max(total_findings,1)}%"></div>
+    <div class="low" style="width:{low*100//max(total_findings,1)}%"></div>
+</div>
+<div class="filter">
+    <input type="text" id="search" placeholder="Filter findings..." oninput="filterCards()">
+</div>
+<h2>Findings by Category</h2>
+<div class="grid">{cards_html}</div>
+{"<p class='miss'>missing: " + ", ".join(html_escape(m) for m in missing) + "</p>" if missing else ""}
+<footer>reconchain v{__version__} · all artifacts in <code>{html_escape(str(outdir))}</code></footer>
+</body></html>"""
+    out = ensure(outdir / "dashboard.html")
+    tmp = out.with_suffix(out.suffix + ".tmp")
+    tmp.write_text(html)
+    os.replace(tmp, out)
+    log("ok", f"interactive dashboard → {out}")
     return out

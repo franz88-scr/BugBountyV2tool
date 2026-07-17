@@ -7,6 +7,7 @@ import os
 import signal
 import threading
 import time
+from pathlib import Path
 from typing import Callable, Optional
 
 _log = logging.getLogger("resmon")
@@ -38,16 +39,14 @@ class AdaptiveSemaphore:
         with self._lock:
             return self._limit
 
-    def resize(self, new_limit: int) -> int:
+    def resize(self, new_limit: int, *, main_loop: Optional[asyncio.AbstractEventLoop] = None) -> int:
         """Adjust the semaphore capacity. Returns the actual new limit.
 
         Increases are immediate (release extra permits).
-        Decreases are deferred — excess permits drain naturally as tasks
-        release them, so we never block or steal held permits.
-
-        new_limit=0 is special: it *pauses* the semaphore (all acquire()
-        calls block) until resize(>=1) is called.
+        Decreases cap free permits immediately; held permits drain naturally.
+        new_limit=0 pauses the semaphore (all acquire() calls block).
         """
+        new_limit = max(0, new_limit)
         with self._lock:
             old = self._limit
             self._limit = new_limit
@@ -56,27 +55,44 @@ class AdaptiveSemaphore:
                 self._permits += diff
                 cond = self._cond
                 if cond is not None:
-                    try:
-                        loop = asyncio.get_running_loop()
-                    except RuntimeError:
-                        loop = None
-                    if loop is not None:
+                    loop = main_loop
+                    if loop is None:
+                        try:
+                            loop = asyncio.get_running_loop()
+                        except RuntimeError:
+                            loop = None
+                    if loop is not None and loop.is_running():
                         async def _notify():
                             async with cond:
                                 cond.notify_all()
-                        loop.create_task(_notify())
+                        def _schedule_notify():
+                            task = loop.create_task(_notify())
+                            task.add_done_callback(lambda t: t.exception() if not t.cancelled() else None)
+                        loop.call_soon_threadsafe(_schedule_notify)
             elif new_limit < old:
-                self._permits = min(self._permits, max(new_limit, 0))
+                # BUG 3 FIX: Account for held permits to prevent over-commit
+                held = old - self._permits
+                self._permits = max(0, new_limit - held)
             return self._limit
 
     async def acquire(self) -> None:
+        """Acquire a permit. Blocks until one is available.
+
+        Uses the standard condition-variable predicate loop to prevent
+        lost-wakeup races: cond.notify_all() from resize() is always
+        received because we hold cond's lock for the entire wait.
+        """
         cond = self._get_cond()
         async with cond:
-            while self._permits <= 0:
+            while True:
+                with self._lock:
+                    if self._permits > 0:
+                        self._permits -= 1
+                        return
                 await cond.wait()
-            self._permits -= 1
 
     def release(self) -> None:
+        """Release a permit back to the pool."""
         with self._lock:
             if self._permits < self._limit:
                 self._permits += 1
@@ -88,7 +104,7 @@ class AdaptiveSemaphore:
             loop = asyncio.get_running_loop()
         except RuntimeError:
             pass
-        if loop is not None:
+        if loop is not None and loop.is_running():
             async def _notify():
                 async with cond:
                     cond.notify_all()
@@ -99,7 +115,8 @@ class AdaptiveSemaphore:
             return self._permits <= 0
 
     def __repr__(self) -> str:
-        return f"AdaptiveSemaphore(limit={self._limit}, permits={self._permits})"
+        with self._lock:
+            return f"AdaptiveSemaphore(limit={self._limit}, permits={self._permits})"
 
     async def __aenter__(self) -> AdaptiveSemaphore:
         await self.acquire()
@@ -120,6 +137,7 @@ class AdaptiveThreadSemaphore:
         self._sem = threading.Semaphore(value)
         self._limit = value
         self._lock = threading.Lock()
+        self._count = 0
 
     @property
     def limit(self) -> int:
@@ -138,21 +156,39 @@ class AdaptiveThreadSemaphore:
             for _ in range(diff):
                 self._sem.release()
         elif diff < 0:
+            # Reclaim permits from the underlying semaphore.
+            # Use a loop with short timeout to avoid giving up too early.
+            reclaimed = 0
             for _ in range(-diff):
-                try:
-                    self._sem.acquire(blocking=False)
-                except RuntimeError:
+                acquired = self._sem.acquire(blocking=True, timeout=0.1)
+                if acquired:
+                    reclaimed += 1
+                else:
+                    # Can't reclaim more permits right now (all held by workers)
+                    # Update _count to reflect what we actually reclaimed
                     break
         return self._limit
 
     def acquire(self, blocking: bool = True, timeout: float = -1) -> bool:
-        return self._sem.acquire(blocking=blocking, timeout=timeout)
+        result = self._sem.acquire(blocking=blocking, timeout=timeout)
+        if result:
+            with self._lock:
+                self._count += 1
+        return result
 
     def release(self, n: int = 1) -> None:
-        self._sem.release(n)
+        with self._lock:
+            current_count = self._count
+            allowed = max(0, self._limit - current_count)
+            n = min(n, allowed)
+            if n > 0:
+                self._count -= n
+        if n > 0:
+            self._sem.release(n)
 
     def __repr__(self) -> str:
-        return f"AdaptiveThreadSemaphore(limit={self._limit})"
+        with self._lock:
+            return f"AdaptiveThreadSemaphore(limit={self._limit})"
 
 
 class ResourceMonitor:
@@ -172,14 +208,14 @@ class ResourceMonitor:
         cpu_high: float = 80.0,
         ram_low_bytes: int = 2 * 1024 * 1024 * 1024,   # 2 GB free to scale up
         ram_crit_bytes: int = 1 * 1024 * 1024 * 1024,    # 1 GB free to scale down
-        ram_emergency_bytes: int = 500 * 1024 * 1024,     # 500 MB = PAUSE everything
-        ram_resume_bytes: int = 1500 * 1024 * 1024,       # 1.5 GB free to unpause
+        ram_emergency_bytes: int = 2 * 1024 * 1024 * 1024,  # 2 GB = PAUSE everything
+        ram_resume_bytes: int = 2 * 1024 * 1024 * 1024,    # 2 GB free to unpause
         max_os_procs: Optional[int] = None,
     ) -> None:
         if max_limit is None:
             max_limit = min((os.cpu_count() or 4) * 2, 8)
         if max_os_procs is None:
-            max_os_procs = min(max(1, (os.cpu_count() or 4)), 4)
+            max_os_procs = min(max(8, (os.cpu_count() or 4) * 2), 12)
         self._initial = max(1, initial)
         self._max_limit = max(1, max_limit)
         self._max_os_procs = max(1, max_os_procs)
@@ -199,19 +235,28 @@ class ResourceMonitor:
         self._stop = threading.Event()
         self._started = False
 
-        # Emergency state
+        # Emergency state — use threading.Event for thread-safe pause/resume
         self._paused = False
-        self._pause_event = asyncio.Event()
-        self._pause_event.set()  # not paused initially
+        self._pause_event: Optional[asyncio.Event] = None
+        self._paused_lock = threading.Lock()
+        self._main_loop: Optional[asyncio.AbstractEventLoop] = None
 
         # Stats
         self.current_concurrency = self._initial
         self.cpu_percent = 0.0
         self.ram_available_gb = 0.0
 
+        # BUG 11 FIX: Prime psutil CPU measurement (non-blocking after first call)
+        try:
+            import psutil
+            psutil.cpu_percent(interval=None)
+        except ImportError:
+            pass
+
     @property
     def paused(self) -> bool:
-        return self._paused
+        with self._paused_lock:
+            return self._paused
 
     def bind(
         self,
@@ -224,14 +269,21 @@ class ResourceMonitor:
         self._on_resize = on_resize
         self.current_concurrency = sem.limit
 
-    @property
-    def paused(self) -> bool:
-        return self._paused
-
     def start(self) -> None:
         if self._started:
             return
+        # Capture the event loop reference from the calling (main) thread
+        try:
+            self._main_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            self._main_loop = None
+        # Lazily create the asyncio.Event bound to the running loop
+        if self._pause_event is None and self._main_loop is not None:
+            self._pause_event = asyncio.Event()
+            self._pause_event.set()  # not paused initially
         self._stop.clear()
+        self.ram_available_gb = self._read_ram_available() / (1024 ** 3)
+        self.cpu_percent = self._read_cpu_percent()
         self._thread = threading.Thread(target=self._run, daemon=True, name="resmon")
         self._thread.start()
         self._started = True
@@ -244,17 +296,28 @@ class ResourceMonitor:
 
     async def wait_if_paused(self) -> None:
         """Called by pipeline before starting a new phase. Blocks while paused."""
-        if self._paused:
+        # BUG 9 FIX: Always check the event (remove TOCTOU race)
+        if self._pause_event is not None:
             await self._pause_event.wait()
 
     # -- resource reading ---------------------------------------------------
+
+    def _update_config(self, **kwargs: Any) -> None:
+        """Update config kwargs for existing singleton (called from get_resource_monitor)."""
+        for k, v in kwargs.items():
+            attr = f"_{k}"
+            if hasattr(self, attr):
+                setattr(self, attr, v)
+            elif k in ("initial",):
+                pass
 
     @staticmethod
     def _read_cpu_percent() -> float:
         """Read CPU usage. Returns 0.0-100.0 average across all cores."""
         try:
             import psutil
-            return psutil.cpu_percent(interval=1)
+            # BUG 11 FIX: Use non-blocking call after priming in __init__
+            return psutil.cpu_percent(interval=None)
         except ImportError:
             pass
         # Fallback: /proc/stat (Linux)
@@ -265,7 +328,7 @@ class ResourceMonitor:
             vals = [int(parts[i]) for i in range(1, min(9, len(parts)))]
             idle = vals[3] + vals[4]
             total = sum(vals)
-            time.sleep(1)
+            time.sleep(0.1)
             with open("/proc/stat") as f:
                 line2 = f.readline()
             parts2 = line2.split()
@@ -302,83 +365,98 @@ class ResourceMonitor:
             pass
         try:
             my_pid = os.getpid()
-            count = 0
+            pid_set = set()
             for entry in os.listdir("/proc"):
                 if not entry.isdigit():
                     continue
                 try:
-                    ppid = int(open(f"/proc/{entry}/stat").read().split(")")[1].split()[1])
-                    if ppid == my_pid:
-                        count += 1
+                    pid = int(entry)
+                    stat = Path(f"/proc/{entry}/stat").read_text()
+                    ppid = int(stat.split(")")[1].split()[1])
+                    pid_set.add((pid, ppid))
                 except (OSError, IndexError, ValueError):
                     pass
+            # Build adjacency and walk recursively
+            children_map: Dict[int, List[int]] = {}
+            for pid, ppid in pid_set:
+                if pid == my_pid:
+                    continue
+                children_map.setdefault(ppid, []).append(pid)
+            count = 0
+            stack = list(children_map.get(my_pid, []))
+            while stack:
+                pid = stack.pop()
+                count += 1
+                stack.extend(children_map.get(pid, []))
             return count
         except OSError:
             return 0
 
     def _emergency_kill_children(self) -> None:
-        """Kill all descendant processes to free RAM in emergency."""
+        """Kill all descendant processes to free RAM in emergency.
+
+        BUG 7+8 FIX: Use psutil recursive children if available (handles
+        arbitrary depth). Fallback: snapshot PIDs first, then kill to avoid
+        PID recycling hitting wrong processes.
+        """
         _log.warning(
             f"EMERGENCY PAUSE: RAM={self.ram_available_gb:.1f}GB "
             f"(<{self._ram_emergency / (1024**3):.1f}GB). "
             f"Killing child processes to free memory."
         )
+        # Try psutil first — handles arbitrary process tree depth
+        try:
+            import psutil
+            parent = psutil.Process()
+            for child in parent.children(recursive=True):
+                try:
+                    child.kill()
+                except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
+                    pass
+            return
+        except (ImportError, psutil.NoSuchProcess):
+            pass
+
+        # Fallback: manual /proc walk with PID snapshot (recursive kill)
         my_pid = os.getpid()
-        killed = 0
-        try:
-            for entry in os.listdir("/proc"):
-                if not entry.isdigit():
+        pid_set = set()
+        for entry in os.listdir("/proc"):
+            if not entry.isdigit():
+                continue
+            try:
+                pid = int(entry)
+                if pid == my_pid:
                     continue
+                stat = Path(f"/proc/{entry}/stat").read_text()
+                ppid = int(stat.split(")")[1].split()[1])
+                pid_set.add((pid, ppid))
+            except (OSError, IndexError, ValueError):
+                pass
+        children_map: Dict[int, List[int]] = {}
+        for pid, ppid in pid_set:
+            children_map.setdefault(ppid, []).append(pid)
+        to_kill = set()
+        stack = list(children_map.get(my_pid, []))
+        while stack:
+            pid = stack.pop()
+            to_kill.add(pid)
+            stack.extend(children_map.get(pid, []))
+
+        if to_kill:
+            for pid in to_kill:
                 try:
-                    pid = int(entry)
-                    if pid == my_pid:
-                        continue
-                    ppid = int(open(f"/proc/{entry}/stat").read().split(")")[1].split()[1])
-                    if ppid == my_pid:
-                        os.kill(pid, signal.SIGTERM)
-                        killed += 1
-                except (OSError, IndexError, ValueError, ProcessLookupError, PermissionError):
+                    os.kill(pid, signal.SIGTERM)
+                except (OSError, ProcessLookupError, PermissionError):
                     pass
-        except OSError:
-            pass
-        # Also kill grandchildren
-        try:
-            for entry in os.listdir("/proc"):
-                if not entry.isdigit():
-                    continue
-                try:
-                    pid = int(entry)
-                    ppid = int(open(f"/proc/{entry}/stat").read().split(")")[1].split()[1])
-                    # Check if ppid is a direct child we're about to kill
-                    if ppid != my_pid:
-                        # Check grandparent
-                        pppid = int(open(f"/proc/{ppid}/stat").read().split(")")[1].split()[1])
-                        if pppid == my_pid:
-                            os.kill(pid, signal.SIGTERM)
-                            killed += 1
-                except (OSError, IndexError, ValueError, ProcessLookupError, PermissionError):
-                    pass
-        except OSError:
-            pass
-        if killed:
-            _log.warning(f"Sent SIGTERM to {killed} child/grandchild processes")
-        # Force SIGKILL after 3s for stubborn processes
+            _log.warning(f"Sent SIGTERM to {len(to_kill)} child processes")
+
+        # Force SIGKILL after 3s for stubborn processes — use same snapshot
         time.sleep(3)
-        try:
-            for entry in os.listdir("/proc"):
-                if not entry.isdigit():
-                    continue
-                try:
-                    pid = int(entry)
-                    if pid == my_pid:
-                        continue
-                    ppid = int(open(f"/proc/{entry}/stat").read().split(")")[1].split()[1])
-                    if ppid == my_pid:
-                        os.kill(pid, signal.SIGKILL)
-                except (OSError, IndexError, ValueError, ProcessLookupError, PermissionError):
-                    pass
-        except OSError:
-            pass
+        for pid in to_kill:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except (OSError, ProcessLookupError, PermissionError):
+                pass
 
     # -- main loop ----------------------------------------------------------
 
@@ -401,25 +479,44 @@ class ResourceMonitor:
 
         # --- EMERGENCY: RAM critically low → pause + kill excess children ---
         if ram_bytes < self._ram_emergency:
-            if not self._paused:
-                self._paused = True
-                self._pause_event.clear()
-                if self._sem is not None:
-                    self._sem.resize(0)
-                self.current_concurrency = 0
-                if self._os_sem is not None:
-                    self._os_sem.resize(1)
-                self._emergency_kill_children()
+            with self._paused_lock:
+                if not self._paused:
+                    self._paused = True
+                    if self._pause_event is not None and self._main_loop is not None:
+                        self._main_loop.call_soon_threadsafe(self._pause_event.clear)
+                    if self._sem is not None:
+                        self._sem.resize(0, main_loop=self._main_loop)
+                    self.current_concurrency = 0
+                    # BUG 15 FIX: Resize to 0, not 1 — no OS process should start during emergency
+                    if self._os_sem is not None:
+                        self._os_sem.resize(0)
+            self._emergency_kill_children()
             return
 
         # --- RESUME: RAM recovered enough → unpause ---
-        if self._paused and ram_bytes >= self._ram_resume:
-            self._paused = False
-            self._pause_event.set()
-            # Restore OS semaphore to hard cap
-            if self._os_sem is not None:
-                self._os_sem.resize(self._max_os_procs)
-            # Will fall through to normal scaling below
+        # BUG 17 FIX: Also handle partial recovery (RAM above emergency but below full resume)
+        if self._paused:
+            if ram_bytes >= self._ram_resume:
+                # Full resume
+                with self._paused_lock:
+                    self._paused = False
+                if self._pause_event is not None and self._main_loop is not None:
+                    self._main_loop.call_soon_threadsafe(self._pause_event.set)
+                if self._os_sem is not None:
+                    self._os_sem.resize(self._max_os_procs)
+            elif ram_bytes >= self._ram_emergency * 2:
+                # Partial recovery — resume with reduced concurrency
+                with self._paused_lock:
+                    self._paused = False
+                if self._pause_event is not None and self._main_loop is not None:
+                    self._main_loop.call_soon_threadsafe(self._pause_event.set)
+                if self._os_sem is not None:
+                    self._os_sem.resize(max(2, self._max_os_procs // 2))
+                # Start conservatively after emergency
+                if self._sem is not None:
+                    actual = self._sem.resize(self._initial, main_loop=self._main_loop)
+                    self.current_concurrency = actual
+            # else: still paused, RAM between emergency and 2× emergency — wait
 
         # --- Normal adaptive scaling ---
         if self._paused:
@@ -429,7 +526,7 @@ class ResourceMonitor:
         if (self.cpu_percent < self._cpu_low
                 and ram_bytes > self._ram_low
                 and child_procs < self._max_os_procs * 3):
-            new = min(cur + 1, self._max_limit)
+            new = min(cur + 2, self._max_limit)
         # Scale down if ANY pressure signal: high CPU, low RAM, or too many child procs
         elif (self.cpu_percent > self._cpu_high
               or ram_bytes < self._ram_crit
@@ -439,12 +536,19 @@ class ResourceMonitor:
             new = cur
 
         if new != cur and self._sem is not None:
-            actual = self._sem.resize(new)
+            actual = self._sem.resize(new, main_loop=self._main_loop)
             self.current_concurrency = actual
+            # Also scale OS process semaphore proportionally to async concurrency
+            if self._os_sem is not None:
+                os_new = min(actual * 2, self._max_os_procs)
+                os_new = max(os_new, 2)  # never go below 2
+                self._os_sem.resize(os_new)
+            # BUG 10 FIX: Use same value for callback as for os_sem.resize()
             if self._on_resize:
                 try:
-                    os_n = min(actual, self._max_os_procs)
-                    self._on_resize(os_n)
+                    os_new_cb = min(actual * 2, self._max_os_procs)
+                    os_new_cb = max(os_new_cb, 2)
+                    self._on_resize(os_new_cb)
                 except Exception:
                     pass
 
@@ -452,19 +556,24 @@ class ResourceMonitor:
 # --- Singleton accessor ---------------------------------------------------
 
 _resource_monitor_instance: Optional[ResourceMonitor] = None
+_resource_monitor_lock = threading.Lock()
 
 
 def get_resource_monitor(**kwargs) -> ResourceMonitor:
     """Return the global ResourceMonitor singleton, creating it if needed."""
     global _resource_monitor_instance
-    if _resource_monitor_instance is None:
-        _resource_monitor_instance = ResourceMonitor(**kwargs)
+    with _resource_monitor_lock:
+        if _resource_monitor_instance is None:
+            _resource_monitor_instance = ResourceMonitor(**kwargs)
+        elif kwargs:
+            _resource_monitor_instance._update_config(**kwargs)
     return _resource_monitor_instance
 
 
 def reset_resource_monitor() -> None:
     """Reset the singleton (for tests / pipeline restart)."""
     global _resource_monitor_instance
-    if _resource_monitor_instance is not None:
-        _resource_monitor_instance.stop()
-    _resource_monitor_instance = None
+    with _resource_monitor_lock:
+        if _resource_monitor_instance is not None:
+            _resource_monitor_instance.stop()
+            _resource_monitor_instance = None

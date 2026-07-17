@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Monitor reconchain.py run, restarting on failure/stuck/browser opens."""
 from __future__ import annotations
-import argparse, subprocess, time, sys, os, psutil
+import argparse, re, subprocess, time, sys, os, psutil
 from pathlib import Path
 
 
@@ -49,6 +49,8 @@ def main():
     args = parser.parse_args()
 
     DOMAIN = args.domain
+    if not re.match(r'^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$', DOMAIN):
+        sys.exit(f"error: invalid domain {DOMAIN!r} (path traversal check)")
     WORKDIR = Path(__file__).resolve().parent
     OUTDIR = Path(args.outdir) if args.outdir else WORKDIR / f"out_{DOMAIN}"
     LOGFILE = OUTDIR / "monitor.log"
@@ -87,7 +89,6 @@ def main():
                     last_output = time.time()
                     print(line, end="", flush=True)
                     time.sleep(0.05)
-                    continue
             except (ValueError, OSError):
                 pass
 

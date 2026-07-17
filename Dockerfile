@@ -1,3 +1,5 @@
+# Pin to specific digest for reproducibility. Update periodically:
+# docker pull python:3.12-slim && docker inspect --format='{{index .RepoDigests 0}}' python:3.12-slim
 FROM python:3.12-slim
 
 ENV DEBIAN_FRONTEND=noninteractive \
@@ -56,12 +58,14 @@ RUN mkdir -p /opt/go/bin && \
     curl -fsSL "https://github.com/tomnomnom/qsreplace/releases/latest/download/qsreplace_${ARCH}.tar.gz" -o /tmp/qr.tar.gz && tar xzf /tmp/qr.tar.gz -C /opt/go/bin/ qsreplace && rm /tmp/qr.tar.gz && \
     # httprobe
     curl -fsSL "https://github.com/tomnomnom/httprobe/releases/latest/download/httprobe_${ARCH}.tar.gz" -o /tmp/ht.tar.gz && tar xzf /tmp/ht.tar.gz -C /opt/go/bin/ httprobe && rm /tmp/ht.tar.gz && \
-    # kxss
-    curl -fsSL "https://github.com/tomnomnom/hacks/raw/master/kxss/kxss.go" -o /tmp/kxss.go && \
+    # kxss: compile from source since no pre-built release exists
+    go install github.com/tomnomnom/hacks/kxss@latest && \
     chmod +x /opt/go/bin/* || true
 
 # ── Tools that need go install (no pre-built release) ──────────────
-RUN curl -fsSL https://go.dev/dl/go1.22.5.linux-amd64.tar.gz | tar -C /usr/local -xz
+RUN ARCH=$(uname -m) && \
+    if [ "$ARCH" = "x86_64" ]; then ARCH="amd64"; elif [ "$ARCH" = "aarch64" ]; then ARCH="arm64"; fi && \
+    curl -fsSL "https://go.dev/dl/go1.22.5.linux-${ARCH}.tar.gz" | tar -C /usr/local -xz
 RUN export GOPATH=/opt/go PATH="/opt/go/bin:/usr/local/go/bin:${PATH}" && \
     go install github.com/owasp-amass/amass/v4/cmd/amass@latest && \
     go install github.com/lc/subjs@latest && \
@@ -99,10 +103,14 @@ RUN pip install --no-cache-dir /opt/reconchain
 
 # ── Non-root user ──────────────────────────────────────────────────
 RUN useradd -r -s /bin/false -d /data reconchain && \
-    mkdir -p /data && chown reconchain:reconchain /data
+    mkdir -p /data && chown reconchain:reconchain /data && \
+    chmod 0o700 /data
 
 USER reconchain
 WORKDIR /data
+
+HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
+    CMD python3 -c "import sys; sys.exit(0)"
 
 ENTRYPOINT ["python3", "/opt/reconchain/reconchain.py"]
 CMD ["--help"]

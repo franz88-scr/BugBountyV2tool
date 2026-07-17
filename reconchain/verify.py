@@ -130,7 +130,7 @@ def filter_outputs(outdir: Path) -> int:
     total_removed = 0
     emptied = 0
 
-    txt_files = sorted(outdir.glob("*.txt"))
+    txt_files = sorted(outdir.rglob("*.txt"))
     if not txt_files:
         log("info", "no output files to filter")
         return 0

@@ -1,0 +1,29 @@
+# ShellCheck configuration for ReconChain
+# https://www.shellcheck.net/
+
+# Enable all optional checks
+enable=all
+
+# Disable specific checks
+# SC1091: Not following sourced files
+disable=SC1091
+
+# SC2034: Variables appear unused
+disable=SC2034
+
+# SC2086: Double quote to prevent globbing and word splitting
+# (use inline disable where word splitting is intentional)
+# disable=SC2086
+
+# SC2155: Declare and assign separately
+disable=SC2155
+
+# SC2164: Use cd ... || exit for error handling
+disable=SC2164
+
+# Severity levels
+# We mainly care about warnings and errors
+severity=warning
+
+# External commands that are allowed
+external-sources=true

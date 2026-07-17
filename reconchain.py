@@ -4,7 +4,7 @@ reconchain.py — recon orchestrator.
 
 This is now a thin shim that delegates to the reconchain/ package.
 All phase logic, reporting, and pipeline orchestration live in
-reconchain/ submodules (phases.py, reporting.py, pipeline.py, etc.).
+reconchain/ submodules (reconchain/phases/, reporting.py, pipeline.py, etc.).
 
 Usage:
   python3 reconchain.py -d example.com -o ./out

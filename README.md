@@ -1,6 +1,6 @@
 # ReconChain v2.0.0
 
-Chains 152 recon and vulnerability phases across 27 stages into a single resumable pipeline.
+Chains 164 recon and vulnerability phases across 27 stages into a single resumable pipeline.
 
 ![](docs/wizard_menu.svg)
 
@@ -10,6 +10,7 @@ reconchain -d example.com -o ./out      # Full audit
 reconchain -d example.com,test.org      # Multi-domain
 reconchain -d example.com --fast        # Basic recon only
 reconchain -d example.com --no-dos      # Skip DoS-style phases
+reconchain -d example.com --safe        # Safe mode for VMs/containers
 ```
 
 ## Install
@@ -34,7 +35,7 @@ chmod +x install.sh && ./install.sh
 | `--proxy URL` | SOCKS/HTTP proxy, e.g. `socks5://127.0.0.1:9050` |
 | `--vuln-proxy URL` | Proxy for vuln phases only |
 | `-j N` | Parallel phases (default: cpu count) |
-| `--max-procs N` | Max concurrent tool subprocesses (default: half cpu count) |
+| `--max-procs N` | Max concurrent tool subprocesses (default: auto, scales with CPU) |
 | `--delay SEC` | Throttle delay between requests |
 | `--rate-limit N` | Max requests/sec per tool (0 = unlimited) |
 | `--dos` | Enable DoS-style phases (default) |
@@ -48,19 +49,44 @@ chmod +x install.sh && ./install.sh
 | `--exclude-tags TAGS` | Comma-separated nuclei tags to exclude |
 | `--header HDR` | Extra HTTP header (repeatable) |
 | `--cookie STR` | Cookie string for authenticated scans |
+| `--safe` | Safe mode: conservative concurrency for VMs/containers (start=1, max=4, max_procs=2) |
+| `--adaptive` | Enable adaptive resource monitor (default: on) |
+| `--no-adaptive` | Disable adaptive monitor, use static concurrency |
+| `--adaptive-start N` | Starting concurrency for adaptive monitor (default: auto, 2-6) |
+| `--adaptive-max N` | Max concurrency cap for adaptive monitor (0 = auto) |
+| `--adaptive-max-procs N` | Hard cap on concurrent subprocesses (0 = auto) |
+| `--adaptive-interval F` | Monitor check interval in seconds (default: 5.0) |
+| `--adaptive-cpu-high N` | CPU% threshold to reduce concurrency (default: 80) |
+| `--adaptive-ram-crit F` | RAM free GB threshold to reduce concurrency (default: 1.0) |
+
+### Performance
+
+ReconChain automatically scales concurrency based on system resources. The adaptive monitor measures CPU/RAM every 5 seconds and adjusts thread count and subprocess limits in real time.
+
+**How it works:**
+- Starts at a conservative concurrency level (auto-detected based on CPU cores)
+- Ramps up by +2 every 5 seconds when system load is low
+- Scales down when CPU > 80% or free RAM < 1 GB
+- Hard-caps subprocesses at 12 max (auto-detected: `min(12, max(8, cpu_count * 2))`)
+
+**For VMs/containers:** Use `--safe` to apply pre-tuned conservative settings that prevent OOM kills.
 
 ### Low-Resource / VM Mode
 
 For VirtualBox VMs, Docker containers, or low-RAM hosts:
 
 ```bash
+# Quick safe mode — auto-configures conservative settings
+reconchain -d example.com --fast --safe
+
+# Manual fine-tuning
 reconchain -d example.com --fast -j 1 --max-procs 2 --rate-limit 5
 reconchain -d example.com --fast --no-dos -j 1 --max-procs 3 --delay 0.5 --rate-limit 10
 ```
 
 Every subprocess is capped at 8 GB virtual memory, 2048 child processes, and 512 MB output. A hard OS-level process counter (`--max-procs`) limits total concurrent tools across all phases.
 
-## Phases (152)
+## Phases (164)
 
 ### Recon (00–07)
 
@@ -124,9 +150,9 @@ Every subprocess is capped at 8 GB virtual memory, 2048 child processes, and 512
 
 ## Tools (45+)
 
-**Go:** subfinder, amass, alterx, dnsx, naabu, httpx, nuclei, gau, gospider, katana, subjs, ffuf, dalfox, interactsh-client, kxss, gitleaks, httprobe, trufflehog, unfurl, qsreplace, Gxss, cdncheck, puredns, gowitness, cloudfox, crlfuzz, graphinder
+**Go:** subfinder, amass, alterx, dnsx, naabu, httpx, nuclei, gau, gospider, katana, subjs, ffuf, dalfox, interactsh-client, kxss, gitleaks, httprobe, trufflehog, unfurl, qsreplace, Gxss, cdncheck, puredns, gowitness, cloudfox, crlfuzz
 
-**Python:** dnsgen, waymore, xnLinkFinder, SecretFinder, wafw00f, inql, cloud_enum, clairvoyance, arjun, jsubfinder, corsy, jwt_tool, ssmrfy, commix, wpscan, sqlmap
+**Python:** dnsgen, waymore, xnLinkFinder, SecretFinder, wafw00f, inql, cloud_enum, clairvoyance, graphinder, arjun, jsubfinder, corsy, jwt_tool, ssmrfy, commix, wpscan, sqlmap
 
 **System:** nmap, massdns, testssl.sh, nuclei-headless, feroxbuster (cargo)
 
@@ -139,8 +165,13 @@ The following phases are disabled by default with `--no-dos`:
 ## Safety
 
 - **Per-tool resource caps**: RLIMIT_AS (8 GB), RLIMIT_NPROC (2048), RLIMIT_FSIZE (512 MB) via `preexec_fn`
-- **Global process counter**: Hard cap on total concurrent subprocesses (`--max-procs`)
-- **Memory monitoring**: Warns when available RAM drops below 1 GB
+- **Global process counter**: Hard cap on total concurrent subprocesses (auto-scales with CPU, caps at 12)
+- **Adaptive resource monitor**: Auto-tunes concurrency based on real-time CPU/RAM usage; scales down when thresholds are exceeded
+- **Emergency kill**: Terminates the pipeline immediately if free RAM drops below 500 MB
+- **Emergency resume**: Restarts the pipeline when free RAM recovers above 1.5 GB
+- **Circuit breaker**: Pauses all phases after 3 consecutive subprocess failures
+- **Phase timeout**: Individual phases are killed after 7200s (2h) to prevent infinite hangs
+- **Safe mode**: `--safe` flag applies conservative settings (start=1, max=4, max_procs=2, CPU threshold=60%, RAM threshold=2GB, reduced sample sizes, serial tool execution)
 - **Rate limiting**: Per-tool rate limits via `--rate-limit` and `--delay`
 
 ## Output

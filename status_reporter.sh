@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-OUTDIR="${OUTDIR:-/home/ferdi/BugBountyV2tool/out_brandenburg.cloud}"
+OUTDIR="${OUTDIR:-$(dirname "$0")/out_brandenburg.cloud}"
 LOGFILE="$OUTDIR/monitor_stdout.log"
 STATUSFILE="$OUTDIR/status_report.txt"
 

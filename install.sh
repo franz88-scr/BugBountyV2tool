@@ -79,7 +79,7 @@ for arg in "$@"; do
 
     -h|--help)
 
-      sed -n '2,12p' "$0"; exit 0 ;;
+      sed -n '20,30p' "$0"; exit 0 ;;
 
     *) err "unknown flag: $arg"; exit 1 ;;
 
@@ -197,7 +197,9 @@ ALL_TOOLS=(subfinder amass dnsx naabu nmap httpx nuclei
 
            alterx cloudfox crlfuzz graphinder
 
-           clairvoyance commix corsy smuggler)
+           clairvoyance commix corsy smuggler
+
+           grpcurl shortscan jsluice)
 
 
 
@@ -318,7 +320,11 @@ GO_TOOLS=(
 
   "github.com/dwisiswant0/crlfuzz/cmd/crlfuzz"
 
-  "github.com/Escape-Technologies/graphinder"
+  "github.com/fullstorydev/grpcurl/cmd/grpcurl"
+
+  "github.com/icehess/shortscan"
+
+  "github.com/pcrow001/jsluice/cmd/jsluice"
 
 )
 
@@ -405,6 +411,11 @@ install_python_tools() {
   # NOTE: secretfinder (m4ll0k/SecretFinder) is installed via git below,
   # not from pip. The pip package `secretfinder` is a different tool.
   for pkg in arjun; do
+    # Validate package name to prevent code injection
+    if [[ ! "$pkg" =~ ^[a-zA-Z0-9_]+$ ]]; then
+      warn "invalid package name: $pkg"
+      continue
+    fi
     if ! python3 -c "import ${pkg}" 2>/dev/null && \
        ! command -v "${pkg}" >/dev/null 2>&1; then
       pip3 install --user "$pkg" 2>/dev/null || \
@@ -481,6 +492,13 @@ GITEOF
       warn "clairvoyance pip install failed"
   fi
   command -v clairvoyance >/dev/null 2>&1 && ok "clairvoyance" || dim "clairvoyance not installed"
+
+  # graphinder — GraphQL endpoint finder (Python)
+  if ! command -v graphinder >/dev/null 2>&1; then
+    pip3 install --user graphinder 2>/dev/null || pip3 install --user --break-system-packages graphinder 2>/dev/null || \
+      warn "graphinder pip install failed"
+  fi
+  command -v graphinder >/dev/null 2>&1 && ok "graphinder" || dim "graphinder not installed"
 
   # commix — command injection exploiter
   if ! command -v commix >/dev/null 2>&1; then

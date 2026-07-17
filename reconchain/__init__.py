@@ -1,14 +1,14 @@
 # ReconChain package
 from __future__ import annotations
 
-# The package is structured so that reconchain.py (single file) has been
-# split into submodules within this package.  All public symbols are
-# re-exported here for backward compatibility.
+# Backward-compatible re-exports: all public symbols from submodules are
+# available directly via `from reconchain import ...`.
 
 from reconchain.config import (
     __version__,
     VALID_PHASES,
     FAST_PHASES,
+    QUICK_SKIP_PHASES,
     DOS_PHASES,
     PipelineConfig,
     _HOSTNAME_RE,
@@ -20,6 +20,8 @@ from reconchain.utils import (
     _target_token,
     _target_lines,
     _write_target_tokens,
+    write_findings,
+    _load_live_hosts,
     _color, C, LVL,
     disable_color,
     log,
@@ -68,7 +70,7 @@ from reconchain.process import (
 from reconchain.interactsh import Interactsh
 from reconchain.reporting import (
     _counts, write_summary, write_html,
-    write_full_summary, write_markdown,
+    write_full_summary, write_markdown, write_sarif, write_faraday, write_html_dashboard,
 )
 import re as _re
 
@@ -229,16 +231,31 @@ from reconchain.phases import (
     phase_134_LBDETECT,
     phase_135_VHOST,
     phase_136_RATELIMITBYPASS,
+    phase_137_EMAILFINDER,
+    phase_138_METAGOOFIL,
+    phase_139_PORCHPIRATE,
+    phase_140_DORKHUNTER,
+    phase_141_CRTSH,
+    phase_142_GITHUBSUB,
+    phase_143_TLSX,
+    phase_144_ANALYTICSRELS,
+    phase_145_FAVIRECON,
+    phase_146_JSLUICE,
+    phase_147_SHORTSCAN,
+    phase_148_GRPCURL,
 )
 from reconchain.pipeline import run_pipeline
-from reconchain.cli import build_parser, main, interactive_setup
+from reconchain.cli import build_parser, main, InteractiveWizard
 from reconchain.dedup import DedupEngine
 from reconchain.monitor import MonitorEngine
 from reconchain.ratelimit import RateLimiter
 from reconchain.useragent import UARotator
+from reconchain.conf import load_config, apply_config_to_args, find_config
+from reconchain.notify import send_notification, send_scan_summary
+from reconchain.distributed import SSHScanner, create_scanner_from_config
 
 __all__ = [
-    "__version__", "VALID_PHASES", "FAST_PHASES", "DOS_PHASES", "PhaseSet",
+    "__version__", "VALID_PHASES", "FAST_PHASES", "QUICK_SKIP_PHASES", "DOS_PHASES", "PhaseSet",
     "PIPELINE", "_PHASE_WEIGHTS", "PHASE_DEPS", "STAGES", "PipelineConfig",
     "_parse_semver", "_semver_lt",
     "_JS_SECRET_PATTERNS", "_SOURCE_MAP_RE",
@@ -246,6 +263,7 @@ __all__ = [
     "_RECON_LEVELS", "_HOSTNAME_RE", "_SAFE_HOST",
     "_is_valid_hostname", "_is_under_domain", "_target_token",
     "_target_lines", "_write_target_tokens",
+    "write_findings", "_load_live_hosts",
     "_color", "C", "LVL", "disable_color", "log",
     "_auto_detect_proxy", "_set_proxy_env", "_auto_detect_cookies",
     "_extra_headers_dict", "_extra_http_args", "_get_urlopener",
@@ -275,20 +293,32 @@ __all__ = [
     "phase_03_PERMUTE", "phase_04_SCAN", "phase_04b_TAKEOVER_VALIDATE",
     "phase_05_HARVEST", "phase_05b_APISPEC", "phase_06_JSINTEL",
     "phase_07_PARAMS", "phase_08_FUZZ", "phase_09_VULNSCAN",
-    "phase_10_TLSCMS", "phase_11_INJECT", "phase_11b_SQLMAP",
+    "phase_10_TLSCMS", "phase_11_INJECT", "phase_11a_DOMXSS", "phase_11b_SQLMAP",
     "phase_12_SSTI", "phase_13_OOB", "phase_14_ORIGIN",
     "phase_15_SECRETS", "phase_16a_AUTHZ", "phase_16b_MASSASSIGN",
     "phase_17_IDOR", "phase_17b_SSRFMETA", "phase_18_CLOUD",
     "phase_19_GIT", "phase_20_GRAPHQL", "phase_21_WAF",
-    "phase_22_NOSQLI", "phase_23_RACE", "phase_24_JWT",
+    "phase_21b_WAFBYPASS", "phase_22_NOSQLI", "phase_23_RACE", "phase_24_JWT",
     "phase_25_XXE", "phase_26_CMDINJECT", "phase_27_SSPP",
     "phase_28_CACHED", "phase_29_DEPCHECK", "phase_30_LFI",
     "phase_31_OPENREDIR", "phase_32_CLICKJACK", "phase_33_CRLF",
     "phase_34_RATELIMIT", "phase_35_CORSADV", "phase_36_JWTADV",
-    "phase_37_FILEUPLOAD", "phase_38_SMUGGLE", "phase_39_OAUTH",
+    "phase_37_FILEUPLOAD", "phase_38_SMUGGLE", "phase_38b_H2SMUGGLE", "phase_39_OAUTH",
     "phase_40_PWRESET", "phase_41_WEBSOCKET", "phase_42_LDAP",
-    "phase_43_DESERIAL",     "phase_44_CHAIN", "phase_45_EVIDENCE",
+    "phase_43_DESERIAL", "phase_44_CHAIN", "phase_45_EVIDENCE",
     "phase_46_BUCKET", "phase_47_CDN", "phase_48_CONTENT",
+    "phase_49_FRAMEWORKS", "phase_50_BUCKET_PERMS", "phase_51_HPP",
+    "phase_52_SERVERLESS", "phase_53_CSP", "phase_54_WS_FUZZ",
+    "phase_55_CSV_INJECT", "phase_56_EXPOSED_DB", "phase_57_DEFAULT_CREDS",
+    "phase_58_HOST_INJECT", "phase_59_EMAIL_SEC", "phase_60_SMTP_ENUM",
+    "phase_61_OAUTH_ADV", "phase_62_LOG_INJECT", "phase_63_DOC_ATTACK",
+    "phase_64_IDEMPOTENCY", "phase_65_SESSION", "phase_66_SSRF_FULL",
+    "phase_67_PATHNORM", "phase_68_DEPCVE", "phase_69_DNSZT",
+    "phase_70_PORTFULL", "phase_71_EMHARVEST", "phase_72_ACCOUNTENUM",
+    "phase_73_CSPBYPASS", "phase_74_GHTOOLS", "phase_75_MOBILEAPI",
+    "phase_76_WORKFLOW", "phase_77_CACHEKEY", "phase_78_FILEUPLOADADV",
+    "phase_79_SECRETDIFF", "phase_80_STOREXSS", "phase_81_IDORFUZZ",
+    "phase_82_OAUTHDEEP", "phase_83_RACEBURST",
     "phase_84_WHOIS", "phase_85_ASN", "phase_86_DORK",
     "phase_87_SHODAN", "phase_88_EMPLOYEE", "phase_89_PASSIVEDNS",
     "phase_90_CSRF", "phase_91_SESSIONFIX", "phase_92_SAML",
@@ -309,8 +339,16 @@ __all__ = [
     "phase_127_CICD", "phase_128_DOCKER", "phase_129_K8S",
     "phase_130_TERRAFORM", "phase_131_ENVDEEP",
     "phase_132_GQLABUSE", "phase_133_APIVERSION", "phase_134_LBDETECT",
-    "phase_135_VHOST", "phase_136_RATELIMITBYPASS",
-    "build_parser", "main", "interactive_setup",
+     "phase_135_VHOST", "phase_136_RATELIMITBYPASS",
+    "phase_137_EMAILFINDER", "phase_138_METAGOOFIL", "phase_139_PORCHPIRATE",
+    "phase_140_DORKHUNTER", "phase_141_CRTSH", "phase_142_GITHUBSUB",
+    "phase_143_TLSX", "phase_144_ANALYTICSRELS", "phase_145_FAVIRECON",
+    "phase_146_JSLUICE", "phase_147_SHORTSCAN", "phase_148_GRPCURL",
+    "build_parser", "main", "InteractiveWizard",
     "run_pipeline",
     "DedupEngine", "MonitorEngine", "RateLimiter", "UARotator",
+    "load_config", "apply_config_to_args", "find_config",
+    "send_notification", "send_scan_summary",
+    "write_sarif", "write_faraday", "write_html_dashboard",
+    "SSHScanner", "create_scanner_from_config",
 ]

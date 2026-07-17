@@ -2,6 +2,15 @@ services:
   reconchain:
     build: .
     container_name: reconchain
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_RAW
+    read_only: true
+    tmpfs:
+      - /tmp
     deploy:
       resources:
         limits:

@@ -1,14 +1,15 @@
 """Configuration constants, dataclasses, and pipeline definitions."""
 from __future__ import annotations
+
 import re
 from dataclasses import dataclass, field
-from typing import List, Set
+from typing import Any, Dict, List, Set
 
 _HOSTNAME_RE = re.compile(
     r"^(?=.{1,253}$)(?:[A-Za-z0-9](?:[A-Za-z0-9_-]{0,61}[A-Za-z0-9])?\.)+"
     r"[A-Za-z0-9](?:[A-Za-z0-9_-]{0,61}[A-Za-z0-9])?\.?$"
 )
-__version__ = "1.5.1"
+__version__ = "2.0.0"
 
 VALID_PHASES = {
     "00-SCOPE", "01-RECON", "02-RESOLVE", "03-PERMUTE", "04-SCAN",
@@ -40,11 +41,59 @@ VALID_PHASES = {
     "110-THIRDPARTYJS", "111-BROWSERSTORAGE", "112-RFI", "113-WEBDAV", "114-SNMP",
     "115-BANNER", "116-PHPINFO", "117-SRVSTATUS", "118-ERRORLEAK",
     "119-WILDCARDDNS", "120-DNSREBIND",
-    "121-IISASPNET", "122-TOMCAT", "123-NODEJS", "124-LARAVEL", "125-DJANGO", "126-SYMFONY",
+     "121-IISASPNET", "122-TOMCAT", "123-NODEJS", "124-LARAVEL", "125-DJANGO", "126-SYMFONY",
     "127-CICD", "128-DOCKER", "129-K8S", "130-TERRAFORM", "131-ENVDEEP",
     "132-GQLABUSE", "133-APIVERSION", "134-LBDETECT", "135-VHOST", "136-RATELIMITBYPASS",
+    "137-EMAILFINDER", "138-METAGOOFIL", "139-PORCHPIRATE", "140-DORKHUNTER",
+    "141-CRTSH", "142-GITHUBSUB", "143-TLSX", "144-ANALYTICSRELS",
+    "145-FAVIRECON", "146-JSLUICE", "147-SHORTSCAN", "148-GRPCURL",
 }
 FAST_PHASES = {"00-SCOPE", "01-RECON", "02-RESOLVE", "04-SCAN", "05-HARVEST"}
+# Phases that are redundant, low-signal, or produce false positives against wildcard-DNS targets.
+# Used by --profile quick to skip them automatically.
+QUICK_SKIP_PHASES = {
+    # Info-leak probes that produce no real findings against modern targets
+    "115-BANNER",        # SSH/FTP banners — rarely useful for web targets
+    "116-PHPINFO",       # phpinfo() disclosure — already covered by nuclei
+    "117-SRVSTATUS",     # Apache/Nginx server-status — already covered by nuclei
+    # Framework-specific probes that only fire on matching tech (low hit rate)
+    "121-IISASPNET",     # IIS/ASP.NET — only if IIS detected
+    "122-TOMCAT",        # Tomcat manager/JMX — only if Tomcat detected
+    "123-NODEJS",        # Node.js debug/SSTI — only if Node detected
+    "124-LARAVEL",       # Laravel env/logs — only if Laravel detected
+    "125-DJANGO",        # Django debug/admin — only if Django detected
+    "126-SYMFONY",       # Symfony profiler — only if Symfony detected
+    # Infrastructure probes (low signal for web apps)
+    "119-WILDCARDDNS",   # Wildcard DNS detection — already handled by 404 filter
+    "120-DNSREBIND",     # DNS rebinding — very niche attack
+    "127-CICD",          # CI/CD file exposure — rarely found
+    "128-DOCKER",        # Docker registry exposure — rarely found
+    "129-K8S",           # Kubernetes exposure — rarely found
+    "130-TERRAFORM",     # Terraform state exposure — rarely found
+    # Duplicate/overlapping phases
+    "84-WHOIS",          # WHOIS info — available via other tools
+    "85-ASN",            # ASN lookup — low web security value
+    "89-PASSIVEDNS",     # Passive DNS — already in recon data
+    "91-SESSIONFIX",     # Session fixation — low signal
+    "92-SAML",           # SAML bypass — only if SAML detected
+    "95-POSTTEST",       # POST auth bypass — overlaps with 99g-AUTHBYPASSADV
+    "96-METHODOVERRIDE", # Method override — overlaps with other auth phases
+    "98-CASEBYPASS",     # Case-sensitivity bypass — overlaps with 97-FORCEDBROWSE
+    "99a-TABNAB",        # Reverse tabnabbing — low priority
+    "102-NULLBYTE",      # Null byte injection — modern servers block this
+    "103-DOUBLEENCOD",   # Double encoding — covered by nuclei
+    "104-UNICODE",       # Unicode bypass — covered by nuclei
+    "106-JSONP",         # JSONP hijacking — very niche
+    "108-MIXEDCONTENT",  # Mixed content — informational, not a vulnerability
+    "109-HSTSPRELOAD",   # HSTS preload — informational only
+    "110-THIRDPARTYJS",  # Third-party JS audit — informational only
+    "112-RFI",           # Remote file inclusion — very niche
+    "113-WEBDAV",        # WebDAV testing — very niche
+    "114-SNMP",          # SNMP — not web security
+    "52-SERVERLESS",     # Serverless detection — niche
+    "59-EMAIL-SEC",      # Email security — not web security
+    "60-SMTP-ENUM",      # SMTP enumeration — not web security
+}
 DOS_PHASES = {
     "20-GRAPHQL",      # 100-alias batching, depth-10 nested queries
     "23-RACE",         # 5 concurrent requests + TOCTOU write+read
@@ -61,6 +110,320 @@ DISCOVERY_PHASES = {
     "00-SCOPE", "01-RECON", "02-RESOLVE", "03-PERMUTE", "04-SCAN",
     "04b-TAKEOVER-VALIDATE", "05-HARVEST", "05b-APISPEC", "06-JSINTEL",
     "07-PARAMS", "08-FUZZ", "21-WAF",
+}
+
+# ── Phase categories for the interactive wizard ──────────────────────────────
+# Each category groups related phases for the grouped phase selector UI.
+# Order here defines display order in the wizard.
+PHASE_CATEGORIES: Dict[str, Dict[str, Any]] = {
+    "Recon & Discovery": {
+        "desc": "Scope validation, subdomain enumeration, DNS resolution, port scanning, URL harvesting, JS analysis, parameter discovery, fuzzing, vuln scanning, TLS/CMS fingerprinting",
+        "phases": [
+            ("00-SCOPE", "Scope validation"),
+            ("01-RECON", "Subdomain enumeration (subfinder, amass, etc.)"),
+            ("02-RESOLVE", "DNS resolution & live probing"),
+            ("03-PERMUTE", "Subdomain permutation"),
+            ("04-SCAN", "Port scanning (naabu/nmap)"),
+            ("04b-TAKEOVER-VALIDATE", "Confirm dangling CNAME exploitability"),
+            ("05-HARVEST", "URL gathering (gau, wayback, katana)"),
+            ("05b-APISPEC", "API spec discovery (Swagger/OpenAPI/GraphQL SDL)"),
+            ("06-JSINTEL", "JavaScript analysis (secretfinder, corsy)"),
+            ("07-PARAMS", "Parameter discovery (arjun/x8)"),
+            ("08-FUZZ", "Endpoint fuzzing (ffuf)"),
+            ("09-VULNSCAN", "Vulnerability scanning (nuclei)"),
+            ("10-TLSCMS", "TLS/CMS fingerprinting"),
+        ],
+    },
+    "OSINT & Passive Recon": {
+        "desc": "WHOIS, ASN, Google dorking, Shodan, email harvesting, passive DNS, crt.sh, GitHub subdomains, metagoofil, porch-pirate",
+        "phases": [
+            ("84-WHOIS", "WHOIS registration data lookup"),
+            ("85-ASN", "ASN & BGP prefix enumeration"),
+            ("86-DORK", "Google/Bing dorking for sensitive files & pages"),
+            ("87-SHODAN", "Shodan host & service fingerprinting"),
+            ("88-EMPLOYEE", "Employee name harvesting"),
+            ("89-PASSIVEDNS", "Passive DNS historical subdomain lookup"),
+            ("71-EMHARVEST", "Email address harvesting from web pages"),
+            ("137-EMAILFINDER", "Email address discovery"),
+            ("138-METAGOOFIL", "Document metadata extraction"),
+            ("139-PORCHPIRATE", "Exposed package / public repos discovery"),
+            ("140-DORKHUNTER", "Advanced dorking for exposed panels"),
+            ("141-CRTSH", "crt.sh certificate transparency lookup"),
+            ("142-GITHUBSUB", "GitHub subdomain discovery"),
+        ],
+    },
+    "Injection & XSS": {
+        "desc": "XSS (dalfox/kxss/DOM), SQL injection (sqlmap), SSTI, NoSQLi, XXE, command injection, prototype pollution, LDAP, deserialization, stored XSS, SSI, JSON injection, null byte, encoding bypasses",
+        "phases": [
+            ("11-INJECT", "XSS (dalfox/kxss), SSRF probes, parameter injection"),
+            ("11a-DOMXSS", "DOM-based XSS via browser automation (Playwright)"),
+            ("11b-SQLMAP", "SQL injection via sqlmap (pre-filtered)"),
+            ("12-SSTI", "SSTI fuzzing"),
+            ("22-NOSQLI", "NoSQL injection probes"),
+            ("25-XXE", "XML external entity injection"),
+            ("26-CMDINJECT", "OS command injection detection"),
+            ("27-SSPP", "Server-side prototype pollution"),
+            ("42-LDAP", "LDAP injection detection"),
+            ("43-DESERIAL", "Deserialization attack detection"),
+            ("55-CSV-INJECT", "CSV/Excel formula injection (DDE, HYPERLINK)"),
+            ("62-LOG-INJECT", "Log injection / log forging detection"),
+            ("80-STOREXSS", "Stored XSS payload injection + verification"),
+            ("99e-XSSSTORED", "Stored XSS with payload persistence check"),
+            ("100-SSI", "SSI injection testing"),
+            ("101-JSONINJECT", "JSON-based injection (JWT, template, expression)"),
+            ("102-NULLBYTE", "Null byte injection bypass"),
+            ("103-DOUBLEENCOD", "Double URL encoding bypass"),
+            ("104-UNICODE", "Unicode normalization bypass"),
+            ("105-POSTMSGXSS", "postMessage XSS via window.postMessage"),
+            ("106-JSONP", "JSONP hijacking & callback abuse"),
+        ],
+    },
+    "Auth & Session": {
+        "desc": "JWT analysis, OAuth misconfig, session fixation, CSRF, IDOR, password reset poisoning, SAML bypass, cookie audit, mass assignment, credential spraying",
+        "phases": [
+            ("24-JWT", "JWT token analysis"),
+            ("36-JWTADV", "Advanced JWT attacks"),
+            ("39-OAUTH", "OAuth misconfiguration testing"),
+            ("40-PWRESET", "Password reset logic testing"),
+            ("61-OAUTH-ADV", "OAuth redirect_uri bypass variants"),
+            ("65-SESSION", "Session fixation & token lifecycle analysis"),
+            ("82-OAUTHDEEP", "Deep OAuth redirect_uri bypass (state, PKCE)"),
+            ("16a-AUTHZ", "Auth bypass header injection"),
+            ("16b-MASSASSIGN", "Mass assignment field discovery"),
+            ("17-IDOR", "ID manipulation / predictable IDs"),
+            ("17b-SSRFMETA", "Cloud metadata exfiltration (SSRF confirmed)"),
+            ("81-IDORFUZZ", "IDOR via parameter fuzzing (cross-session)"),
+            ("90-CSRF", "CSRF token validation & SameSite audit"),
+            ("91-SESSIONFIX", "Session fixation & session handling audit"),
+            ("92-SAML", "SAML authentication bypass testing"),
+            ("93-PWDSPRAY", "Credential spray & password policy testing"),
+            ("94-COOKIEAUDIT", "Cookie security flags audit (HttpOnly/Secure/SameSite)"),
+            ("95-POSTTEST", "POST-based authentication bypass testing"),
+            ("96-METHODOVERRIDE", "HTTP method override (X-HTTP-Method-Override)"),
+            ("99f-HOSTABUSE", "Host header abuse (password reset poisoning, cache)"),
+            ("99g-AUTHBYPASSADV", "Advanced auth bypass (path traversal, header injection)"),
+        ],
+    },
+    "Client-Side & Web": {
+        "desc": "Cache poisoning, CORS, clickjacking, open redirect, CRLF, file upload, CSP, HPP, rate limiting, WebSocket, evidence capture, cross-phase correlation",
+        "phases": [
+            ("28-CACHED", "Web cache poisoning/deception + v2 probes"),
+            ("29-DEPCHECK", "JS dependency vulnerability scan"),
+            ("30-LFI", "Local file inclusion / path traversal"),
+            ("31-OPENREDIR", "Open redirect detection"),
+            ("32-CLICKJACK", "Clickjacking protection check"),
+            ("33-CRLF", "CRLF injection detection"),
+            ("34-RATELIMIT", "Rate limiting detection"),
+            ("35-CORSADV", "Advanced CORS misconfiguration (corsy)"),
+            ("37-FILEUPLOAD", "File upload vulnerability testing"),
+            ("41-WEBSOCKET", "WebSocket security testing + deep probes"),
+            ("44-CHAIN", "Cross-phase finding correlation"),
+            ("45-EVIDENCE", "Capture request/response + auto PoC generation"),
+            ("48-CONTENT", "Content discovery via common path probing"),
+            ("51-HPP", "HTTP parameter pollution detection"),
+            ("54-WS-FUZZ", "WebSocket message fuzzing"),
+            ("58-HOST-INJECT", "Host header injection / cache poisoning variants"),
+            ("63-DOC-ATTACK", "Document-based attacks (DDE, macro, XXE, SVG-XSS)"),
+            ("64-IDEMPOTENCY", "Idempotency key replay testing (POST endpoints)"),
+            ("67-PATHNORM", "Path normalization bypass (e.g. /admin -> /Admin)"),
+            ("73-CSPBYPASS", "CSP bypass technique testing"),
+            ("76-WORKFLOW", "Workflow logic bypass testing"),
+            ("77-CACHEKEY", "Cache key probe & poisoning via key differences"),
+            ("78-FILEUPLOADADV", "Advanced file upload (polyglot, metadata stripping)"),
+            ("97-FORCEDBROWSE", "Forced browsing to hidden endpoints"),
+            ("98-CASEBYPASS", "Case-sensitive path access bypass"),
+            ("99-APIPAGE", "Hidden API page discovery (/api, /graphql, /swagger)"),
+            ("99a-TABNAB", "Reverse tabnabbing via target=_blank links"),
+            ("99b-APIKEYLEAK", "API key exposure in JS, HTML comments, error pages"),
+            ("99c-REDIRABUSE", "Open redirect chain abuse for SSRF/XSS"),
+            ("99d-LOGTRIGGER", "Log injection trigger (CRLF in User-Agent, Referer)"),
+            ("107-SRI", "Subresource Integrity (SRI) missing/bypass"),
+            ("108-MIXEDCONTENT", "Mixed HTTP/HTTPS content loading"),
+            ("109-HSTSPRELOAD", "HSTS preload list compliance check"),
+            ("110-THIRDPARTYJS", "Third-party JS library vulnerability scan"),
+            ("111-BROWSERSTORAGE", "Browser storage (localStorage/sessionStorage) audit"),
+        ],
+    },
+    "Infrastructure & Cloud": {
+        "desc": "SSRF, cloud buckets, WAF detection & bypass, race conditions, smuggling (HTTP/HTTP2), GraphQL abuse, CDN, serverless, exposed DBs, default creds, secret scanning",
+        "phases": [
+            ("13-OOB", "OOB interaction tracking (DNS/HTTP Callback)"),
+            ("14-ORIGIN", "Origin IP bypass (Cloudflare)"),
+            ("15-SECRETS", "Deep JS secret scanning (secretfinder + corsy)"),
+            ("18-CLOUD", "Cloud bucket discovery (AWS/GCP/Azure)"),
+            ("19-GIT", "Git exposure scanning (.git + trufflehog)"),
+            ("20-GRAPHQL", "GraphQL introspection + schema analysis + deep probes"),
+            ("21-WAF", "WAF detection (50+ vendor signatures)"),
+            ("21b-WAFBYPASS", "WAF bypass technique testing"),
+            ("23-RACE", "Race condition detection"),
+            ("38-SMUGGLE", "HTTP request smuggling detection"),
+            ("38b-H2SMUGGLE", "HTTP/2 + HTTP/3 attack surface (H2 smugg, QUIC, HPACK)"),
+            ("46-BUCKET", "Cloud storage bucket enumeration (S3/Azure/GCP)"),
+            ("47-CDN", "CDN provider detection + origin IP discovery"),
+            ("49-FRAMEWORKS", "Framework detection + edge runtime vulnerability checks"),
+            ("50-BUCKET-PERMS", "Cloud bucket permission auditing (public read/write)"),
+            ("52-SERVERLESS", "Serverless/cloud function endpoint discovery"),
+            ("53-CSP", "CSP header analysis + bypass detection"),
+            ("56-EXPOSED-DB", "Exposed database / storage probing (ES, Redis, Mongo, K8s)"),
+            ("57-DEFAULT-CREDS", "Default credentials testing on admin services"),
+            ("59-EMAIL-SEC", "Email security posture (SPF/DMARC/DKIM)"),
+            ("60-SMTP-ENUM", "SMTP enumeration / email bombing detection"),
+            ("66-SSRF-FULL", "Full SSRF with OOB callback + cloud metadata exfil"),
+            ("68-DEPCVE", "Known CVE check for JS/Python/Go dependencies"),
+            ("69-DNSZT", "DNS zone transfer attempt (AXFR)"),
+            ("70-PORTFULL", "Full port scan (all 65535 ports)"),
+            ("72-ACCOUNTENUM", "Account enumeration via login/register error messages"),
+            ("74-GHTOOLS", "GitHub dorking for tokens, secrets, endpoints"),
+            ("75-MOBILEAPI", "Mobile API endpoint discovery (.well-known, APK)"),
+            ("79-SECRETDIFF", "Secret rotation diff analysis (old vs new)"),
+            ("83-RACEBURST", "Race condition burst (Turbo Intruder style)"),
+            ("132-GQLABUSE", "GraphQL batching, depth DoS & schema leak"),
+            ("133-APIVERSION", "API versioning bypass (v0, internal, legacy, beta)"),
+            ("134-LBDETECT", "Load balancer detection & origin bypass"),
+            ("135-VHOST", "Virtual host enumeration via Host header"),
+            ("136-RATELIMITBYPASS", "Rate limit bypass (IP rotation, case, unicode)"),
+        ],
+    },
+    "CMS & Framework Exposure": {
+        "desc": "IIS/ASP.NET, Tomcat, Node.js, Laravel, Django, Symfony, CI/CD, Docker, Kubernetes, Terraform, env/config secrets, gRPC, TLS cert intel, analytics, favicon recon, JS endpoints, shortlinks",
+        "phases": [
+            ("121-IISASPNET", "IIS/ASP.NET exposure (web.config, debug, traversal)"),
+            ("122-TOMCAT", "Tomcat manager default creds & JMX exposure"),
+            ("123-NODEJS", "Node.js/Express exposed files & SSTI probes"),
+            ("124-LARAVEL", "Laravel .env/log/dashboard exposure"),
+            ("125-DJANGO", "Django debug mode, admin, DRF exposure"),
+            ("126-SYMFONY", "Symfony profiler/debug toolbar exposure"),
+            ("127-CICD", "CI/CD pipeline file exposure (.gitlab-ci.yml, Jenkinsfile)"),
+            ("128-DOCKER", "Docker registry & compose file exposure"),
+            ("129-K8S", "Kubernetes API/kubelet/etcd/dashboard exposure"),
+            ("130-TERRAFORM", "Terraform state file secret leakage"),
+            ("131-ENVDEEP", "Deep env/config file secret scanning"),
+            ("115-BANNER", "Server banner fingerprinting"),
+            ("116-PHPINFO", "phpinfo() exposure detection"),
+            ("117-SRVSTATUS", "Server status page exposure (/server-status)"),
+            ("118-ERRORLEAK", "Error message info leakage (stack traces, debug)"),
+            ("119-WILDCARDDNS", "Wildcard DNS detection & DDoS surface"),
+            ("120-DNSREBIND", "DNS rebinding attack surface check"),
+            ("112-RFI", "Remote file inclusion probing"),
+            ("113-WEBDAV", "WebDAV method & file exposure"),
+            ("114-SNMP", "SNMP community string & info leak"),
+            ("143-TLSX", "TLS certificate intel (expiry, SAN, CT logs)"),
+            ("144-ANALYTICSRELS", "Analytics / tracking endpoint discovery"),
+            ("145-FAVIRECON", "Favicon-based technology fingerprinting"),
+            ("146-JSLUICE", "JS endpoint & secret extraction (jsluice)"),
+            ("147-SHORTSCAN", "Short URL / link shortener endpoint scanning"),
+            ("148-GRPCURL", "gRPC service enumeration & reflection"),
+        ],
+    },
+}
+
+# Phase IDs ordered by category (flat list preserving category order)
+PHASE_CATEGORY_ORDER: List[str] = [
+    pid for cat in PHASE_CATEGORIES.values() for pid, _ in cat["phases"]
+]
+
+# ── Wizard presets ───────────────────────────────────────────────────────────
+# Each preset maps to a set of phase IDs + default config overrides.
+WIZARD_PRESETS: Dict[str, Dict[str, Any]] = {
+    "quick": {
+        "name": "Quick Recon",
+        "desc": "Scope -> Subs -> DNS -> Ports/HTTP -> URLs (~5 min)",
+        "phases": {"00-SCOPE", "01-RECON", "02-RESOLVE", "04-SCAN", "05-HARVEST"},
+        "defaults": {
+            "delay": 0.0,
+            "rate_limit": 0,
+            "dos_mode": False,
+            "sqlmap_level": 1,
+            "sqlmap_risk": 1,
+            "fast": True,
+        },
+    },
+    "standard": {
+        "name": "Standard Assessment",
+        "desc": "Recon + perms + JS secrets + params + fuzzing + nuclei + TLS + origin + JWT + cache (~15 min)",
+        "phases": {
+            "00-SCOPE", "01-RECON", "02-RESOLVE", "03-PERMUTE", "04-SCAN",
+            "05-HARVEST", "06-JSINTEL", "07-PARAMS", "08-FUZZ",
+            "09-VULNSCAN", "10-TLSCMS", "14-ORIGIN", "24-JWT",
+            "28-CACHED", "34-RATELIMIT", "41-WEBSOCKET",
+        },
+        "defaults": {
+            "delay": 0.0,
+            "rate_limit": 10,
+            "dos_mode": False,
+            "sqlmap_level": 1,
+            "sqlmap_risk": 1,
+            "fast": False,
+        },
+    },
+    "full": {
+        "name": "Full Audit",
+        "desc": "All 164 phases — complete recon + vuln scan + auth + client-side + infra + CMS (~2 hrs)",
+        "phases": VALID_PHASES,
+        "defaults": {
+            "delay": 0.0,
+            "rate_limit": 10,
+            "dos_mode": False,
+            "sqlmap_level": 1,
+            "sqlmap_risk": 1,
+            "fast": False,
+        },
+    },
+    "stealth": {
+        "name": "Stealth / Polite",
+        "desc": "Recon only with rate limiting — for monitored targets (~30 min)",
+        "phases": {"00-SCOPE", "01-RECON", "02-RESOLVE", "04-SCAN", "05-HARVEST"},
+        "defaults": {
+            "delay": 2.0,
+            "rate_limit": 5,
+            "dos_mode": False,
+            "sqlmap_level": 1,
+            "sqlmap_risk": 1,
+            "fast": True,
+        },
+    },
+    "pentest": {
+        "name": "Web App Pentest",
+        "desc": "Standard + all injection + auth bypass + client-side (~45 min)",
+        "phases": {
+            "00-SCOPE", "01-RECON", "02-RESOLVE", "03-PERMUTE", "04-SCAN",
+            "05-HARVEST", "06-JSINTEL", "07-PARAMS", "08-FUZZ",
+            "09-VULNSCAN", "10-TLSCMS", "14-ORIGIN",
+            "11-INJECT", "11a-DOMXSS", "11b-SQLMAP", "12-SSTI",
+            "22-NOSQLI", "25-XXE", "26-CMDINJECT", "27-SSPP",
+            "24-JWT", "36-JWTADV", "39-OAUTH", "40-PWRESET",
+            "16a-AUTHZ", "16b-MASSASSIGN", "17-IDOR",
+            "28-CACHED", "30-LFI", "31-OPENREDIR", "32-CLICKJACK",
+            "33-CRLF", "35-CORSADV", "37-FILEUPLOAD", "51-HPP",
+            "41-WEBSOCKET", "45-EVIDENCE", "44-CHAIN",
+        },
+        "defaults": {
+            "delay": 0.0,
+            "rate_limit": 10,
+            "dos_mode": False,
+            "sqlmap_level": 2,
+            "sqlmap_risk": 1,
+            "fast": False,
+        },
+    },
+    "osint": {
+        "name": "OSINT Focus",
+        "desc": "Recon + all OSINT/passive phases — employee names, dorks, certs, GitHub (~20 min)",
+        "phases": {
+            "00-SCOPE", "01-RECON", "02-RESOLVE", "04-SCAN", "05-HARVEST",
+            "84-WHOIS", "85-ASN", "86-DORK", "87-SHODAN", "88-EMPLOYEE",
+            "89-PASSIVEDNS", "71-EMHARVEST", "137-EMAILFINDER", "138-METAGOOFIL",
+            "139-PORCHPIRATE", "140-DORKHUNTER", "141-CRTSH", "142-GITHUBSUB",
+        },
+        "defaults": {
+            "delay": 0.5,
+            "rate_limit": 5,
+            "dos_mode": False,
+            "sqlmap_level": 1,
+            "sqlmap_risk": 1,
+            "fast": False,
+        },
+    },
 }
 
 PhaseSet = Set[str]
@@ -126,7 +489,7 @@ class PipelineConfig:
     waf_detected: bool = False
     waf_evasion_throttle: float = 0.0
     credentials_queue: List[str] = field(default_factory=list)
-    cookie2: str = ""
+    cookie_b: str = ""
     idor_session_a: str = ""
     idor_session_b: str = ""
     sample_urls_csrf: int = 20
@@ -183,6 +546,19 @@ class PipelineConfig:
     sample_hosts_lbdetect: int = 15
     sample_hosts_vhost: int = 10
     sample_urls_ratelimitbypass: int = 20
+    sample_hosts_emailfinder: int = 10
+    sample_urls_metagoofil: int = 50
+    sample_hosts_porchpirate: int = 10
+    sample_urls_dorkhunter: int = 20
+    sample_hosts_crtsh: int = 10
+    sample_hosts_githubsub: int = 10
+    sample_hosts_tlsx: int = 10
+    sample_hosts_analyticsrels: int = 10
+    sample_hosts_favirecon: int = 10
+    sample_urls_jsluice: int = 20
+    sample_urls_shortscan: int = 20
+    sample_hosts_grpcurl: int = 10
+    safe_mode: bool = False
 
 
 

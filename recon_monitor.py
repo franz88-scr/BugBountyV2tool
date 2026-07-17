@@ -8,15 +8,17 @@ ReconChain Monitor v3
 - Loops until scan is complete
 """
 from __future__ import annotations
-import json, os, shutil, signal, subprocess, sys, time
+import json, os, re, shutil, signal, subprocess, sys, time
 from datetime import datetime
 from pathlib import Path
 
 DOMAIN = os.environ.get("RECON_DOMAIN", "brandenburg.cloud")
+if not re.match(r'^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$', DOMAIN):
+    sys.exit(f"error: invalid domain {DOMAIN!r} (path traversal check)")
 WORKDIR = Path(os.environ.get("RECON_WORKDIR", str(Path(__file__).resolve().parent)))
 OUTDIR = WORKDIR / f"out_{DOMAIN}"
 STATE_FILE = OUTDIR / "state.json"
-SCAN_STATUS_DIR = Path("/run/user/1000/reconchain_status")
+SCAN_STATUS_DIR = Path(os.environ.get('XDG_RUNTIME_DIR', f'/run/user/{os.getuid()}')) / 'reconchain_status'
 SCAN_STATUS_FILE = SCAN_STATUS_DIR / f"{DOMAIN.replace('.', '_')}.json"
 CHECK_INTERVAL = 300
 MAX_IDLE = 3
@@ -163,7 +165,7 @@ def main() -> int:
         idle = 0
         prev_done: set = set()
 
-        while attempt < max_attempts:
+        while True:
             time.sleep(CHECK_INTERVAL)
 
             alive = proc.poll() is None
@@ -199,29 +201,31 @@ def main() -> int:
 
                 # Stuck detection: no progress across multiple checks
                 if alive:
-                    if done == prev_done and not running:
-                        idle += 1
-                        log(f"No progress {idle}/{MAX_IDLE}")
-                        if idle >= MAX_IDLE:
-                            log("Stuck — killing and restarting")
-                            try:
-                                os.killpg(proc.pid, signal.SIGTERM)
-                            except (ProcessLookupError, OSError):
-                                pass
-                            try:
-                                proc.wait(timeout=10)
-                            except Exception:
+                    if done == prev_done:
+                        # No new completions — also trigger if running phases are stalled
+                        if not running or (running and done == prev_done):
+                            idle += 1
+                            log(f"No progress {idle}/{MAX_IDLE}")
+                            if idle >= MAX_IDLE:
+                                log("Stuck — killing and restarting")
                                 try:
-                                    os.killpg(proc.pid, signal.SIGKILL)
+                                    os.killpg(proc.pid, signal.SIGTERM)
                                 except (ProcessLookupError, OSError):
                                     pass
                                 try:
-                                    proc.wait(timeout=5)
+                                    proc.wait(timeout=10)
                                 except Exception:
-                                    pass
-                            proc = None
-                            time.sleep(30)  # Minimum delay before restart
-                            break
+                                    try:
+                                        os.killpg(proc.pid, signal.SIGKILL)
+                                    except (ProcessLookupError, OSError):
+                                        pass
+                                    try:
+                                        proc.wait(timeout=5)
+                                    except Exception:
+                                        pass
+                                proc = None
+                                time.sleep(30)  # Minimum delay before restart
+                                break
                     else:
                         idle = 0
                     prev_done = done

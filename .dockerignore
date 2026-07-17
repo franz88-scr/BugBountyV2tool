@@ -25,3 +25,13 @@ __pycache__/
 venv/
 .pytest_cache/
 .ruff_cache/
+.github/
+.pre-commit-config.yaml
+pyproject.toml
+reconchain.cfg
+check_status.sh
+status_reporter.sh
+watchdog.sh
+monitor.py
+recon_monitor.py
+manual-testing.md

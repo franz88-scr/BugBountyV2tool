@@ -1,84 +1,82 @@
 # ReconChain package
 from __future__ import annotations
 
-# Backward-compatible re-exports: all public symbols from submodules are
-# available directly via `from reconchain import ...`.
-
-from reconchain.config import (
-    __version__,
-    VALID_PHASES,
-    FAST_PHASES,
-    QUICK_SKIP_PHASES,
-    DOS_PHASES,
-    PipelineConfig,
-    _HOSTNAME_RE,
-    _SAFE_HOST,
-)
-from reconchain.utils import (
-    _is_valid_hostname,
-    _is_under_domain,
-    _target_token,
-    _target_lines,
-    _write_target_tokens,
-    write_findings,
-    _load_live_hosts,
-    _color, C, LVL,
-    disable_color,
-    log,
-    _auto_detect_proxy,
-    _set_proxy_env,
-    _auto_detect_cookies,
-    _extra_headers_dict,
-    _extra_http_args,
-    _get_urlopener,
-    _get_no_redirect_urlopener,
-    _NoRedirectHandler,
-    _async_urlopen,
-    _async_urlopen_no_redirect,
-    _throttle, _throttle_rate, _throttle_sync,
-    ensure,
-    _existing_artifacts,
-    read_lines, iter_lines, count_nonblank,
-    merge_unique, merge_unique_str,
-    _downsample_file,
-    safe_suffix, _safe_name,
-    read_jsonl,
-    _extract_urls_from_ffuf_json,
-    _merge_dnsx_output,
-    _dedupe_by_host_path, _dedupe_by_host_params,
-    html_escape, md_escape,
-    _parse_httpx_tech,
-    _mmh3_hash,
-    Progress,
-    ScanStatus,
-)
-from reconchain.tools import Tools
-from reconchain.process import (
-    _run_blocking, _run, run_parallel,
-    _needs_proxychains,
-    StepResult,
-    _wait_proc, _kill_proc, _cleanup_child_procs, _register_proc,
-    _maybe_timeout,
-    _update_nuclei_templates,
-    _atomic_write_json,
-    _parse_phase_csv, _domain_arg, _csv_from_phases,
-    MAX_PARALLEL_JOBS,
-    _USE_PROXYCHAINS,
-    _SPAWNED_PIDS, _SPAWNED_PIDS_LOCK,
-    _JOB_SEM, _PIPELINE_CFG, _TOOL_RC_REGISTRY,
-)
-from reconchain.interactsh import Interactsh
-from reconchain.reporting import (
-    _counts, write_summary, write_html,
-    write_full_summary, write_markdown, write_sarif, write_faraday, write_html_dashboard,
-)
 import re as _re
 
+from reconchain.ai import (
+    LLMProvider,
+    ai_complete,
+    get_provider,
+    parse_json_response,
+)
+from reconchain.ai import (
+    configure as ai_configure,
+)
+from reconchain.ai_exploit import suggest_exploit_chains
+from reconchain.ai_triage import run_triage
+from reconchain.attack_surface import (
+    build_graph,
+    write_attack_surface_html,
+    write_attack_surface_json,
+)
+from reconchain.bot import start_bot, start_bot_thread
+from reconchain.cli import InteractiveWizard, build_parser, main
+from reconchain.conf import apply_config_to_args, find_config, load_config
+
+# Backward-compatible re-exports: all public symbols from submodules are
+# available directly via `from reconchain import ...`.
+from reconchain.config import (
+    _HOSTNAME_RE,
+    _SAFE_HOST,
+    DOS_PHASES,
+    FAST_PHASES,
+    QUICK_SKIP_PHASES,
+    VALID_PHASES,
+    PipelineConfig,
+    __version__,
+)
+from reconchain.dashboard_server import start_dashboard, start_dashboard_thread
+from reconchain.dedup import DedupEngine
+from reconchain.distributed import SSHScanner, create_scanner_from_config
+
+# New v2.1 modules
+from reconchain.events import Event, EventBus, bus
+from reconchain.exploit_chain import analyze_exploit_chains
+from reconchain.interactsh import Interactsh
+from reconchain.monitor import MonitorEngine
+from reconchain.notify import send_notification, send_scan_summary
+
+# v3.0 modules
+from reconchain.artifacts import ARTIFACTS, ARTIFACT_REGISTRY, FILENAME_TO_ARTIFACT, get_counts, get_findings_by_severity, get_findings_for_triage, get_report_files, get_coverage, guess_severity
+from reconchain.target_profile import TargetProfile, build_target_profile, save_profile, load_profile
+from reconchain.confidence import Confidence, score_finding, score_all_findings, write_confidence_report
+from reconchain.poc import generate_pocs, generate_all_pocs
+from reconchain.tool_health import get_tool_health_monitor, ToolHealthMonitor
+from reconchain.severity import RiskScore, calculate_risk_score, write_risk_score
+from reconchain.batch import BatchScan
+from reconchain.compare import ScanDiff, compare_scans
+from reconchain.tui import TUIDashboard
+from reconchain.review import FindingReview, run_interactive_review
+from reconchain.learning import LearningEngine
+
+# v3.1 modules
+from reconchain.finding import Finding, FindingStore, finding_from_text
+from reconchain.remediation import get_remediation, get_all_remediations, get_remediation_text, has_remediation
+from reconchain.ratelimiter import GlobalRateLimiter, TokenBucket, configure_rate_limiter, get_rate_limiter
+from reconchain.api import start_api_server, stop_api_server
 from reconchain.phases import (
-    PIPELINE, _PHASE_WEIGHTS, PHASE_DEPS, STAGES, _RECON_LEVELS, PhaseSet,
-    _parse_semver, _semver_lt,
-    _JS_SECRET_PATTERNS, _SOURCE_MAP_RE,
-    _AUTH_BYPASS_HEADERS, _MASS_ASSIGN_FIELDS,
+    _AUTH_BYPASS_HEADERS,
+    _JS_SECRET_PATTERNS,
+    _MASS_ASSIGN_FIELDS,
+    _PHASE_WEIGHTS,
+    _RECON_LEVELS,
+    _SOURCE_MAP_RE,
+    PHASE_DEPS,
+    PIPELINE,
+    STAGES,
+    PhaseSet,
+    _parse_semver,
+    _semver_lt,
     phase_00_SCOPE,
     phase_01_RECON,
     phase_02_RESOLVE,
@@ -245,14 +243,92 @@ from reconchain.phases import (
     phase_148_GRPCURL,
 )
 from reconchain.pipeline import run_pipeline
-from reconchain.cli import build_parser, main, InteractiveWizard
-from reconchain.dedup import DedupEngine
-from reconchain.monitor import MonitorEngine
+from reconchain.plugin import PhasePlugin, discover_plugins, get_registry
+from reconchain.process import (
+    _JOB_SEM,
+    _PIPELINE_CFG,
+    _SPAWNED_PIDS,
+    _SPAWNED_PIDS_LOCK,
+    _TOOL_RC_REGISTRY,
+    _USE_PROXYCHAINS,
+    MAX_PARALLEL_JOBS,
+    StepResult,
+    _atomic_write_json,
+    _cleanup_child_procs,
+    _csv_from_phases,
+    _domain_arg,
+    _kill_proc,
+    _maybe_timeout,
+    _needs_proxychains,
+    _parse_phase_csv,
+    _register_proc,
+    _run,
+    _run_blocking,
+    _update_nuclei_templates,
+    _wait_proc,
+    run_parallel,
+)
 from reconchain.ratelimit import RateLimiter
+from reconchain.reporting import (
+    _counts,
+    write_faraday,
+    write_full_summary,
+    write_html,
+    write_html_dashboard,
+    write_markdown,
+    write_sarif,
+    write_summary,
+)
+from reconchain.tools import Tools
 from reconchain.useragent import UARotator
-from reconchain.conf import load_config, apply_config_to_args, find_config
-from reconchain.notify import send_notification, send_scan_summary
-from reconchain.distributed import SSHScanner, create_scanner_from_config
+from reconchain.utils import (
+    LVL,
+    C,
+    Progress,
+    ScanStatus,
+    _async_urlopen,
+    _async_urlopen_no_redirect,
+    _auto_detect_cookies,
+    _auto_detect_proxy,
+    _color,
+    _dedupe_by_host_params,
+    _dedupe_by_host_path,
+    _downsample_file,
+    _existing_artifacts,
+    _extra_headers_dict,
+    _extra_http_args,
+    _extract_urls_from_ffuf_json,
+    _get_no_redirect_urlopener,
+    _get_urlopener,
+    _is_under_domain,
+    _is_valid_hostname,
+    _load_live_hosts,
+    _merge_dnsx_output,
+    _mmh3_hash,
+    _NoRedirectHandler,
+    _parse_httpx_tech,
+    _safe_name,
+    _set_proxy_env,
+    _target_lines,
+    _target_token,
+    _throttle,
+    _throttle_rate,
+    _throttle_sync,
+    _write_target_tokens,
+    count_nonblank,
+    disable_color,
+    ensure,
+    html_escape,
+    iter_lines,
+    log,
+    md_escape,
+    merge_unique,
+    merge_unique_str,
+    read_jsonl,
+    read_lines,
+    safe_suffix,
+    write_findings,
+)
 
 __all__ = [
     "__version__", "VALID_PHASES", "FAST_PHASES", "QUICK_SKIP_PHASES", "DOS_PHASES", "PhaseSet",
@@ -351,4 +427,26 @@ __all__ = [
     "send_notification", "send_scan_summary",
     "write_sarif", "write_faraday", "write_html_dashboard",
     "SSHScanner", "create_scanner_from_config",
+    # New v2.1
+    "bus", "Event", "EventBus",
+    "PhasePlugin", "discover_plugins", "get_registry",
+    "get_provider", "ai_complete", "ai_configure", "parse_json_response", "LLMProvider",
+    "run_triage", "suggest_exploit_chains",
+    "build_graph", "write_attack_surface_html", "write_attack_surface_json",
+    "analyze_exploit_chains",
+    "start_dashboard", "start_dashboard_thread",
+    "start_bot", "start_bot_thread",
+    # v3.0
+    "ARTIFACTS", "ARTIFACT_REGISTRY", "FILENAME_TO_ARTIFACT",
+    "get_counts", "get_findings_by_severity", "get_findings_for_triage", "get_report_files", "get_coverage", "guess_severity",
+    "TargetProfile", "build_target_profile", "save_profile", "load_profile",
+    "Confidence", "score_finding", "score_all_findings", "write_confidence_report",
+    "generate_pocs", "generate_all_pocs",
+    "get_tool_health_monitor", "ToolHealthMonitor",
+    "RiskScore", "calculate_risk_score", "write_risk_score",
+    "BatchScan",
+    "ScanDiff", "compare_scans",
+    "TUIDashboard",
+    "FindingReview", "run_interactive_review",
+    "LearningEngine",
 ]

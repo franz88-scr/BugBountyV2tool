@@ -295,6 +295,19 @@ def _extra_headers_dict() -> Dict[str, str]:
             if hdr and ":" in hdr:
                 k, v = hdr.split(":", 1)
                 headers[k.strip()] = _sanitize_header_value(v.strip())
+    try:
+        from reconchain.process import _PIPELINE_CFG as cfg
+        if getattr(cfg, "auth_bearer", ""):
+            headers["Authorization"] = f"Bearer {cfg.auth_bearer}"
+        if getattr(cfg, "auth_api_key", ""):
+            header_name = getattr(cfg, "auth_api_key_header", "X-API-Key")
+            headers[header_name] = cfg.auth_api_key
+        if getattr(cfg, "auth_basic", ""):
+            import base64
+            encoded = base64.b64encode(cfg.auth_basic.encode()).decode()
+            headers["Authorization"] = f"Basic {encoded}"
+    except Exception:
+        pass
     return headers
 
 def _extra_http_args() -> List[str]:
@@ -1084,6 +1097,44 @@ class ScanStatus:
         results: List[Dict[str, Any]] = []
         if not cls._SCAN_STATUS_DIR.exists():
             return results
+        for f in sorted(cls._SCAN_STATUS_DIR.glob("*.json")):
+            try:
+                data = json.loads(f.read_text(encoding="utf-8", errors="ignore"))
+                if data.get("status") != "completed":
+                    results.append(data)
+            except Exception:
+                continue
+        return results
+
+
+# ── Atomic write helpers ──────────────────────────────────────────────────────
+
+def atomic_write_json(path: Path, payload: Any) -> None:
+    """Atomically write JSON to a file using tmp + rename."""
+    import tempfile
+    fd, tmp_path = tempfile.mkstemp(dir=str(path.parent), suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(payload, f, indent=2, default=str)
+        os.replace(tmp_path, path)
+    except Exception:
+        with contextlib.suppress(Exception):
+            os.unlink(tmp_path)
+        raise
+
+
+def atomic_write_text(path: Path, content: str) -> None:
+    """Atomically write text to a file using tmp + rename."""
+    import tempfile
+    fd, tmp_path = tempfile.mkstemp(dir=str(path.parent), suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(content)
+        os.replace(tmp_path, path)
+    except Exception:
+        with contextlib.suppress(Exception):
+            os.unlink(tmp_path)
+        raise
         for f in sorted(cls._SCAN_STATUS_DIR.glob("*.json")):
             try:
                 data = json.loads(f.read_text(encoding="utf-8", errors="ignore"))

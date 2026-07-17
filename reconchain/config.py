@@ -9,7 +9,7 @@ _HOSTNAME_RE = re.compile(
     r"^(?=.{1,253}$)(?:[A-Za-z0-9](?:[A-Za-z0-9_-]{0,61}[A-Za-z0-9])?\.)+"
     r"[A-Za-z0-9](?:[A-Za-z0-9_-]{0,61}[A-Za-z0-9])?\.?$"
 )
-__version__ = "2.0.0"
+__version__ = "3.0.0"
 
 VALID_PHASES = {
     "00-SCOPE", "01-RECON", "02-RESOLVE", "03-PERMUTE", "04-SCAN",
@@ -559,6 +559,14 @@ class PipelineConfig:
     sample_urls_shortscan: int = 20
     sample_hosts_grpcurl: int = 10
     safe_mode: bool = False
+    # ── Authentication ──────────────────────────────────────────────
+    auth_bearer: str = ""
+    auth_api_key: str = ""
+    auth_api_key_header: str = "X-API-Key"
+    auth_client_cert: str = ""
+    auth_basic: str = ""
+    # ── Rate limiter ────────────────────────────────────────────────
+    rate_limit_per_domain: int = 0
 
 
 

@@ -180,7 +180,7 @@ def main() -> int:
             else:
                 log("No ScanStatus or state.json yet — scan initializing")
 
-            # --- Stuck detection: check output dir mtime, logs, and process ---
+            # --- Stuck detection: check output dir, logs, child processes ---
             if alive:
                 # Check if any file in output dir was recently modified (within CHECK_INTERVAL)
                 outdir_changed = False
@@ -201,15 +201,41 @@ def main() -> int:
                     except (ValueError, OSError):
                         pass
 
-                if outdir_changed or logs_changed:
+                # Check if long-running child tools are still active
+                child_tools_active = False
+                try:
+                    import subprocess as _sp
+                    pg = _sp.check_output(["pgrep", "-P", str(proc.pid)], text=True).strip().split()
+                    if pg:
+                        child_tools_active = True
+                except (_sp.CalledProcessError, Exception):
+                    pass
+
+                # Also check for known long-running tools by name
+                if not child_tools_active:
+                    try:
+                        out = _sp.check_output(
+                            ["pgrep", "-af", "nuclei|httpx|ffuf|sqlmap|naabu|katana|waymore|commix"],
+                            text=True, stderr=_sp.DEVNULL
+                        ).strip()
+                        if out:
+                            child_tools_active = True
+                            tool_names = [l.split()[-1].split('/')[-1] for l in out.splitlines()[:3]]
+                            log(f"  Long-running tools: {', '.join(tool_names)}")
+                    except (_sp.CalledProcessError, Exception):
+                        pass
+
+                if outdir_changed or logs_changed or child_tools_active:
                     idle = 0
                     if outdir_changed:
                         log("  Output dir active (files changing)")
                     if logs_changed:
                         log("  Logs active (recent writes)")
+                    if child_tools_active and not outdir_changed and not logs_changed:
+                        log("  Child tools still running (nuclei/ffuf/etc) — not stuck")
                 else:
                     idle += 1
-                    log(f"No activity detected {idle}/{MAX_IDLE} (outdir_changed={outdir_changed}, logs_changed={logs_changed})")
+                    log(f"No activity detected {idle}/{MAX_IDLE} (outdir={outdir_changed}, logs={logs_changed}, children={child_tools_active})")
                     if idle >= MAX_IDLE:
                         log("Stuck — killing and restarting")
                         try:

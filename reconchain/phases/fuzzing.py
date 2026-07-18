@@ -52,6 +52,14 @@ async def phase_08_FUZZ(domain: str, outdir: Path, t: Tools, only: PhaseSet, ski
             else str(_seclists_base / "Discovery/Web-Content/raft-medium-directories.txt")
         ),
     )
+    # When sample_mode=minimal, truncate wordlist to 1 entry so ffuf finishes fast
+    if _PIPELINE_CFG.sample_mode == "minimal" and wordlist and Path(wordlist).exists():
+        _wl_lines = Path(wordlist).read_text(errors="replace").splitlines()
+        _wl_lines = [l for l in _wl_lines if l.strip()]
+        if _wl_lines:
+            _tmp_wl = outdir / ".ffuf_wordlist_minimal.txt"
+            _tmp_wl.write_text(_wl_lines[0] + "\n")
+            wordlist = str(_tmp_wl)
     if not Path(wordlist).exists():
         wordlist = ""
     jobs: List[Tuple[str, List[str], int]] = []
@@ -91,6 +99,13 @@ async def phase_08_FUZZ(domain: str, outdir: Path, t: Tools, only: PhaseSet, ski
             "FFUF_EXT_WORDLIST",
             str(_seclists_base / "Discovery/Web-Content/common.txt"),
         )
+        if _PIPELINE_CFG.sample_mode == "minimal" and Path(ext_wordlist).exists():
+            _ewl_lines = Path(ext_wordlist).read_text(errors="replace").splitlines()
+            _ewl_lines = [l for l in _ewl_lines if l.strip()]
+            if _ewl_lines:
+                _tmp_ewl = outdir / ".ffuf_ext_wordlist_minimal.txt"
+                _tmp_ewl.write_text(_ewl_lines[0] + "\n")
+                ext_wordlist = str(_tmp_ewl)
         if Path(ext_wordlist).exists():
             for u in sample:
                 parsed_u = urllib.parse.urlparse(u)
@@ -206,7 +221,7 @@ async def phase_21_WAF(
             "wafw00f",
             [waf_bin, *[tgt.replace("https://", "").replace("http://", "") for tgt in targets],
              "-o", str(waf_out), "-a"],
-            600, outdir,
+            900, outdir,
         )
         if waf_out.exists() and waf_out.stat().st_size > 0:
             for ln in read_lines(waf_out):

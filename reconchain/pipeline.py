@@ -386,6 +386,7 @@ async def run_pipeline(args: argparse.Namespace) -> int:
     _new_cfg = PipelineConfig(
         safe_mode=_safe_mode,
         dos_mode=dos_mode,
+        sample_mode=getattr(args, 'sample_mode', 'normal'),
         sqlmap_level=getattr(args, 'sqlmap_level', 1),
         sqlmap_risk=getattr(args, 'sqlmap_risk', 1),
         delay=getattr(args, 'delay', 0.0),

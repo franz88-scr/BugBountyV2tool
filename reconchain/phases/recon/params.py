@@ -93,7 +93,7 @@ async def phase_07_PARAMS(
                 "arjun", "-i", str(retry_in), "-o", str(outdir / "params_arjun.json"),
                 "-T", "120", "--rate-limit", "50", "--disable-redirects",
             ]
-            await run_parallel([("arjun-retry", retry_parts, _maybe_timeout(600))], outdir)
+            await run_parallel([("arjun-retry", retry_parts, _maybe_timeout(900))], outdir)
             if not (outdir / "params_arjun.json").exists():
                 log("warn", "07-PARAMS: arjun retry also produced no output file")
     parts = sorted(p for p in outdir.glob("params_*.txt") if p.name != "params.txt")

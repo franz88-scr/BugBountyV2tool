@@ -41,7 +41,7 @@ async def phase_09_VULNSCAN(outdir: Path, t: Tools, only: PhaseSet, skip: PhaseS
             + ["-tags", ",".join(nuclei_tags), "-severity", "low,medium,high,critical",
                "-o", str(outdir / "nuclei.txt")]
             + _proxy_opt,
-            3600,
+            7200,
         )], outdir)
         # STEP 2: tech-scanner
         await run_parallel([(
@@ -50,7 +50,7 @@ async def phase_09_VULNSCAN(outdir: Path, t: Tools, only: PhaseSet, skip: PhaseS
             + ["-t", "http/technologies",
                "-o", str(outdir / "tech.txt")]
             + _proxy_opt,
-            3600,
+            7200,
         )], outdir)
         # STEP 3: headless scan (optional, needs Chrome)
         _has_browser = any(
@@ -402,7 +402,7 @@ async def phase_68_DEPCVE(
         pkg_json = tmp_dir / "package.json"
         pkg_json.write_text(json.dumps({"name": "scan", "dependencies": deps_found}))
         trivy_out = outdir / "logs" / "trivy_output.txt"
-        await _run("trivy-check", ["trivy", "fs", "--quiet", "--format", "json", "--output", str(trivy_out), str(tmp_dir)], 120, outdir)
+        await _run("trivy-check", ["trivy", "fs", "--quiet", "--format", "json", "--output", str(trivy_out), str(tmp_dir)], 300, outdir)
         if trivy_out.exists() and read_lines(trivy_out):
             findings.append(f"[trivy-results] {trivy_out}")
         for p in tmp_dir.glob("*"):

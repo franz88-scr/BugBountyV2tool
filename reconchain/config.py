@@ -459,6 +459,7 @@ class PipelineConfig:
     delay: float = 0.0
     rate_limit: int = 10
     # ── Sampling (max artifacts per phase) ───────────────────────────
+    sample_mode: str = "normal"
     sample_urls_fuzz: int = 200
     sample_urls_params: int = 15
     sample_urls_arjun_waf: int = 5

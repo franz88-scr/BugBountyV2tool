@@ -42,7 +42,7 @@ async def phase_11_INJECT(
             prefilter_jobs.append((
                 "Gxss",
                 ["bash", "-c", f"Gxss -o {shlex.quote(str(gxss_out))} < {shlex.quote(str(xss_in))}"],
-                600,
+                900,
             ))
         if prefilter_jobs:
             await run_parallel(prefilter_jobs, outdir)
@@ -473,7 +473,7 @@ async def phase_11b_SQLMAP(
              f' --output-dir="$DIR" > "{shlex.quote(str(outdir / "sqlmap_11b.log"))}" 2>&1\n'
         )
         runner.chmod(0o700)
-        await _run("sqlmap-11b", ["bash", str(runner)], 7200, outdir)
+        await _run("sqlmap-11b", ["bash", str(runner)], 14400, outdir)
         sqlmap_log = outdir / "sqlmap_11b.log"
         if sqlmap_log.exists():
             for ln in read_lines(sqlmap_log):

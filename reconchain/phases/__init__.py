@@ -605,7 +605,7 @@ PHASE_DEPS: Dict[str, Set[str]] = {
     #   (most injection, auth, and check phases consume these)
     "05b-APISPEC": {"05-HARVEST"},
     "06-JSINTEL": {"05-HARVEST"},
-    "07-PARAMS": {"05-HARVEST"},
+    "07-PARAMS": {"05-HARVEST", "06-JSINTEL"},
     "08-FUZZ": {"05-HARVEST"},
     "09-VULNSCAN": {"05-HARVEST"},
     "10-TLSCMS": {"05-HARVEST"},
@@ -720,7 +720,7 @@ PHASE_DEPS: Dict[str, Set[str]] = {
     "15-SECRETS": {"06-JSINTEL"},
     # ── Specific cross-phase deps ──────────────────────────────────────────
     "17b-SSRFMETA": {"11-INJECT"},
-    "21b-WAFBYPASS": {"21-WAF"},
+    "21b-WAFBYPASS": {"21-WAF", "05-HARVEST"},
     "36-JWTADV": {"24-JWT"},
     "39-OAUTH": {"36-JWTADV"},
     "45-EVIDENCE": {"44-CHAIN"},

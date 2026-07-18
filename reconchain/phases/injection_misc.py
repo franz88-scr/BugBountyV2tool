@@ -129,13 +129,15 @@ async def phase_25_XXE(
                     headers={"Content-Type": "application/xml", "User-Agent": "Mozilla/5.0", **_xxe_extra_headers})
                 xs, _, xb = await _async_urlopen(_x_urlopen, req, timeout=10)
                 body = xb.decode("utf-8", errors="ignore")
-                if "root" in body and ("root" in body[:100] or xs in (200, 201)):
+                xxe_indicators = ["root:x:0:0", "root:*:", "php://filter", "ENTITY", "SYSTEM \"file://"]
+                if any(ind in body for ind in xxe_indicators):
                     results.append(f"[xxe-candidate] {url} payload={i} HTTP {xs}")
                     break
             except urllib.error.HTTPError as e:
                 try:
                     body = e.read().decode("utf-8", errors="ignore")
-                    if "root" in body or "file" in body.lower():
+                    xxe_indicators = ["root:x:0:0", "root:*:", "ENTITY", "SYSTEM \"file://"]
+                    if any(ind in body for ind in xxe_indicators):
                         results.append(f"[xxe-error-reflected] {url} payload={i} HTTP {e.code}")
                         break
                 except Exception:

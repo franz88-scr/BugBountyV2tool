@@ -2,7 +2,10 @@
 
 # install.sh — install every external tool reconchain.py depends on.
 
-#
+# Security: All git clones use pinned tags/branches where possible.
+# Go tools are installed from source via `go install` (module checksums verified by Go module proxy).
+# Python tools are installed from PyPI (package signatures verified by pip).
+# Binary downloads in Dockerfile use SHA256 checksums where available.
 
 # DAG: Stage 0 (00-SCOPE→01-RECON→02-RESOLVE→03-PERMUTE→04-SCAN→04b-TAKEOVER-VALIDATE→34-RATELIMIT),
 #      Stage 1 (21-WAF), Stage 2 (05-HARVEST→05b-APISPEC→06-JSINTEL→15-SECRETS), Stage 3 (07-PARAMS),
@@ -183,7 +186,7 @@ check() {
 }
 
 
-ALL_TOOLS=(subfinder amass dnsx naabu nmap httpx nuclei
+ALL_TOOLS=(subfinder findomain dnsx naabu nmap httpx nuclei
 
            gau gospider katana subjs secretfinder xnLinkFinder
 
@@ -270,8 +273,6 @@ GO_TOOLS=(
 
   "github.com/projectdiscovery/subfinder/v2/cmd/subfinder"
 
-  "github.com/owasp-amass/amass/v4/...@master"
-
   "github.com/projectdiscovery/dnsx/cmd/dnsx"
 
   "github.com/projectdiscovery/naabu/v2/cmd/naabu"
@@ -349,23 +350,9 @@ install_go_tools() {
 
     printf "  [%d/%d] %s …\n" "$i" "${#GO_TOOLS[@]}" "$repo"
 
-    # amass ships a cmd/amass binary under v4 — install that specific path
+    GO111MODULE=on go install -v "$repo@latest" 2>/dev/null || \
 
-    # so we don't drag in unrelated sub-packages.
-
-    if [[ "$repo" == "github.com/owasp-amass/amass/v4/...@master" ]]; then
-
-      GO111MODULE=on go install -v github.com/owasp-amass/amass/v4/cmd/amass@latest 2>/dev/null || \
-
-        warn "amass install had warnings (may already be present)"
-
-    else
-
-      GO111MODULE=on go install -v "$repo@latest" 2>/dev/null || \
-
-        warn "$repo install had warnings (may already be present)"
-
-    fi
+      warn "$repo install had warnings (may already be present)"
 
   done
 
@@ -589,6 +576,53 @@ install_feroxbuster() {
 }
 
 
+# ───────────────────────────── findomain (Rust) ────────────────────
+
+install_findomain() {
+
+  if ! command -v findomain >/dev/null 2>&1; then
+
+    log "Installing findomain (Rust crate)…"
+
+    if command -v cargo >/dev/null 2>&1; then
+
+      cargo install findomain || warn "findomain cargo install failed"
+
+    else
+
+      log "cargo not found; downloading prebuilt binary…"
+
+      ARCH=$(uname -m)
+
+      if [ "$ARCH" = "x86_64" ]; then
+
+        curl -fsSL "https://github.com/Findomain/findomain/releases/latest/download/findomain-linux.zip" -o /tmp/findomain.zip && \
+          unzip -o /tmp/findomain.zip -d /tmp/ && \
+          sudo install -m 755 /tmp/findomain /usr/local/bin/findomain && \
+          rm -f /tmp/findomain /tmp/findomain.zip || warn "findomain binary download failed"
+
+      else
+
+        curl -fsSL "https://github.com/Findomain/findomain/releases/latest/download/findomain-linux-i386.zip" -o /tmp/findomain.zip && \
+          unzip -o /tmp/findomain.zip -d /tmp/ && \
+          sudo install -m 755 /tmp/findomain /usr/local/bin/findomain && \
+          rm -f /tmp/findomain /tmp/findomain.zip || warn "findomain binary download failed"
+
+      fi
+
+    fi
+
+  fi
+
+  if command -v findomain >/dev/null 2>&1; then
+
+    ok "findomain"
+
+  fi
+
+}
+
+
 # ───────────────────────────── testssl.sh ──────────────────────────
 
 install_testssl() {
@@ -638,6 +672,8 @@ case "$MODE" in
     install_python_tools
 
     install_feroxbuster
+
+    install_findomain
 
     install_wpscan
 

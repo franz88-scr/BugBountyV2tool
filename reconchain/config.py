@@ -5,11 +5,13 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Set
 
+from reconchain.exceptions import ConfigError as ConfigError
+
 _HOSTNAME_RE = re.compile(
-    r"^(?=.{1,253}$)(?:[A-Za-z0-9](?:[A-Za-z0-9_-]{0,61}[A-Za-z0-9])?\.)+"
-    r"[A-Za-z0-9](?:[A-Za-z0-9_-]{0,61}[A-Za-z0-9])?\.?$"
+    r"^(?=.{1,253}$)(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+"
+    r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.?$"
 )
-__version__ = "3.0.0"
+__version__ = "3.1.0"
 
 VALID_PHASES = {
     "00-SCOPE", "01-RECON", "02-RESOLVE", "03-PERMUTE", "04-SCAN",
@@ -120,7 +122,7 @@ PHASE_CATEGORIES: Dict[str, Dict[str, Any]] = {
         "desc": "Scope validation, subdomain enumeration, DNS resolution, port scanning, URL harvesting, JS analysis, parameter discovery, fuzzing, vuln scanning, TLS/CMS fingerprinting",
         "phases": [
             ("00-SCOPE", "Scope validation"),
-            ("01-RECON", "Subdomain enumeration (subfinder, amass, etc.)"),
+            ("01-RECON", "Subdomain enumeration (subfinder, findomain, etc.)"),
             ("02-RESOLVE", "DNS resolution & live probing"),
             ("03-PERMUTE", "Subdomain permutation"),
             ("04-SCAN", "Port scanning (naabu/nmap)"),
@@ -433,12 +435,30 @@ _SAFE_HOST = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9\-]{0,61}[A-Za-z0-9])?(?:\.[A
 
 @dataclass
 class PipelineConfig:
-    """Shared configuration carried through the pipeline."""
-    dos_mode: bool = True
+    """Shared configuration carried through the pipeline.
+
+    This dataclass holds every tunable parameter for the scan. Fields are
+    grouped logically (scan params, sampling, auth, proxy, etc.) and
+    validated at construction via ``__post_init__``.
+
+    Sensitive fields (``auth_bearer``, ``auth_api_key``, ``auth_basic``,
+    ``auth_client_cert``) are automatically redacted in ``__repr__``.
+
+    Example::
+
+        cfg = PipelineConfig(
+            delay=0.5,
+            rate_limit=10,
+            auth_bearer="mytoken",
+        )
+    """
+    # ── Scan behavior ────────────────────────────────────────────────
+    dos_mode: bool = False
     sqlmap_level: int = 1
     sqlmap_risk: int = 1
     delay: float = 0.0
-    rate_limit: int = 0
+    rate_limit: int = 10
+    # ── Sampling (max artifacts per phase) ───────────────────────────
     sample_urls_fuzz: int = 200
     sample_urls_params: int = 15
     sample_urls_arjun_waf: int = 5
@@ -450,6 +470,7 @@ class PipelineConfig:
     sample_endpoints_post: int = 5
     sample_endpoints_cors: int = 10
     nuclei_exclude_tags: str = ""
+    # ── Proxy ────────────────────────────────────────────────────────
     proxy: str = ""
     vuln_proxy: str = ""
     proxy_timeout_multiplier: float = 1.5
@@ -486,8 +507,10 @@ class PipelineConfig:
     sample_hosts_h2smuggle: int = 10
     sample_hosts_frameworks: int = 20
     takeover_validate: bool = True
+    # ── WAF / evasion ────────────────────────────────────────────────
     waf_detected: bool = False
     waf_evasion_throttle: float = 0.0
+    # ── Session / IDOR ───────────────────────────────────────────────
     credentials_queue: List[str] = field(default_factory=list)
     cookie_b: str = ""
     idor_session_a: str = ""
@@ -567,6 +590,94 @@ class PipelineConfig:
     auth_basic: str = ""
     # ── Rate limiter ────────────────────────────────────────────────
     rate_limit_per_domain: int = 0
+
+    _SENSITIVE_FIELDS = frozenset({
+        "auth_bearer", "auth_api_key", "auth_basic", "auth_client_cert",
+        "proxy", "vuln_proxy", "cookie", "cookie_b",
+        "idor_session_a", "idor_session_b",
+        "extra_headers", "credentials_queue",
+    })
+
+    def __repr__(self) -> str:
+        """Redact sensitive fields in repr to prevent credential leakage in logs/tracebacks."""
+        from dataclasses import fields as dc_fields
+        parts = []
+        for f in dc_fields(self):
+            val = getattr(self, f.name)
+            if f.name in self._SENSITIVE_FIELDS:
+                if val:
+                    parts.append(f"{f.name}=***")
+                else:
+                    parts.append(f"{f.name}={val!r}")
+            else:
+                parts.append(f"{f.name}={val!r}")
+        return f"PipelineConfig({', '.join(parts)})"
+
+    def __post_init__(self) -> None:
+        """Validate configuration values at construction time."""
+        _positive_int = [
+            "sqlmap_level", "sqlmap_risk", "rate_limit", "sample_urls_fuzz",
+            "sample_urls_params", "sample_urls_arjun_waf", "sample_hosts_ssl",
+            "sample_hosts_origin", "sample_endpoints_l", "sample_urls_xss_blind",
+            "sample_urls_ssti", "sample_endpoints_post", "sample_endpoints_cors",
+            "sample_hosts_cloud", "sample_hosts_git", "sample_hosts_graphql",
+            "sample_hosts_waf", "sample_urls_nosqli", "sample_endpoints_race",
+            "sample_hosts_jwt", "sample_urls_xxe", "sample_urls_cmdi",
+            "sample_endpoints_sspp", "sample_hosts_cached", "sample_urls_depcheck",
+            "sample_urls_redirect", "sample_hosts_clickjack", "sample_urls_crlf",
+            "sample_hosts_ratelimit", "sample_endpoints_ratelimit",
+            "sample_endpoints_corsadv", "sample_hosts_jwtadv", "sample_urls_upload",
+            "sample_hosts_smuggle", "sample_endpoints_oauth", "sample_endpoints_pwreset",
+            "sample_hosts_websocket", "sample_urls_ldap", "sample_endpoints_deserial",
+            "sample_urls_lfi", "sample_urls_idor", "sample_urls_apisec",
+            "sample_urls_domxss", "sample_hosts_h2smuggle", "sample_hosts_frameworks",
+            "sample_urls_csrf", "sample_hosts_sessionfix", "sample_endpoints_saml",
+            "sample_users_spray", "sample_hosts_cookie", "sample_urls_posttest",
+            "sample_urls_methodoverride", "sample_hosts_forcedbrowse",
+            "sample_urls_casebypass", "sample_urls_apipage", "sample_urls_tabnab",
+            "sample_urls_apikeyleak", "sample_urls_redirabuse", "sample_urls_logtrigger",
+            "sample_urls_xssstored", "sample_hosts_hostabuse", "sample_urls_authbypassadv",
+            "sample_urls_ssi", "sample_urls_jsoninject", "sample_urls_nullbyte",
+            "sample_urls_doubleencod", "sample_urls_unicode", "sample_hosts_postmsg",
+            "sample_hosts_jsonp", "sample_hosts_sri", "sample_hosts_mixedcontent",
+            "sample_hosts_hstspreload", "sample_hosts_thirdpartyjs",
+            "sample_hosts_browserstorage", "sample_urls_rfi", "sample_hosts_webdav",
+            "sample_hosts_snmp", "sample_hosts_banner", "sample_hosts_phpinfo",
+            "sample_hosts_srvstatus", "sample_urls_errorleak", "sample_hosts_wildcarddns",
+            "sample_hosts_dnsrebind", "sample_hosts_iisaspnet", "sample_hosts_tomcat",
+            "sample_hosts_nodejs", "sample_hosts_laravel", "sample_hosts_django",
+            "sample_hosts_symfony", "sample_hosts_cicd", "sample_hosts_docker",
+            "sample_hosts_k8s", "sample_hosts_terraform", "sample_hosts_envdeep",
+            "sample_hosts_gqlabuse", "sample_urls_apiversion", "sample_hosts_lbdetect",
+            "sample_hosts_vhost", "sample_urls_ratelimitbypass", "sample_hosts_emailfinder",
+            "sample_urls_metagoofil", "sample_hosts_porchpirate", "sample_urls_dorkhunter",
+            "sample_hosts_crtsh", "sample_hosts_githubsub", "sample_hosts_tlsx",
+            "sample_hosts_analyticsrels", "sample_hosts_favirecon", "sample_urls_jsluice",
+            "sample_urls_shortscan", "sample_hosts_grpcurl", "rate_limit_per_domain",
+        ]
+        for field_name in _positive_int:
+            val = getattr(self, field_name, 0)
+            if not isinstance(val, int) or val < 0:
+                raise ConfigError(f"{field_name} must be a non-negative integer, got {val!r}")
+
+        if not (1 <= self.sqlmap_level <= 5):
+            raise ConfigError(f"sqlmap_level must be 1-5, got {self.sqlmap_level}")
+        if not (1 <= self.sqlmap_risk <= 3):
+            raise ConfigError(f"sqlmap_risk must be 1-3, got {self.sqlmap_risk}")
+        if self.delay < 0:
+            raise ConfigError(f"delay must be >= 0, got {self.delay}")
+        if self.proxy_timeout_multiplier <= 0:
+            raise ConfigError(f"proxy_timeout_multiplier must be > 0, got {self.proxy_timeout_multiplier}")
+        if self.waf_evasion_throttle < 0:
+            raise ConfigError(f"waf_evasion_throttle must be >= 0, got {self.waf_evasion_throttle}")
+        if self.proxy and not self.proxy.startswith(("http://", "https://", "socks4://", "socks5://")):
+            raise ConfigError(
+                f"proxy must start with http://, https://, socks4://, or socks5://, got {self.proxy!r}"
+            )
+        if self.vuln_proxy and not self.vuln_proxy.startswith(("http://", "https://", "socks4://", "socks5://")):
+            raise ConfigError(
+                f"vuln_proxy must start with http://, https://, socks4://, or socks5://, got {self.vuln_proxy!r}"
+            )
 
 
 

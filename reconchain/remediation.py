@@ -10,6 +10,16 @@ from typing import Dict, Optional
 
 @dataclass
 class Remediation:
+    """Remediation guidance for a single vulnerability type.
+
+    Attributes:
+        cwe: CWE identifier (e.g. ``"CWE-79"``).
+        title: Human-readable vulnerability title.
+        severity: Expected severity (``"critical"``, ``"high"``, ``"medium"``, ``"low"``).
+        description: What the vulnerability is and why it matters.
+        remediation: Numbered remediation steps (newline-separated).
+        references: List of reference URLs (OWASP, CWE, etc.).
+    """
     cwe: str
     title: str
     severity: str
@@ -332,14 +342,34 @@ REMEDIATIONS: Dict[str, Remediation] = {
 
 
 def get_remediation(vuln_type: str) -> Optional[Remediation]:
+    """Look up remediation guidance by vulnerability type key.
+
+    Args:
+        vuln_type: Key into the ``REMEDIATIONS`` dict (e.g. ``"xss"``, ``"sqli"``).
+
+    Returns:
+        The matching :class:`Remediation`, or ``None`` if not found.
+    """
     return REMEDIATIONS.get(vuln_type)
 
 
 def get_all_remediations() -> Dict[str, Remediation]:
+    """Return a shallow copy of the full ``REMEDIATIONS`` mapping.
+
+    Useful for iterating over all known vulnerability types.
+    """
     return dict(REMEDIATIONS)
 
 
 def get_remediation_text(vuln_type: str) -> str:
+    """Return a formatted remediation string for display.
+
+    If no specific remediation exists for *vuln_type*, a generic best-practice
+    message is returned instead.
+
+    Returns:
+        Multi-line string with CWE tag, title, and numbered fix steps.
+    """
     r = REMEDIATIONS.get(vuln_type)
     if not r:
         return "No specific remediation available. Follow general security best practices."
@@ -347,4 +377,5 @@ def get_remediation_text(vuln_type: str) -> str:
 
 
 def has_remediation(vuln_type: str) -> bool:
+    """Check whether a remediation entry exists for *vuln_type*."""
     return vuln_type in REMEDIATIONS

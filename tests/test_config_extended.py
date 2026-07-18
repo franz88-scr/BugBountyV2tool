@@ -2,6 +2,7 @@
 import pytest
 
 from reconchain.config import PipelineConfig, VALID_PHASES
+from reconchain.exceptions import ConfigError
 
 
 class TestPipelineConfig:
@@ -87,3 +88,89 @@ class TestConfigAuth:
         cfg = PipelineConfig(auth_api_key="secret", auth_api_key_header="X-Custom-Key")
         headers = {cfg.auth_api_key_header: cfg.auth_api_key}
         assert headers["X-Custom-Key"] == "secret"
+
+
+class TestPipelineConfigValidation:
+    def test_valid_config_passes(self):
+        cfg = PipelineConfig()
+        assert cfg.sqlmap_level == 1
+
+    def test_sqlmap_level_too_high(self):
+        with pytest.raises(ConfigError, match="sqlmap_level"):
+            PipelineConfig(sqlmap_level=10)
+
+    def test_sqlmap_level_zero(self):
+        with pytest.raises(ConfigError, match="sqlmap_level"):
+            PipelineConfig(sqlmap_level=0)
+
+    def test_sqlmap_risk_too_high(self):
+        with pytest.raises(ConfigError, match="sqlmap_risk"):
+            PipelineConfig(sqlmap_risk=5)
+
+    def test_sqlmap_risk_zero(self):
+        with pytest.raises(ConfigError, match="sqlmap_risk"):
+            PipelineConfig(sqlmap_risk=0)
+
+    def test_negative_delay(self):
+        with pytest.raises(ConfigError, match="delay"):
+            PipelineConfig(delay=-1.0)
+
+    def test_zero_delay_ok(self):
+        cfg = PipelineConfig(delay=0.0)
+        assert cfg.delay == 0.0
+
+    def test_positive_delay_ok(self):
+        cfg = PipelineConfig(delay=2.5)
+        assert cfg.delay == 2.5
+
+    def test_negative_rate_limit(self):
+        with pytest.raises(ConfigError, match="rate_limit"):
+            PipelineConfig(rate_limit=-1)
+
+    def test_proxy_invalid_scheme(self):
+        with pytest.raises(ConfigError, match="proxy"):
+            PipelineConfig(proxy="ftp://evil.com")
+
+    def test_proxy_http_ok(self):
+        cfg = PipelineConfig(proxy="http://127.0.0.1:8080")
+        assert cfg.proxy == "http://127.0.0.1:8080"
+
+    def test_proxy_socks4_ok(self):
+        cfg = PipelineConfig(proxy="socks4://127.0.0.1:9050")
+        assert cfg.proxy == "socks4://127.0.0.1:9050"
+
+    def test_proxy_socks5_ok(self):
+        cfg = PipelineConfig(proxy="socks5://127.0.0.1:9050")
+        assert cfg.proxy == "socks5://127.0.0.1:9050"
+
+    def test_vuln_proxy_invalid_scheme(self):
+        with pytest.raises(ConfigError, match="vuln_proxy"):
+            PipelineConfig(vuln_proxy="ftp://evil.com")
+
+    def test_vuln_proxy_http_ok(self):
+        cfg = PipelineConfig(vuln_proxy="http://127.0.0.1:8080")
+        assert cfg.vuln_proxy == "http://127.0.0.1:8080"
+
+    def test_vuln_proxy_socks5_ok(self):
+        cfg = PipelineConfig(vuln_proxy="socks5://127.0.0.1:9050")
+        assert cfg.vuln_proxy == "socks5://127.0.0.1:9050"
+
+    def test_negative_sample_field(self):
+        with pytest.raises(ConfigError, match="sample_urls_fuzz"):
+            PipelineConfig(sample_urls_fuzz=-5)
+
+    def test_proxy_timeout_multiplier_zero(self):
+        with pytest.raises(ConfigError, match="proxy_timeout_multiplier"):
+            PipelineConfig(proxy_timeout_multiplier=0)
+
+    def test_proxy_timeout_multiplier_negative(self):
+        with pytest.raises(ConfigError, match="proxy_timeout_multiplier"):
+            PipelineConfig(proxy_timeout_multiplier=-1.0)
+
+    def test_waf_evasion_throttle_negative(self):
+        with pytest.raises(ConfigError, match="waf_evasion_throttle"):
+            PipelineConfig(waf_evasion_throttle=-0.5)
+
+    def test_credentials_queue_default(self):
+        cfg = PipelineConfig()
+        assert cfg.credentials_queue == []

@@ -30,6 +30,12 @@ class RateLimiter:
         for d in stale[:len(stale) // 2]:  # remove half to avoid thrashing
             self._domain_last.pop(d, None)
             self._domain_failures.pop(d, None)
+        # LRU fallback: if no stale entries, evict oldest regardless of age
+        if not stale and len(self._domain_last) > self._MAX_DOMAINS:
+            all_domains = sorted(self._domain_last.items(), key=lambda x: x[1])
+            for d, _ in all_domains[:len(all_domains) // 2]:
+                self._domain_last.pop(d, None)
+                self._domain_failures.pop(d, None)
 
     def _min_interval(self) -> float:
         return 1.0 / self.max_per_second if self.max_per_second > 0 else 0.0

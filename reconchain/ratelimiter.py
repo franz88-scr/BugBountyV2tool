@@ -110,6 +110,9 @@ class GlobalRateLimiter:
         if self.per_domain_rate > 0 and domain:
             bucket = await self._get_domain_bucket(domain)
             await bucket.acquire()
+        # Periodic cleanup of stale domain buckets
+        if len(self._domain_buckets) > 1000:
+            self.cleanup_domains()
 
     async def try_acquire(self, domain: str = "") -> bool:
         if self._global_bucket and not await self._global_bucket.try_acquire():

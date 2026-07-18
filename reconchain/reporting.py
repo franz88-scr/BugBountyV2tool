@@ -1,13 +1,19 @@
-"""Report generation: summary JSON, HTML, Markdown, text."""
+"""Report generation: summary JSON, HTML, Markdown, text, SARIF, Faraday, dashboard."""
 import json
 import os
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List
 
+from reconchain.artifacts import (
+    get_counts,
+    get_coverage,
+    get_report_files,
+)
 from reconchain.config import __version__
-from reconchain.utils import ensure, read_lines, count_nonblank, log
+from reconchain.utils import ensure, read_lines, count_nonblank, log, html_escape, md_escape
 
+# Shared CSS stylesheet used by all HTML report variants.
 HTML_CSS = """
 :root{--fg:#e6edf3;--bg:#0d1117;--mut:#8b949e;--acc:#58a6ff;--warn:#d29922;--ok:#3fb950;--err:#f85149;}
 *{box-sizing:border-box}body{font-family:ui-monospace,Menlo,Consolas,monospace;
@@ -23,199 +29,23 @@ pre{background:#161b22;border:1px solid #30363d;border-radius:6px;padding:12px;o
 
 
 def _counts(outdir: Path) -> Dict[str, int]:
-    keys = {
-        "subdomains": outdir / "all_subs.txt",
-        "resolved": outdir / "resolved.txt",
-        "open_ports": outdir / "ports.txt",
-        "services": outdir / "services.txt",
-        "live_hosts": outdir / "hosts.txt",
-        "tech": outdir / "tech.txt",
-        "takeover": outdir / "takeover.txt",
-        "urls": outdir / "urls_all.txt",
-        "js_urls": outdir / "urls_js.txt",
-        "js_secrets": outdir / "js_secrets.txt",
-        "js_deep": outdir / "js_secrets_deep.txt",
-        "params": outdir / "params.txt",
-        "fuzz": outdir / "fuzz.txt",
-        "nuclei": outdir / "nuclei_combined.txt",
-        "tls_wp": outdir / "tls_wp.txt",
-        "ssti": outdir / "ssti.txt",
-        "origin": outdir / "origin.txt",
-        "auth_bypass": outdir / "auth_bypass.txt",
-        "vulns": outdir / "vulns.txt",
-        "oast": outdir / "oast" / "callbacks.txt",
-        "cloud_buckets": outdir / "cloud_buckets.txt",
-        "git_exposure": outdir / "git_exposure.txt",
-        "graphql": outdir / "graphql_introspection.txt",
-        "waf": outdir / "waf_detection.txt",
-        "nosqli": outdir / "nosqli.txt",
-        "race": outdir / "race_conditions.txt",
-        "jwt": outdir / "jwt_analysis.txt",
-        "xxe": outdir / "xxe.txt",
-        "cmdi": outdir / "cmd_injection.txt",
-        "sspp": outdir / "sspp.txt",
-        "cached": outdir / "cache_poison.txt",
-        "depcheck": outdir / "depcheck.txt",
-        "open_redirect": outdir / "open_redirect.txt",
-        "clickjacking": outdir / "clickjacking.txt",
-        "crlf": outdir / "crlf_injection.txt",
-        "rate_limiting": outdir / "rate_limiting.txt",
-        "cors_advanced": outdir / "cors_advanced.txt",
-        "jwt_advanced": outdir / "jwt_advanced.txt",
-        "file_upload": outdir / "file_upload.txt",
-        "smuggling": outdir / "smuggling.txt",
-        "oauth": outdir / "oauth_misconfig.txt",
-        "password_reset": outdir / "password_reset.txt",
-        "websocket": outdir / "websocket.txt",
-        "ldap": outdir / "ldap_injection.txt",
-        "deserialization": outdir / "deserialization.txt",
-        "takeover_confirmed": outdir / "takeover_confirmed.txt",
-        "api_specs": outdir / "api_specs.txt",
-        "sqlmap": outdir / "sqlmap_findings.txt",
-        "idor": outdir / "idor.txt",
-        "ssrf_meta": outdir / "ssrf_meta.txt",
-        "lfi": outdir / "lfi.txt",
-        "mass_assign": outdir / "mass_assign.txt",
-        "authz_bypass": outdir / "authz_bypass.txt",
-        "domxss": outdir / "domxss_findings.txt",
-        "h2_smuggling": outdir / "h2_smuggling.txt",
-        "framework_vulns": outdir / "framework_vulns.txt",
-        "chain_correlation": outdir / "chain_correlation.txt",
-        "evidence": outdir / "evidence.txt",
-        "bucket_permissions": outdir / "bucket_permissions.txt",
-        "hpp": outdir / "hpp.txt",
-        "serverless_endpoints": outdir / "serverless_endpoints.txt",
-        "csp_analysis": outdir / "csp_analysis.txt",
-        "websocket_fuzz": outdir / "websocket_fuzz.txt",
-        "csv_injection": outdir / "csv_injection.txt",
-        "exposed_databases": outdir / "exposed_databases.txt",
-        "default_creds": outdir / "default_creds.txt",
-        "host_header_injection": outdir / "host_header_injection.txt",
-        "email_security": outdir / "email_security.txt",
-        "smtp_enumeration": outdir / "smtp_enumeration.txt",
-        "oauth_advanced": outdir / "oauth_advanced.txt",
-        "log_injection": outdir / "log_injection.txt",
-        "document_attacks": outdir / "document_attacks.txt",
-        "waf_bypass": outdir / "waf_bypass.txt",
-        "idempotency": outdir / "idempotency.txt",
-        "session": outdir / "session_analysis.txt",
-        "ssrf_full": outdir / "ssrf_full.txt",
-        "pathnorm": outdir / "path_normalization.txt",
-        "dep_cve": outdir / "dep_cve.txt",
-        "dns_zt": outdir / "dns_zone_transfer.txt",
-        "ports_full": outdir / "ports_full.txt",
-        "emails": outdir / "emails_harvested.txt",
-        "account_enum": outdir / "account_enum.txt",
-        "github_dorking": outdir / "github_dorking.txt",
-        "mobile_api": outdir / "mobile_api.txt",
-        "workflow_bypass": outdir / "workflow_bypass.txt",
-        "cache_key": outdir / "cache_key_probe.txt",
-        "file_upload_adv": outdir / "file_upload_adv.txt",
-        "secret_rotation": outdir / "secret_rotation.txt",
-        "stored_xss": outdir / "stored_xss.txt",
-        "idor_fuzz": outdir / "idor_fuzz.txt",
-        "oauth_deep": outdir / "oauth_deep.txt",
-        "race_burst": outdir / "race_burst.txt",
-        "whois": outdir / "whois.txt",
-        "asn_ranges": outdir / "asn_ranges.txt",
-        "dork_findings": outdir / "dork_findings.txt",
-        "shodan_hosts": outdir / "shodan_hosts.txt",
-        "employees": outdir / "employees.txt",
-        "passive_dns_subs": outdir / "passive_dns_subs.txt",
-        "csrf": outdir / "csrf_findings.txt",
-        "session_fixation": outdir / "session_fixation.txt",
-        "saml": outdir / "saml_findings.txt",
-        "password_spray": outdir / "password_spray_results.txt",
-        "cookie_audit": outdir / "cookie_audit.txt",
-        "post_test": outdir / "post_findings.txt",
-        "method_override": outdir / "method_override_bypass.txt",
-        "forced_browse": outdir / "forced_browse.txt",
-        "case_bypass": outdir / "case_bypass.txt",
-        "api_pagination": outdir / "api_pagination_abuse.txt",
-        "tabnabbing": outdir / "reverse_tabnabbing.txt",
-        "api_key_leaks": outdir / "api_key_leaks.txt",
-        "redirect_abuse": outdir / "redirect_abuse.txt",
-        "log_inject_trigger": outdir / "log_injection_trigger.txt",
-        "stored_xss_verified": outdir / "stored_xss_verified.txt",
-        "host_header_abuse": outdir / "host_header_abuse.txt",
-        "auth_bypass_adv": outdir / "auth_bypass_advanced.txt",
-        "ssi_injection": outdir / "ssi_injection.txt",
-        "json_injection": outdir / "json_injection.txt",
-        "null_byte_injection": outdir / "null_byte_injection.txt",
-        "double_encoding_bypass": outdir / "double_encoding_bypass.txt",
-        "unicode_bypass": outdir / "unicode_bypass.txt",
-        "postmessage_xss": outdir / "postmessage_xss.txt",
-        "jsonp_endpoints": outdir / "jsonp_endpoints.txt",
-        "sri_findings": outdir / "sri_findings.txt",
-        "mixed_content": outdir / "mixed_content.txt",
-        "hsts_preload": outdir / "hsts_preload.txt",
-        "third_party_js": outdir / "third_party_js.txt",
-        "browser_storage_audit": outdir / "browser_storage_audit.txt",
-        "rfi_findings": outdir / "rfi_findings.txt",
-        "webdav_enumeration": outdir / "webdav_enumeration.txt",
-        "snmp_findings": outdir / "snmp_findings.txt",
-        "banners": outdir / "banners.txt",
-        "phpinfo_disclosure": outdir / "phpinfo_disclosure.txt",
-        "server_status_exposed": outdir / "server_status_exposed.txt",
-        "error_leakage": outdir / "error_leakage.txt",
-        "wildcard_dns": outdir / "wildcard_dns.txt",
-        "dns_rebinding": outdir / "dns_rebinding.txt",
-        "iis_aspnet": outdir / "iis_aspnet_findings.txt",
-        "tomcat": outdir / "tomcat_findings.txt",
-        "nodejs": outdir / "nodejs_findings.txt",
-        "laravel": outdir / "laravel_exposure.txt",
-        "django": outdir / "django_exposure.txt",
-        "symfony": outdir / "symfony_profiler.txt",
-        "cicd": outdir / "cicd_exposure.txt",
-        "docker": outdir / "docker_registry.txt",
-        "k8s": outdir / "k8s_exposure.txt",
-        "terraform": outdir / "terraform_exposure.txt",
-        "env_deep": outdir / "env_files_found.txt",
-        "graphql_abuse": outdir / "graphql_abuse.txt",
-        "api_version": outdir / "api_version_bypass.txt",
-        "lb_bypass": outdir / "load_balancer_bypass.txt",
-        "vhost": outdir / "vhost_discovery.txt",
-        "ratelimit_bypass": outdir / "rate_limit_bypass.txt",
-        "emails_finder": outdir / "137-EMAILFINDER.txt",
-        "metagoofil": outdir / "138-METAGOOFIL.txt",
-        "porchpirate": outdir / "139-PORCHPIRATE.txt",
-        "dork_hunter": outdir / "140-DORKHUNTER.txt",
-        "crtsh": outdir / "141-CRTSH.txt",
-        "github_sub": outdir / "142-GITHUBSUB.txt",
-        "tlsx": outdir / "143-TLSX.txt",
-        "analytics_rels": outdir / "144-ANALYTICSRELS.txt",
-        "favirecon": outdir / "145-FAVIRECON.txt",
-        "jsluice": outdir / "146-JSLUICE.txt",
-        "shortscan": outdir / "147-SHORTSCAN.txt",
-        "grpcurl": outdir / "148-GRPCURL.txt",
-    }
-    return {k: count_nonblank(v) for k, v in keys.items() if v.exists()}
+    """Count findings in all artifact files using the centralized registry."""
+    return get_counts(outdir)
 
 
 def _coverage(outdir: Path, all_phases: List[str]) -> Dict[str, Any]:
-    """Compute coverage metrics: discovered vs tested, skipped by reason."""
-    coverage: Dict[str, Any] = {
-        "discovered_urls": count_nonblank(outdir / "urls_all.txt") if (outdir / "urls_all.txt").exists() else 0,
-        "tested_phases": 0,
-        "total_phases": len(all_phases),
-        "uncovered_paths": [],
-        "skipped": {},
-    }
-    phase_files = {
-        "00-SCOPE": "scope_validated.txt",
-        "01-RECON": "all_subs.txt",
-        "02-RESOLVE": "resolved.txt",
-        "04-SCAN": "hosts.txt",
-        "05-HARVEST": "urls_all.txt",
-    }
-    for phase_name in all_phases:
-        fname = phase_files.get(phase_name)
-        if fname and (outdir / fname).exists():
-            coverage["tested_phases"] += 1
-    return coverage
+    """Compute coverage metrics using the artifact registry."""
+    return get_coverage(outdir, all_phases)
 
 
 def write_summary(outdir: Path, domain: str, state: dict, counts: Dict[str, int]) -> Path:
+    """Write ``summary.json`` with scan metadata, artifact counts, and coverage.
+
+    The JSON payload includes the domain, generation timestamp, tool version,
+    missing tools, per-artifact counts, and phase coverage metrics.
+
+    Returns the path to the written ``summary.json``.
+    """
     payload = {
         "domain": domain,
         "generated_at": datetime.now().isoformat(timespec="seconds"),
@@ -233,78 +63,22 @@ def write_summary(outdir: Path, domain: str, state: dict, counts: Dict[str, int]
     return out
 
 
-def html_escape(s: str) -> str:
-    return (
-        s.replace("&", "&amp;")
-        .replace("<", "&lt;")
-        .replace(">", "&gt;")
-        .replace('"', "&quot;")
-        .replace("'", "&#39;")
-    )
 
 
 def write_html(outdir: Path, domain: str, counts: Dict[str, int], missing: List[str]) -> Path:
+    """Write ``report.html`` -- a single-page HTML report with summary cards and artifact contents.
+
+    Each artifact file is rendered inside a ``<pre>`` block (truncated at 50 KB).
+    Missing tools are shown as a warning banner.
+
+    Returns the path to the written ``report.html``.
+    """
     cards = "\n".join(
         f'<div class="card"><b>{n}</b><span>{html_escape(k)}</span></div>'
         for k, n in counts.items()
     )
     sections = []
-    for key in (
-        "all_subs.txt", "resolved.txt", "hosts.txt", "ports.txt",
-        "takeover.txt", "takeover_confirmed.txt", "urls_all.txt",
-        "api_specs.txt", "js_secrets.txt", "js_secrets_deep.txt",
-        "params.txt", "fuzz.txt", "nuclei_combined.txt", "tls_wp.txt",
-        "ssti.txt", "origin.txt", "authz_bypass.txt", "mass_assign.txt",
-        "idor.txt", "ssrf_meta.txt", "services.txt",
-        "vulns.txt", "sqlmap_findings.txt", "cloud_buckets.txt",
-        "git_exposure.txt", "graphql_introspection.txt", "waf_detection.txt",
-        "nosqli.txt", "race_conditions.txt", "jwt_analysis.txt", "xxe.txt",
-        "cmd_injection.txt", "sspp.txt", "cache_poison.txt", "depcheck.txt",
-        "lfi.txt", "open_redirect.txt", "clickjacking.txt",
-        "crlf_injection.txt", "rate_limiting.txt", "cors_advanced.txt",
-        "jwt_advanced.txt", "file_upload.txt", "smuggling.txt",
-        "oauth_misconfig.txt", "password_reset.txt", "websocket.txt",
-        "ldap_injection.txt",         "deserialization.txt", "chain_correlation.txt",
-        "evidence.txt", "domxss_findings.txt", "h2_smuggling.txt",
-        "framework_vulns.txt",
-        "bucket_permissions.txt", "hpp.txt", "serverless_endpoints.txt",
-        "csp_analysis.txt", "websocket_fuzz.txt", "csv_injection.txt",
-        "exposed_databases.txt", "default_creds.txt", "host_header_injection.txt",
-        "email_security.txt", "smtp_enumeration.txt", "oauth_advanced.txt",
-        "log_injection.txt", "document_attacks.txt",
-        "waf_bypass.txt", "idempotency.txt",
-        "session_analysis.txt", "ssrf_full.txt", "path_normalization.txt",
-        "dep_cve.txt", "dns_zone_transfer.txt", "ports_full.txt", "emails_harvested.txt",
-        "account_enum.txt", "github_dorking.txt", "mobile_api.txt",
-        "workflow_bypass.txt", "cache_key_probe.txt", "file_upload_adv.txt",
-        "secret_rotation.txt", "stored_xss.txt", "idor_fuzz.txt",
-        "oauth_deep.txt", "race_burst.txt",
-        "whois.txt", "asn_ranges.txt", "dork_findings.txt",
-        "shodan_hosts.txt", "employees.txt", "passive_dns_subs.txt",
-        "csrf_findings.txt", "session_fixation.txt", "saml_findings.txt",
-        "password_spray_results.txt", "cookie_audit.txt", "post_findings.txt",
-        "method_override_bypass.txt", "forced_browse.txt", "case_bypass.txt",
-        "api_pagination_abuse.txt", "reverse_tabnabbing.txt", "api_key_leaks.txt",
-        "redirect_abuse.txt", "log_injection_trigger.txt", "stored_xss_verified.txt",
-        "host_header_abuse.txt", "auth_bypass_advanced.txt",
-        "ssi_injection.txt", "json_injection.txt", "null_byte_injection.txt",
-        "double_encoding_bypass.txt", "unicode_bypass.txt", "postmessage_xss.txt",
-        "jsonp_endpoints.txt", "sri_findings.txt", "mixed_content.txt",
-        "hsts_preload.txt", "third_party_js.txt", "browser_storage_audit.txt",
-        "rfi_findings.txt", "webdav_enumeration.txt", "snmp_findings.txt",
-        "banners.txt", "phpinfo_disclosure.txt", "server_status_exposed.txt",
-        "error_leakage.txt", "wildcard_dns.txt", "dns_rebinding.txt",
-        "iis_aspnet_findings.txt", "tomcat_findings.txt", "nodejs_findings.txt",
-        "laravel_exposure.txt", "django_exposure.txt", "symfony_profiler.txt",
-        "cicd_exposure.txt", "docker_registry.txt", "k8s_exposure.txt",
-        "terraform_exposure.txt", "env_files_found.txt",
-        "graphql_abuse.txt", "api_version_bypass.txt", "load_balancer_bypass.txt",
-        "vhost_discovery.txt", "rate_limit_bypass.txt",
-        "137-EMAILFINDER.txt", "138-METAGOOFIL.txt", "139-PORCHPIRATE.txt",
-        "140-DORKHUNTER.txt", "141-CRTSH.txt", "142-GITHUBSUB.txt",
-        "143-TLSX.txt", "144-ANALYTICSRELS.txt", "145-FAVIRECON.txt",
-        "146-JSLUICE.txt", "147-SHORTSCAN.txt", "148-GRPCURL.txt",
-    ):
+    for key in get_report_files():
         p = outdir / key
         if p.exists():
             txt = p.read_text(encoding="utf-8", errors="ignore")
@@ -341,6 +115,13 @@ def write_html(outdir: Path, domain: str, counts: Dict[str, int], missing: List[
 
 
 def write_full_summary(outdir: Path, domain: str, counts: Dict[str, int], missing: List[str]) -> Path:
+    """Write ``summary.txt`` -- a plain-text summary with artifact counts and key findings.
+
+    The first 5 lines of each non-empty artifact are included as a preview.
+    OOB callback data is appended when present.
+
+    Returns the path to the written ``summary.txt``.
+    """
     lines = [
         "=" * 60,
         f"  Recon Summary \u2014 {domain}",
@@ -362,61 +143,7 @@ def write_full_summary(outdir: Path, domain: str, counts: Dict[str, int], missin
                 lines.append(f"{k:<30} {n:>8}")
     lines.append("")
     lines += ["KEY FINDINGS", "------------", ""]
-    for key in (
-        "all_subs.txt", "resolved.txt", "hosts.txt", "ports.txt",
-        "takeover.txt", "takeover_confirmed.txt", "urls_all.txt", "urls_js.txt",
-        "js_secrets.txt", "js_secrets_deep.txt", "params.txt",
-        "fuzz.txt", "nuclei_combined.txt", "tls_wp.txt",
-        "origin.txt", "authz_bypass.txt", "mass_assign.txt", "idor.txt",
-        "vulns.txt", "sqlmap_findings.txt", "ssrf_meta.txt", "ssti.txt",
-        "cloud_buckets.txt", "git_exposure.txt", "graphql_introspection.txt", "waf_detection.txt",
-        "nosqli.txt", "race_conditions.txt", "jwt_analysis.txt", "xxe.txt",
-        "cmd_injection.txt", "sspp.txt", "cache_poison.txt", "depcheck.txt",
-        "lfi.txt", "api_specs.txt",
-        "open_redirect.txt", "clickjacking.txt", "crlf_injection.txt",
-        "rate_limiting.txt", "cors_advanced.txt", "jwt_advanced.txt",
-        "file_upload.txt", "smuggling.txt", "oauth_misconfig.txt",
-        "password_reset.txt", "websocket.txt", "ldap_injection.txt",
-        "deserialization.txt", "chain_correlation.txt", "evidence.txt",
-        "domxss_findings.txt", "h2_smuggling.txt", "framework_vulns.txt",
-        "bucket_permissions.txt", "hpp.txt", "serverless_endpoints.txt",
-        "csp_analysis.txt", "websocket_fuzz.txt", "csv_injection.txt",
-        "exposed_databases.txt", "default_creds.txt", "host_header_injection.txt",
-        "email_security.txt", "smtp_enumeration.txt", "oauth_advanced.txt",
-        "log_injection.txt", "document_attacks.txt",
-        "waf_bypass.txt", "idempotency.txt",
-        "session_analysis.txt", "ssrf_full.txt", "path_normalization.txt",
-        "dep_cve.txt", "dns_zone_transfer.txt", "ports_full.txt", "emails_harvested.txt",
-        "account_enum.txt", "github_dorking.txt", "mobile_api.txt",
-        "workflow_bypass.txt", "cache_key_probe.txt", "file_upload_adv.txt",
-        "secret_rotation.txt", "stored_xss.txt", "idor_fuzz.txt",
-        "oauth_deep.txt", "race_burst.txt",
-        "whois.txt", "asn_ranges.txt", "dork_findings.txt",
-        "shodan_hosts.txt", "employees.txt", "passive_dns_subs.txt",
-        "csrf_findings.txt", "session_fixation.txt", "saml_findings.txt",
-        "password_spray_results.txt", "cookie_audit.txt", "post_findings.txt",
-        "method_override_bypass.txt", "forced_browse.txt", "case_bypass.txt",
-        "api_pagination_abuse.txt", "reverse_tabnabbing.txt", "api_key_leaks.txt",
-        "redirect_abuse.txt", "log_injection_trigger.txt", "stored_xss_verified.txt",
-        "host_header_abuse.txt", "auth_bypass_advanced.txt",
-        "ssi_injection.txt", "json_injection.txt", "null_byte_injection.txt",
-        "double_encoding_bypass.txt", "unicode_bypass.txt", "postmessage_xss.txt",
-        "jsonp_endpoints.txt", "sri_findings.txt", "mixed_content.txt",
-        "hsts_preload.txt", "third_party_js.txt", "browser_storage_audit.txt",
-        "rfi_findings.txt", "webdav_enumeration.txt", "snmp_findings.txt",
-        "banners.txt", "phpinfo_disclosure.txt", "server_status_exposed.txt",
-        "error_leakage.txt", "wildcard_dns.txt", "dns_rebinding.txt",
-        "iis_aspnet_findings.txt", "tomcat_findings.txt", "nodejs_findings.txt",
-        "laravel_exposure.txt", "django_exposure.txt", "symfony_profiler.txt",
-        "cicd_exposure.txt", "docker_registry.txt", "k8s_exposure.txt",
-        "terraform_exposure.txt", "env_files_found.txt",
-        "graphql_abuse.txt", "api_version_bypass.txt", "load_balancer_bypass.txt",
-        "vhost_discovery.txt", "rate_limit_bypass.txt",
-        "137-EMAILFINDER.txt", "138-METAGOOFIL.txt", "139-PORCHPIRATE.txt",
-        "140-DORKHUNTER.txt", "141-CRTSH.txt", "142-GITHUBSUB.txt",
-        "143-TLSX.txt", "144-ANALYTICSRELS.txt", "145-FAVIRECON.txt",
-        "146-JSLUICE.txt", "147-SHORTSCAN.txt", "148-GRPCURL.txt",
-    ):
+    for key in get_report_files():
         p = outdir / key
         if not p.exists():
             continue
@@ -446,15 +173,15 @@ def write_full_summary(outdir: Path, domain: str, counts: Dict[str, int], missin
     return out
 
 
-def md_escape(s: str) -> str:
-    return (
-        s.replace("&", "&amp;")
-        .replace("<", "&lt;")
-        .replace(">", "&gt;")
-    )
-
 
 def write_markdown(outdir: Path, domain: str, counts: Dict[str, int], missing: List[str]) -> Path:
+    """Write ``report.md`` -- a Markdown report with summary table and artifact listing.
+
+    Includes a Markdown table of artifact counts, a list of all ``*.txt`` artifact
+    files, and up to 50 OOB callback entries when present.
+
+    Returns the path to the written ``report.md``.
+    """
     lines = [
         f"# Recon Report \u2014 {md_escape(domain)}",
         f"_generated {datetime.now().isoformat(timespec='seconds')}_",
@@ -609,7 +336,6 @@ def write_html_dashboard(outdir: Path, domain: str, counts: Dict[str, int], miss
     high = sum(v for k, v in counts.items() if any(x in k for x in ["xss", "ssrf", "lfi", "idor"]))
     medium = sum(v for k, v in counts.items() if any(x in k for x in ["redirect", "cors"]))
     low = sum(v for k, v in counts.items() if any(x in k for x in ["clickjack", "info"]))
-    severity_data = json.dumps([critical, high, medium, low])
     cards_html = "\n".join(
         f'<div class="card"><b>{n}</b><span>{html_escape(k)}</span></div>'
         for k, n in counts.items() if n > 0

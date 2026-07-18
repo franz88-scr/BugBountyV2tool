@@ -29,7 +29,7 @@ def _json_response(handler: BaseHTTPRequestHandler, data: Any, status: int = 200
     handler.send_response(status)
     handler.send_header("Content-Type", "application/json")
     handler.send_header("Content-Length", str(len(body)))
-    handler.send_header("Access-Control-Allow-Origin", "*")
+    handler.send_header("Access-Control-Allow-Origin", "http://localhost:8765")
     handler.send_header("Access-Control-Allow-Methods", "GET, OPTIONS")
     handler.send_header("Access-Control-Allow-Headers", "Content-Type")
     handler.end_headers()
@@ -48,7 +48,7 @@ class ReconChainAPIHandler(BaseHTTPRequestHandler):
 
     def do_OPTIONS(self) -> None:
         self.send_response(204)
-        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Origin", "http://localhost:8765")
         self.send_header("Access-Control-Allow-Methods", "GET, OPTIONS")
         self.send_header("Access-Control-Allow-Headers", "Content-Type")
         self.end_headers()
@@ -82,7 +82,6 @@ class ReconChainAPIHandler(BaseHTTPRequestHandler):
             "status": "ok",
             "version": __version__,
             "timestamp": datetime.now().isoformat(timespec="seconds"),
-            "outdir": str(_outdir) if _outdir else None,
         })
 
     def _handle_summary(self) -> None:
@@ -116,8 +115,12 @@ class ReconChainAPIHandler(BaseHTTPRequestHandler):
         phase = params.get("phase", [None])[0]
         vuln_type = params.get("vuln_type", [None])[0]
         host = params.get("host", [None])[0]
-        limit = int(params.get("limit", ["500"])[0])
-        offset = int(params.get("offset", ["0"])[0])
+        try:
+            limit = min(int(params.get("limit", ["500"])[0]), 10000)
+            offset = max(0, int(params.get("offset", ["0"])[0]))
+        except (ValueError, TypeError):
+            _error_response(self, "Invalid limit/offset parameter", 400)
+            return
 
         if severity:
             findings = [f for f in findings if f.severity == severity]

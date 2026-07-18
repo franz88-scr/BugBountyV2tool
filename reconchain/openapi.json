@@ -1,0 +1,440 @@
+{
+    "openapi": "3.0.3",
+    "info": {
+        "title": "ReconChain REST API",
+        "description": "Security reconnaissance and vulnerability scanning API for ReconChain",
+        "version": "3.1.0",
+        "contact": {
+            "name": "ReconChain",
+            "url": "https://github.com/reconchain/reconchain"
+        }
+    },
+    "servers": [
+        {
+            "url": "http://localhost:8080",
+            "description": "Local development server"
+        }
+    ],
+    "tags": [
+        {"name": "scan", "description": "Scan operations"},
+        {"name": "findings", "description": "Finding queries and exports"},
+        {"name": "phases", "description": "Pipeline phase management"},
+        {"name": "health", "description": "System health and status"},
+        {"name": "plugins", "description": "Plugin management"},
+        {"name": "workspace", "description": "Team workspace operations"}
+    ],
+    "paths": {
+        "/api/v1/health": {
+            "get": {
+                "tags": ["health"],
+                "summary": "Health check",
+                "operationId": "getHealth",
+                "responses": {
+                    "200": {
+                        "description": "System healthy",
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "object",
+                                    "properties": {
+                                        "status": {"type": "string", "example": "ok"},
+                                        "version": {"type": "string", "example": "3.1.0"}
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/api/v1/scan": {
+            "post": {
+                "tags": ["scan"],
+                "summary": "Start a new scan",
+                "operationId": "startScan",
+                "requestBody": {
+                    "required": true,
+                    "content": {
+                        "application/json": {
+                            "schema": {
+                                "$ref": "#/components/schemas/ScanRequest"
+                            }
+                        }
+                    }
+                },
+                "responses": {
+                    "202": {
+                        "description": "Scan started",
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "object",
+                                    "properties": {
+                                        "scan_id": {"type": "string"},
+                                        "status": {"type": "string", "example": "running"}
+                                    }
+                                }
+                            }
+                        }
+                    },
+                    "400": {"$ref": "#/components/responses/BadRequest"},
+                    "503": {"$ref": "#/components/responses/ServiceUnavailable"}
+                }
+            }
+        },
+        "/api/v1/scan/{scan_id}": {
+            "get": {
+                "tags": ["scan"],
+                "summary": "Get scan status",
+                "operationId": "getScanStatus",
+                "parameters": [
+                    {
+                        "name": "scan_id",
+                        "in": "path",
+                        "required": true,
+                        "schema": {"type": "string"}
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "Scan status",
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/ScanStatus"
+                                }
+                            }
+                        }
+                    },
+                    "404": {"$ref": "#/components/responses/NotFound"}
+                }
+            }
+        },
+        "/api/v1/scan/{scan_id}/cancel": {
+            "post": {
+                "tags": ["scan"],
+                "summary": "Cancel a running scan",
+                "operationId": "cancelScan",
+                "parameters": [
+                    {
+                        "name": "scan_id",
+                        "in": "path",
+                        "required": true,
+                        "schema": {"type": "string"}
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "Scan cancelled",
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "object",
+                                    "properties": {
+                                        "status": {"type": "string", "example": "cancelled"}
+                                    }
+                                }
+                            }
+                        }
+                    },
+                    "404": {"$ref": "#/components/responses/NotFound"}
+                }
+            }
+        },
+        "/api/v1/findings": {
+            "get": {
+                "tags": ["findings"],
+                "summary": "List findings",
+                "operationId": "listFindings",
+                "parameters": [
+                    {
+                        "name": "severity",
+                        "in": "query",
+                        "schema": {
+                            "type": "string",
+                            "enum": ["critical", "high", "medium", "low", "info"]
+                        }
+                    },
+                    {
+                        "name": "vuln_type",
+                        "in": "query",
+                        "schema": {"type": "string"}
+                    },
+                    {
+                        "name": "host",
+                        "in": "query",
+                        "schema": {"type": "string"}
+                    },
+                    {
+                        "name": "limit",
+                        "in": "query",
+                        "schema": {"type": "integer", "default": 100}
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "List of findings",
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "array",
+                                    "items": {
+                                        "$ref": "#/components/schemas/Finding"
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/api/v1/findings/export": {
+            "get": {
+                "tags": ["findings"],
+                "summary": "Export findings as CSV or JSON",
+                "operationId": "exportFindings",
+                "parameters": [
+                    {
+                        "name": "format",
+                        "in": "query",
+                        "schema": {
+                            "type": "string",
+                            "enum": ["csv", "json", "jsonl"],
+                            "default": "json"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "Exported findings"
+                    }
+                }
+            }
+        },
+        "/api/v1/phases": {
+            "get": {
+                "tags": ["phases"],
+                "summary": "List available pipeline phases",
+                "operationId": "listPhases",
+                "responses": {
+                    "200": {
+                        "description": "List of phases",
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "array",
+                                    "items": {
+                                        "$ref": "#/components/schemas/Phase"
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/api/v1/plugins": {
+            "get": {
+                "tags": ["plugins"],
+                "summary": "List installed plugins",
+                "operationId": "listPlugins",
+                "responses": {
+                    "200": {
+                        "description": "Installed plugins",
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "array",
+                                    "items": {
+                                        "$ref": "#/components/schemas/Plugin"
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/api/v1/plugins/marketplace/search": {
+            "get": {
+                "tags": ["plugins"],
+                "summary": "Search plugin marketplace",
+                "operationId": "searchPlugins",
+                "parameters": [
+                    {
+                        "name": "q",
+                        "in": "query",
+                        "schema": {"type": "string"},
+                        "description": "Search query"
+                    },
+                    {
+                        "name": "tag",
+                        "in": "query",
+                        "schema": {"type": "string"},
+                        "description": "Filter by tag"
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "Search results",
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "array",
+                                    "items": {
+                                        "$ref": "#/components/schemas/Plugin"
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/api/v1/workspace/{name}/stats": {
+            "get": {
+                "tags": ["workspace"],
+                "summary": "Get workspace statistics",
+                "operationId": "getWorkspaceStats",
+                "parameters": [
+                    {
+                        "name": "name",
+                        "in": "path",
+                        "required": true,
+                        "schema": {"type": "string"}
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "Workspace statistics"
+                    }
+                }
+            }
+        }
+    },
+    "components": {
+        "schemas": {
+            "ScanRequest": {
+                "type": "object",
+                "required": ["domain"],
+                "properties": {
+                    "domain": {
+                        "type": "string",
+                        "description": "Target domain to scan",
+                        "example": "example.com"
+                    },
+                    "phases": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Specific phases to run (empty = all)"
+                    },
+                    "safe_mode": {
+                        "type": "boolean",
+                        "default": false,
+                        "description": "Enable safe mode (resource limits)"
+                    },
+                    "proxy": {
+                        "type": "string",
+                        "description": "SOCKS proxy URL",
+                        "example": "socks5://127.0.0.1:9050"
+                    },
+                    "delay": {
+                        "type": "number",
+                        "default": 0,
+                        "description": "Delay between tool executions (seconds)"
+                    }
+                }
+            },
+            "ScanStatus": {
+                "type": "object",
+                "properties": {
+                    "scan_id": {"type": "string"},
+                    "domain": {"type": "string"},
+                    "status": {
+                        "type": "string",
+                        "enum": ["running", "completed", "cancelled", "failed"]
+                    },
+                    "current_phase": {"type": "string"},
+                    "progress": {"type": "number"},
+                    "findings_count": {"type": "integer"},
+                    "started_at": {"type": "string", "format": "date-time"},
+                    "elapsed_seconds": {"type": "number"}
+                }
+            },
+            "Finding": {
+                "type": "object",
+                "properties": {
+                    "id": {"type": "string"},
+                    "text": {"type": "string"},
+                    "vuln_type": {"type": "string"},
+                    "severity": {"type": "string"},
+                    "host": {"type": "string"},
+                    "source_file": {"type": "string"},
+                    "phase": {"type": "string"},
+                    "confidence": {"type": "number"}
+                }
+            },
+            "Phase": {
+                "type": "object",
+                "properties": {
+                    "id": {"type": "string", "example": "09-NUCLEI-SCAN"},
+                    "name": {"type": "string", "example": "Nuclei Scan"},
+                    "category": {"type": "string", "example": "vuln"},
+                    "description": {"type": "string"},
+                    "tools_required": {
+                        "type": "array",
+                        "items": {"type": "string"}
+                    }
+                }
+            },
+            "Plugin": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string"},
+                    "version": {"type": "string"},
+                    "description": {"type": "string"},
+                    "author": {"type": "string"},
+                    "tags": {
+                        "type": "array",
+                        "items": {"type": "string"}
+                    },
+                    "installed": {"type": "boolean"}
+                }
+            },
+            "ErrorResponse": {
+                "type": "object",
+                "properties": {
+                    "error": {"type": "string"},
+                    "message": {"type": "string"},
+                    "details": {"type": "object"}
+                }
+            }
+        },
+        "responses": {
+            "BadRequest": {
+                "description": "Invalid request parameters",
+                "content": {
+                    "application/json": {
+                        "schema": {"$ref": "#/components/schemas/ErrorResponse"}
+                    }
+                }
+            },
+            "NotFound": {
+                "description": "Resource not found",
+                "content": {
+                    "application/json": {
+                        "schema": {"$ref": "#/components/schemas/ErrorResponse"}
+                    }
+                }
+            },
+            "ServiceUnavailable": {
+                "description": "Service temporarily unavailable",
+                "content": {
+                    "application/json": {
+                        "schema": {"$ref": "#/components/schemas/ErrorResponse"}
+                    }
+                }
+            }
+        }
+    }
+}

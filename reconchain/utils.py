@@ -36,6 +36,112 @@ def _shutdown_http_pool() -> None:
     _http_pool.shutdown(wait=False)
 _atexit.register(_shutdown_http_pool)
 
+
+# ── HTTP Response Cache ────────────────────────────────────────────
+# LRU cache for GET responses to avoid redundant network I/O across phases.
+# Keyed by (url, method). Entries expire after TTL seconds.
+
+class _HTTPResponseCache:
+    """Thread-safe LRU cache for HTTP GET responses.
+
+    Avoids redundant fetches when multiple phases probe the same URL
+    (e.g. CORS check, header leak check, redirect check).
+    """
+
+    def __init__(self, max_size: int = 2048, ttl: int = 300) -> None:
+        self._max_size = max_size
+        self._ttl = ttl
+        self._cache: Dict[str, Tuple[float, int, bytes]] = {}  # key -> (ts, status, body)
+        self._lock = threading.Lock()
+
+    def _key(self, url: str, method: str = "GET") -> str:
+        return f"{method}:{url}"
+
+    def get(self, url: str, method: str = "GET") -> Optional[Tuple[int, bytes]]:
+        key = self._key(url, method)
+        with self._lock:
+            entry = self._cache.get(key)
+            if entry is None:
+                return None
+            ts, status, body = entry
+            if time.monotonic() - ts > self._ttl:
+                del self._cache[key]
+                return None
+            return status, body
+
+    def put(self, url: str, status: int, body: bytes, method: str = "GET") -> None:
+        key = self._key(url, method)
+        with self._lock:
+            if len(self._cache) >= self._max_size:
+                # Evict oldest 25%
+                evict_count = max(1, self._max_size // 4)
+                sorted_keys = sorted(
+                    self._cache.keys(),
+                    key=lambda k: self._cache[k][0],
+                )
+                for k in sorted_keys[:evict_count]:
+                    self._cache.pop(k, None)
+            self._cache[key] = (time.monotonic(), status, body)
+
+    def invalidate(self) -> None:
+        with self._lock:
+            self._cache.clear()
+
+
+_http_response_cache = _HTTPResponseCache()
+
+
+def get_http_cache() -> _HTTPResponseCache:
+    return _http_response_cache
+
+
+# ── DNS Resolution Cache ──────────────────────────────────────────
+# Caches DNS lookup results to avoid redundant getaddrinfo calls.
+
+class _DNSCache:
+    """Thread-safe DNS resolution cache with TTL."""
+
+    def __init__(self, max_size: int = 4096, ttl: int = 600) -> None:
+        self._max_size = max_size
+        self._ttl = ttl
+        self._cache: Dict[str, Tuple[float, Set[str]]] = {}  # host -> (ts, resolved_ips)
+        self._lock = threading.Lock()
+
+    def get(self, host: str) -> Optional[Set[str]]:
+        with self._lock:
+            entry = self._cache.get(host)
+            if entry is None:
+                return None
+            ts, ips = entry
+            if time.monotonic() - ts > self._ttl:
+                del self._cache[host]
+                return None
+            return ips
+
+    def put(self, host: str, ips: Set[str]) -> None:
+        with self._lock:
+            if len(self._cache) >= self._max_size:
+                evict_count = max(1, self._max_size // 4)
+                sorted_keys = sorted(
+                    self._cache.keys(),
+                    key=lambda k: self._cache[k][0],
+                )
+                for k in sorted_keys[:evict_count]:
+                    self._cache.pop(k, None)
+            self._cache[host] = (time.monotonic(), ips)
+
+    def invalidate(self) -> None:
+        with self._lock:
+            self._cache.clear()
+
+
+_dns_cache = _DNSCache()
+
+
+def get_dns_cache() -> _DNSCache:
+    return _dns_cache
+
+
 def _is_valid_hostname(s: str) -> bool:
     if not s:
         return False
@@ -73,7 +179,9 @@ def _write_target_tokens(src: Path, dst: Path) -> int:
             seen.add(token)
     if not seen:
         log("warn", f"_write_target_tokens: no valid tokens found in {src.name}")
-    ensure(dst).write_text("\n".join(sorted(seen)) + "\n")
+        ensure(dst).write_text("")
+    else:
+        ensure(dst).write_text("\n".join(sorted(seen)) + "\n")
     return len(seen)
 
 
@@ -260,10 +368,11 @@ def _sanitize_header_value(v: str) -> str:
     return v.strip()
 
 def _validate_cookie(value: str) -> str:
-    """Validate and sanitize a cookie string. Raises ValueError on empty result."""
+    """Validate and sanitize a cookie string. Raises InvalidCookieError on empty result."""
+    from reconchain.exceptions import InvalidCookieError
     value = _sanitize_header_value(value)
     if not value:
-        raise ValueError("cookie string is empty after sanitization")
+        raise InvalidCookieError("cookie string is empty after sanitization")
     # Strip leading '--' fragments that could inject CLI arguments
     while value.startswith("--"):
         value = value[2:].lstrip()
@@ -1135,11 +1244,3 @@ def atomic_write_text(path: Path, content: str) -> None:
         with contextlib.suppress(Exception):
             os.unlink(tmp_path)
         raise
-        for f in sorted(cls._SCAN_STATUS_DIR.glob("*.json")):
-            try:
-                data = json.loads(f.read_text(encoding="utf-8", errors="ignore"))
-                if data.get("status") != "completed":
-                    results.append(data)
-            except Exception:
-                continue
-        return results

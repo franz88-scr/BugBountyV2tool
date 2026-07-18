@@ -178,7 +178,9 @@ class Interactsh:
             return False
         token = os.environ.get("INTERACTSH_TOKEN")
         ensure(self.log)
-        self.log.write_text("")
+        # Append to log instead of truncating to avoid clobbering other instances
+        if self.log.exists() and self.log.stat().st_size > 10 * 1024 * 1024:
+            self.log.write_text("")
         cmd = ["interactsh-client", "-v"]
         if token:
             cmd += ["-t", token]

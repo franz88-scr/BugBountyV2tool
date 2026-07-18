@@ -1,16 +1,16 @@
-# ReconChain v2.0.0
+# ReconChain v3.1.0
 
-Chains 164 recon and vulnerability phases across 27 stages into a single resumable pipeline.
-
-![](docs/wizard_menu.svg)
+Enterprise-grade security reconnaissance and vulnerability assessment pipeline orchestrator. Chains **164 security phases** across **27 DAG stages**, orchestrating **45+ external tools** into a single resumable, adaptive pipeline.
 
 ```bash
-reconchain -i                           # Interactive wizard
-reconchain -d example.com -o ./out      # Full audit
-reconchain -d example.com,test.org      # Multi-domain
-reconchain -d example.com --fast        # Basic recon only
-reconchain -d example.com --no-dos      # Skip DoS-style phases
-reconchain -d example.com --safe        # Safe mode for VMs/containers
+reconchain -d example.com                          # Full scan
+reconchain -i                                      # Interactive wizard
+reconchain -d example.com --fast                   # Quick recon (5 phases)
+reconchain -d example.com --safe                   # VM/container safe mode
+reconchain -d example.com,test.org                 # Multi-domain scan
+reconchain --batch targets.txt                     # Batch scan from file
+reconchain -d example.com --api-port 8080          # REST API
+reconchain -d example.com --dashboard              # Live web dashboard
 ```
 
 ## Install
@@ -20,170 +20,265 @@ pip install tqdm && python3 -m pip install -e '.[dev]'
 chmod +x install.sh && ./install.sh
 ```
 
-## Flags
-
-| Flag | Description |
-|------|-------------|
-| `-d DOMAIN` | Target domain (comma-separated for multi) |
-| `-o DIR` | Output directory (default: `./out/DOMAIN`) |
-| `--fast` | Basic recon only (5 phases: scope, recon, resolve, scan, harvest) |
-| `--only PHASES` | Comma-separated phase list, e.g. `06-JSINTEL,45-EVIDENCE` |
-| `--skip PHASES` | Comma-separated phases to skip, e.g. `11-INJECT` |
-| `--resume` | Resume from `state.json` |
-| `--force` | Re-run all phases (ignore cache) |
-| `--format FORMAT` | Report format: `html`, `md`, `json`, `sarif` |
-| `--proxy URL` | SOCKS/HTTP proxy, e.g. `socks5://127.0.0.1:9050` |
-| `--vuln-proxy URL` | Proxy for vuln phases only |
-| `-j N` | Parallel phases (default: cpu count) |
-| `--max-procs N` | Max concurrent tool subprocesses (default: auto, scales with CPU) |
-| `--delay SEC` | Throttle delay between requests |
-| `--rate-limit N` | Max requests/sec per tool (0 = unlimited) |
-| `--dos` | Enable DoS-style phases (default) |
-| `--no-dos` | Skip DoS-style phases (race bursts, password sprays, GraphQL abuse, etc.) |
-| `--sqlmap-level N` | SQLMap test level 1-5 (default: 1) |
-| `--sqlmap-risk N` | SQLMap risk level 1-3 (default: 1) |
-| `--quiet` | Suppress banner and progress output |
-| `--no-color` | Disable colored output |
-| `-i` | Interactive wizard |
-| `--sample` | Downsample artifacts to 1 entry per file |
-| `--exclude-tags TAGS` | Comma-separated nuclei tags to exclude |
-| `--header HDR` | Extra HTTP header (repeatable) |
-| `--cookie STR` | Cookie string for authenticated scans |
-| `--safe` | Safe mode: conservative concurrency for VMs/containers (start=1, max=4, max_procs=2) |
-| `--adaptive` | Enable adaptive resource monitor (default: on) |
-| `--no-adaptive` | Disable adaptive monitor, use static concurrency |
-| `--adaptive-start N` | Starting concurrency for adaptive monitor (default: auto, 2-6) |
-| `--adaptive-max N` | Max concurrency cap for adaptive monitor (0 = auto) |
-| `--adaptive-max-procs N` | Hard cap on concurrent subprocesses (0 = auto) |
-| `--adaptive-interval F` | Monitor check interval in seconds (default: 5.0) |
-| `--adaptive-cpu-high N` | CPU% threshold to reduce concurrency (default: 80) |
-| `--adaptive-ram-crit F` | RAM free GB threshold to reduce concurrency (default: 1.0) |
-
-### Performance
-
-ReconChain automatically scales concurrency based on system resources. The adaptive monitor measures CPU/RAM every 5 seconds and adjusts thread count and subprocess limits in real time.
-
-**How it works:**
-- Starts at a conservative concurrency level (auto-detected based on CPU cores)
-- Ramps up by +2 every 5 seconds when system load is low
-- Scales down when CPU > 80% or free RAM < 1 GB
-- Hard-caps subprocesses at 12 max (auto-detected: `min(12, max(8, cpu_count * 2))`)
-
-**For VMs/containers:** Use `--safe` to apply pre-tuned conservative settings that prevent OOM kills.
-
-### Low-Resource / VM Mode
-
-For VirtualBox VMs, Docker containers, or low-RAM hosts:
+Or with Docker:
 
 ```bash
-# Quick safe mode — auto-configures conservative settings
-reconchain -d example.com --fast --safe
-
-# Manual fine-tuning
-reconchain -d example.com --fast -j 1 --max-procs 2 --rate-limit 5
-reconchain -d example.com --fast --no-dos -j 1 --max-procs 3 --delay 0.5 --rate-limit 10
+docker build -t reconchain .
+docker compose run reconchain -d example.com
 ```
 
-Every subprocess is capped at 8 GB virtual memory, 2048 child processes, and 512 MB output. A hard OS-level process counter (`--max-procs`) limits total concurrent tools across all phases.
+## Features
+
+- **164 phases, 27 DAG stages** — resumable, parallel execution with explicit dependency ordering
+- **45+ integrated tools** — subfinder, nuclei, httpx, naabu, ffuf, sqlmap, dalfox, katana, gau, and more
+- **Adaptive resource monitor** — auto-scales concurrency based on real-time CPU/RAM; circuit breaker prevents cascading failures
+- **Multi-format reporting** — HTML, Markdown, JSON, SARIF (CI/CD), Faraday (JSONL)
+- **AI-powered triage** — OpenAI, Anthropic, or Ollama integration for vulnerability classification and exploit suggestions
+- **ML-assisted scanning** — phase prioritization, vulnerability classification with 24 signatures, exploit chain analysis
+- **Compliance reports** — PCI DSS v4.0 (8 controls), HIPAA (6 controls), SOC 2 Type II (6 controls)
+- **Threat intelligence** — MITRE ATT&CK mapping (20 techniques across 7 tactics), custom threat feed matching
+- **Attack surface visualization** — directed graph analysis of multi-step attack chains
+- **Collaborative scanning** — multi-scanner team workspaces with consensus-based confirmation
+- **Plugin marketplace** — community-contributed phase plugins
+- **Continuous monitoring** — watchdog scripts, scheduled re-scans, Discord/Slack/Telegram notifications
+- **REST API** — stdlib-based HTTP server with health, findings, artifacts, and scan control endpoints
+- **Terminal UI & web dashboard** — live SSE streaming dashboard
+- **Distributed scanning** — SSH-based multi-host orchestration
+- **Secure by default** — RLIMIT caps, rate limiting, credential encryption (Fernet/AES-128), input sanitization, audit logging
+
+## Quick Start
+
+| Command | Description |
+|---------|-------------|
+| `reconchain -d example.com` | Full reconnaissance and vulnerability scan |
+| `reconchain -d example.com --fast` | Quick recon (scope, resolve, scan, harvest, params) |
+| `reconchain -d example.com --safe` | Conservative settings for VMs/containers |
+| `reconchain -d example.com --no-dos` | Skip DoS-style phases |
+| `reconchain -d example.com --resume` | Resume from saved state |
+| `reconchain -d example.com --only 01-RECON,02-RESOLVE` | Selective phases |
+| `reconchain -d example.com --skip 23-RACE,93-PWDSPRAY` | Skip specific phases |
+| `reconchain -i` | Interactive setup wizard |
+| `reconchain --batch targets.txt` | Batch scan multiple domains |
+
+### Advanced
+
+```bash
+reconchain -d example.com --proxy socks5://127.0.0.1:9050     # Tor proxy
+reconchain -d example.com --compliance pci_dss,hipaa           # Compliance report
+reconchain -d example.com --threat-intel                       # MITRE ATT&CK
+reconchain -d example.com --credential-store                   # Encrypted creds
+reconchain -d example.com --collaborative --workspace team     # Team scanning
+reconchain -d example.com --format sarif                       # CI/CD output
+python3 monitor.py -d example.com                              # Watchdog
+```
 
 ## Phases (164)
 
-### Recon (00–07)
+```
+00-SCOPE              01-RECON             02-RESOLVE          03-PERMUTE
+04-SCAN               04b-TAKEOVER         05-HARVEST          05b-APISPEC
+06-JSINTEL            07-PARAMS            08-FUZZ             09-VULNSCAN
+10-TLSCMS             11-INJECT            11a-DOMXSS          11b-SQLMAP
+12-SSTI               13-OOB               14-ORIGIN           15-SECRETS
+16a-AUTHZ             16b-MASSASSIGN       17-IDOR             17b-SSRFMETA
+18-CLOUD              19-GIT               20-GRAPHQL          21-WAF
+21b-WAFBYPASS         22-NOSQLI            23-RACE             24-JWT
+25-XXE                26-CMDINJECT         27-SSPP             28-CACHED
+29-DEPCHECK           30-LFI               31-OPENREDIR        32-CLICKJACK
+33-CRLF               34-RATELIMIT         35-CORSADV          36-JWTADV
+37-FILEUPLOAD         38-SMUGGLE           38b-H2SMUGGLE       39-OAUTH
+40-PWRESET            41-WEBSOCKET         42-LDAP             43-DESERIAL
+44-CHAIN              45-EVIDENCE          46-BUCKET           47-CDN
+48-CONTENT            49-FRAMEWORKS        50-BUCKET-PERMS     51-HPP
+52-SERVERLESS         53-CSP               54-WS-FUZZ          55-CSV-INJECT
+56-EXPOSED-DB         57-DEFAULT-CREDS     58-HOST-INJECT      59-EMAIL-SEC
+60-SMTP-ENUM          61-OAUTH-ADV         62-LOG-INJECT       63-DOC-ATTACK
+64-IDEMPOTENCY        65-SESSION           66-SSRF-FULL        67-PATHNORM
+68-DEPCVE             69-DNSZT             70-PORTFULL         71-EMHARVEST
+72-ACCOUNTENUM        73-CSPBYPASS         74-GHTOOLS          75-MOBILEAPI
+76-WORKFLOW           77-CACHEKEY          78-FILEUPLOADADV    79-SECRETDIFF
+80-STOREXSS           81-IDORFUZZ          82-OAUTHDEEP        83-RACEBURST
+84-WHOIS              85-ASN               86-DORK             87-SHODAN
+88-EMPLOYEE           89-PASSIVEDNS        90-CSRF             91-SESSIONFIX
+92-SAML               93-PWDSPRAY          94-COOKIEAUDIT      95-POSTTEST
+96-METHODOVERRIDE     97-FORCEDBROWSE      98-CASEBYPASS       99-APIPAGE
+99a-TABNAB            99b-APIKEYLEAK       99c-REDIRABUSE      99d-LOGTRIGGER
+99e-XSSSTORED         99f-HOSTABUSE        99g-AUTHBYPASSADV   100-SSI
+101-JSONINJECT        102-NULLBYTE         103-DOUBLEENCOD     104-UNICODE
+105-POSTMSGXSS        106-JSONP            107-SRI             108-MIXEDCONTENT
+109-HSTSPRELOAD       110-THIRDPARTYJS     111-BROWSERSTORAGE  112-RFI
+113-WEBDAV            114-SNMP             115-BANNER          116-PHPINFO
+117-SRVSTATUS         118-ERRORLEAK        119-WILDCARDDNS     120-DNSREBIND
+121-IISASPNET         122-TOMCAT           123-NODEJS          124-LARAVEL
+125-DJANGO            126-SYMFONY          127-CICD            128-DOCKER
+129-K8S               130-TERRAFORM        131-ENVDEEP         132-GQLABUSE
+133-APIVERSION        134-LBDETECT         135-VHOST           136-RATELIMITBYPASS
+```
 
-00-SCOPE, 01-RECON, 02-RESOLVE, 03-PERMUTE, 04-SCAN, 04b-TAKEOVER-VALIDATE, 05-HARVEST, 05b-APISPEC, 06-JSINTEL, 07-PARAMS, 15-SECRETS
+## Integrated Tools (45+)
 
-### Fuzzing (08, 21, 54)
+**Go:** subfinder, alterx, dnsx, naabu, httpx, nuclei, gau, gospider, katana, subjs, ffuf, dalfox, interactsh-client, kxss, gitleaks, httprobe, trufflehog, unfurl, qsreplace, Gxss, cdncheck, puredns, gowitness, cloudfox, crlfuzz
 
-08-FUZZ, 21-WAF, 21b-WAFBYPASS, 54-WS-FUZZ
-
-### Vulnerability Scan (09–14, 18–20, 68, 71)
-
-09-VULNSCAN, 10-TLSCMS, 11-INJECT, 11a-DOMXSS, 11b-SQLMAP, 12-SSTI, 13-OOB, 14-ORIGIN, 18-CLOUD, 19-GIT, 20-GRAPHQL, 68-DEPCVE, 71-EMHARVEST
-
-### Auth / Session (16a, 16b, 17, 17b, 24, 36, 39, 40, 61, 65)
-
-16a-AUTHZ, 16b-MASSASSIGN, 17-IDOR, 17b-SSRFMETA, 24-JWT, 36-JWTADV, 39-OAUTH, 40-PWRESET, 61-OAUTH-ADV, 65-SESSION
-
-### Injection (22, 25–27, 42, 43, 67)
-
-22-NOSQLI, 25-XXE, 26-CMDINJECT, 27-SSPP, 42-LDAP, 43-DESERIAL, 67-PATHNORM
-
-### Client-Side (28, 30–35, 37, 73, 80)
-
-28-CACHED, 30-LFI, 31-OPENREDIR, 32-CLICKJACK, 33-CRLF, 35-CORSADV, 37-FILEUPLOAD, 73-CSPBYPASS, 80-STOREXSS
-
-### Smuggling / Race (23, 38, 38b, 41, 83)
-
-23-RACE, 34-RATELIMIT, 38-SMUGGLE, 38b-H2SMUGGLE, 41-WEBSOCKET, 83-RACEBURST
-
-### Infrastructure (29, 44–53, 55–60, 62–64, 66, 69–70, 72, 74–79, 81–82)
-
-29-DEPCHECK, 44-CHAIN, 45-EVIDENCE, 46-BUCKET, 47-CDN, 48-CONTENT, 49-FRAMEWORKS, 50-BUCKET-PERMS, 51-HPP, 52-SERVERLESS, 53-CSP, 55-CSV-INJECT, 56-EXPOSED-DB, 57-DEFAULT-CREDS, 58-HOST-INJECT, 59-EMAIL-SEC, 60-SMTP-ENUM, 62-LOG-INJECT, 63-DOC-ATTACK, 64-IDEMPOTENCY, 66-SSRF-FULL, 69-DNSZT, 70-PORTFULL, 72-ACCOUNTENUM, 74-GHTOOLS, 75-MOBILEAPI, 76-WORKFLOW, 77-CACHEKEY, 78-FILEUPLOADADV, 79-SECRETDIFF, 81-IDORFUZZ, 82-OAUTHDEEP
-
-### OSINT (84–89)
-
-84-WHOIS, 85-ASN, 86-DORK, 87-SHODAN, 88-EMPLOYEE, 89-PASSIVEDNS
-
-### Auth Bypass (90–99g)
-
-90-CSRF, 91-SESSIONFIX, 92-SAML, 93-PWDSPRAY, 94-COOKIEAUDIT, 95-POSTTEST, 96-METHODOVERRIDE, 97-FORCEDBROWSE, 98-CASEBYPASS, 99-APIPAGE, 99a-TABNAB, 99b-APIKEYLEAK, 99c-REDIRABUSE, 99d-LOGTRIGGER, 99e-XSSSTORED, 99f-HOSTABUSE, 99g-AUTHBYPASSADV
-
-### Encoding / Bypass (100–106)
-
-100-SSI, 101-JSONINJECT, 102-NULLBYTE, 103-DOUBLEENCOD, 104-UNICODE, 105-POSTMSGXSS, 106-JSONP
-
-### Third-Party / Headers (107–111)
-
-107-SRI, 108-MIXEDCONTENT, 109-HSTSPRELOAD, 110-THIRDPARTYJS, 111-BROWSERSTORAGE
-
-### Network / Infra (112–120)
-
-112-RFI, 113-WEBDAV, 114-SNMP, 115-BANNER, 116-PHPINFO, 117-SRVSTATUS, 118-ERRORLEAK, 119-WILDCARDDNS, 120-DNSREBIND
-
-### CMS / Framework (121–126, 131–132)
-
-121-IISASPNET, 122-TOMCAT, 123-NODEJS, 124-LARAVEL, 125-DJANGO, 126-SYMFONY, 131-ENVDEEP, 132-GQLABUSE
-
-### Cloud / DevOps (127–130, 133–136)
-
-127-CICD, 128-DOCKER, 129-K8S, 130-TERRAFORM, 133-APIVERSION, 134-LBDETECT, 135-VHOST, 136-RATELIMITBYPASS
-
-## Tools (45+)
-
-**Go:** subfinder, amass, alterx, dnsx, naabu, httpx, nuclei, gau, gospider, katana, subjs, ffuf, dalfox, interactsh-client, kxss, gitleaks, httprobe, trufflehog, unfurl, qsreplace, Gxss, cdncheck, puredns, gowitness, cloudfox, crlfuzz
+**Rust:** findomain (CT logs + 14 APIs, DNS, port scan, monitoring)
 
 **Python:** dnsgen, waymore, xnLinkFinder, SecretFinder, wafw00f, inql, cloud_enum, clairvoyance, graphinder, arjun, jsubfinder, corsy, jwt_tool, ssmrfy, commix, wpscan, sqlmap
 
-**System:** nmap, massdns, testssl.sh, nuclei-headless, feroxbuster (cargo)
+**System:** nmap, massdns, testssl.sh, feroxbuster
 
-## DoS-Sensitive Phases
+## Configuration
 
-The following phases are disabled by default with `--no-dos`:
+Place `reconchain.cfg` in the project root or `~/.config/reconchain/`:
 
-20-GRAPHQL, 23-RACE, 34-RATELIMIT, 38-SMUGGLE, 38b-H2SMUGGLE, 54-WS-FUZZ, 83-RACEBURST, 93-PWDSPRAY, 132-GQLABUSE, 136-RATELIMITBYPASS
+```ini
+[general]
+# proxy = socks5://127.0.0.1:9050
+# delay = 0.0
+# rate_limit = 0
+# parallel_jobs = 4
 
-## Safety
+[scan]
+dos_mode = false
+sqlmap_level = 1
+sqlmap_risk = 1
 
-- **Per-tool resource caps**: RLIMIT_AS (8 GB), RLIMIT_NPROC (2048), RLIMIT_FSIZE (512 MB) via `preexec_fn`
-- **Global process counter**: Hard cap on total concurrent subprocesses (auto-scales with CPU, caps at 12)
-- **Adaptive resource monitor**: Auto-tunes concurrency based on real-time CPU/RAM usage; scales down when thresholds are exceeded
-- **Emergency kill**: Terminates the pipeline immediately if free RAM drops below 500 MB
-- **Emergency resume**: Restarts the pipeline when free RAM recovers above 1.5 GB
-- **Circuit breaker**: Pauses all phases after 3 consecutive subprocess failures
-- **Phase timeout**: Individual phases are killed after 7200s (2h) to prevent infinite hangs
-- **Safe mode**: `--safe` flag applies conservative settings (start=1, max=4, max_procs=2, CPU threshold=60%, RAM threshold=2GB, reduced sample sizes, serial tool execution)
-- **Rate limiting**: Per-tool rate limits via `--rate-limit` and `--delay`
+[api]
+# shodan_key = ""
+# whoisxml_key = ""
+# projectdiscovery_key = ""
+# github_tokens = ["ghp_xxx"]
 
-## Output
+[notify]
+# slack_webhook = ""
+# discord_webhook = ""
+
+[ai]
+# provider = ollama
+# model = llama3
+# api_key = ""
+```
+
+## Output Structure
 
 ```
 out/example.com/
-├── summary.json / summary.txt / report.html / report.md / results.sarif
-├── hosts.txt urls_all.txt nuclei_combined.txt
-├── evidence/             # Auto-generated PoCs
-├── screenshots/          # Gowitness browser screenshots
-├── logs/                 # Raw tool output
-└── state.json            # Resume state
+├── summary.json / summary.txt
+├── report.html / report.md
+├── results.sarif / results.faraday.json
+├── attack_surface.html / attack_surface.json
+├── exploit_chains.json
+├── classified_vulns.json
+├── threat_intel_report.json
+├── compliance_pci_dss.json
+├── risk_score.json / confidence_scores.json
+├── state.json                    # Resume state
+├── evidence/                     # Auto-generated PoCs
+├── screenshots/                  # Gowitness screenshots
+├── oast/                         # OOB interaction callbacks
+├── logs/                         # Raw tool output
+└── *.txt                         # Per-artifact finding files
+```
+
+## Safety
+
+- **Per-tool resource caps**: RLIMIT_AS (8 GB), RLIMIT_NPROC (2048), RLIMIT_FSIZE (512 MB)
+- **Global process counter**: auto-scales with CPU, caps at 12 concurrent subprocesses
+- **Adaptive monitor**: auto-tunes concurrency; emergency kill at 500 MB RAM, resume at 1.5 GB
+- **Circuit breaker**: pauses after 3 consecutive subprocess failures
+- **Phase timeout**: 7200s per phase
+- **Safe mode** (`--safe`): start=1, max=4, max_procs=2, CPU threshold=60%, RAM threshold=2 GB
+- **Rate limiting**: per-tool via `--rate-limit`, global via `--delay`
+- **Credential encryption**: Fernet (AES-128-CBC + HMAC-SHA256) with machine-derived keys
+- **Input sanitization**: domain validation, output path confinement, batch file filtering
+- **Audit logging**: structured JSONL audit trail
+
+## Architecture
+
+```
+reconchain/
+├── cli/                    # banner.py, parser.py (170+ flags), wizard.py (997 lines), helpers.py
+├── phases/                 # 164 phase implementations
+│   └── recon/              # 8 recon sub-modules
+├── config.py               # PipelineConfig (130+ fields), phase definitions
+├── pipeline.py             # DAG executor (1137 lines)
+├── process.py              # Subprocess management, circuit breaker
+├── api.py                  # REST API (stdlib http.server)
+├── reporting.py            # HTML, Markdown, JSON, SARIF, Faraday reports
+├── exploit_chain.py        # Attack path graph analysis
+├── threat_intel.py         # MITRE ATT&CK mapping (20 techniques, 7 tactics)
+├── compliance.py           # PCI DSS / HIPAA / SOC 2 reporting
+├── ai.py / ai_triage.py    # LLM providers + vulnerability triage
+├── ml_phase_selector.py    # Rule-based phase prioritization
+├── ml_vuln.py              # 24-signature vulnerability classification
+├── collaborative.py        # Team workspace with multi-scanner dedup
+├── marketplace.py          # Plugin marketplace client
+├── plugin.py               # Plugin/extension system
+├── resource_monitor.py     # Adaptive CPU/RAM monitor
+├── bot.py                  # Discord/Slack companion bot
+├── dashboard_server.py     # SSE live web dashboard
+├── tui.py                  # Terminal UI dashboard
+├── distributed.py          # SSH-based distributed scanning
+├── dedup.py                # Cross-phase fuzzy deduplication
+├── credentials.py          # Encrypted credential storage (Fernet)
+├── audit.py                # Structured JSONL audit logging
+├── events.py               # In-process event bus (pub/sub)
+├── notify.py               # Slack/Discord/Telegram notifications
+├── interactsh.py           # OOB interaction tracking
+├── poc.py                  # Auto-PoC generation
+├── target_profile.py       # Target profiling + auto-tuning
+├── artifacts.py            # 164-phase artifact registry
+├── severity.py             # Risk scoring (A-F)
+├── confidence.py           # Confidence scoring
+├── remediation.py          # CWE-to-fix mappings (25 types)
+├── exceptions.py           # 28-class exception hierarchy
+└── utils.py                # Logging, DNS, HTTP, file I/O
+```
+
+## Compliance Reporting
+
+```bash
+reconchain -d example.com --compliance pci_dss      # PCI DSS v4.0 (8 controls)
+reconchain -d example.com --compliance hipaa,soc2   # HIPAA + SOC 2
+```
+
+## Threat Intelligence
+
+```bash
+reconchain -d example.com --threat-intel
+reconchain -d example.com --threat-intel --threat-intel-feeds feeds.json
+```
+
+MITRE ATT&CK coverage: 20 techniques across Initial Access, Execution, Defense Evasion, Credential Access, Lateral Movement, Exfiltration, and Impact.
+
+## REST API
+
+```bash
+reconchain -d example.com --api-port 8080
+
+GET  /api/v1/health              # Health check
+GET  /api/v1/summary             # Scan summary
+GET  /api/v1/findings            # List findings (filterable)
+GET  /api/v1/coverage            # Phase coverage metrics
+GET  /api/v1/artifacts           # Artifact registry
+GET  /api/v1/openapi.json        # OpenAPI 3.0 spec
+```
+
+## Documentation
+
+| Document | Description |
+|----------|-------------|
+| [Architecture](docs/architecture.md) | Module structure, pipeline flow, data flow |
+| [REST API](docs/api.md) | API endpoints, security, programmatic usage |
+| [Plugins](docs/plugins.md) | Custom phase development guide |
+| [Events](docs/events.md) | Event bus reference for real-time streaming |
+| [Contributing](docs/contributing.md) | Development setup, code style, PR process |
+
+## Development
+
+```bash
+pip install -e '.[dev]'
+pytest tests/          # Run tests
+ruff check reconchain/ # Lint
+mypy reconchain/       # Type check
 ```
 
 ## License

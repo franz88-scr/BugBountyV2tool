@@ -1,7 +1,57 @@
-# ReconChain package
+"""ReconChain -- bug bounty reconnaissance pipeline orchestrator.
+
+ReconChain chains 43+ security tools across 164+ phases to perform
+comprehensive, automated reconnaissance and vulnerability assessment.
+
+Quick start::
+
+    from reconchain import run_pipeline, PipelineConfig
+    import asyncio, argparse
+
+    # Create a minimal args namespace and run
+    args = argparse.Namespace(domain="example.com", out="./out/example.com", ...)
+    asyncio.run(run_pipeline(args))
+
+For CLI usage::
+
+    reconchain -d example.com
+    reconchain -d example.com --fast
+    reconchain -i          # interactive wizard
+"""
 from __future__ import annotations
 
 import re as _re
+
+from reconchain.exceptions import (
+    ReconChainError as ReconChainError,
+    ConfigError as ConfigError,
+    InvalidDomainError as InvalidDomainError,
+    InvalidPhaseError as InvalidPhaseError,
+    InvalidCookieError as InvalidCookieError,
+    PipelineError as PipelineError,
+    OutputPathError as OutputPathError,
+    InsufficientResourcesError as InsufficientResourcesError,
+    PhaseTimeoutError as PhaseTimeoutError,
+    PhaseCrashError as PhaseCrashError,
+    ToolError as ToolError,
+    ToolNotFoundError as ToolNotFoundError,
+    ToolExecutionError as ToolExecutionError,
+    ToolTimeoutError as ToolTimeoutError,
+    CircuitBreakerOpenError as CircuitBreakerOpenError,
+    NetworkError as NetworkError,
+    ProxyError as ProxyError,
+    HTTP2NotSupportedError as HTTP2NotSupportedError,
+    InteractshError as InteractshError,
+    PluginError as PluginError,
+    PluginLoadError as PluginLoadError,
+    ReportError as ReportError,
+    StateWriteError as StateWriteError,
+    ReportGenerationError as ReportGenerationError,
+    IntegrationError as IntegrationError,
+    AIAnalysisError as AIAnalysisError,
+    BotError as BotError,
+    DashboardError as DashboardError,
+)
 
 from reconchain.ai import (
     LLMProvider,
@@ -64,6 +114,7 @@ from reconchain.finding import Finding, FindingStore, finding_from_text
 from reconchain.remediation import get_remediation, get_all_remediations, get_remediation_text, has_remediation
 from reconchain.ratelimiter import GlobalRateLimiter, TokenBucket, configure_rate_limiter, get_rate_limiter
 from reconchain.api import start_api_server, stop_api_server
+from reconchain.audit import log_event as audit_log_event, init_audit_log, enable as audit_enable, disable as audit_disable
 from reconchain.phases import (
     _AUTH_BYPASS_HEADERS,
     _JS_SECRET_PATTERNS,
@@ -331,40 +382,26 @@ from reconchain.utils import (
 )
 
 __all__ = [
-    "__version__", "VALID_PHASES", "FAST_PHASES", "QUICK_SKIP_PHASES", "DOS_PHASES", "PhaseSet",
-    "PIPELINE", "_PHASE_WEIGHTS", "PHASE_DEPS", "STAGES", "PipelineConfig",
-    "_parse_semver", "_semver_lt",
-    "_JS_SECRET_PATTERNS", "_SOURCE_MAP_RE",
-    "_AUTH_BYPASS_HEADERS", "_MASS_ASSIGN_FIELDS", "_re",
-    "_RECON_LEVELS", "_HOSTNAME_RE", "_SAFE_HOST",
-    "_is_valid_hostname", "_is_under_domain", "_target_token",
-    "_target_lines", "_write_target_tokens",
-    "write_findings", "_load_live_hosts",
-    "_color", "C", "LVL", "disable_color", "log",
-    "_auto_detect_proxy", "_set_proxy_env", "_auto_detect_cookies",
-    "_extra_headers_dict", "_extra_http_args", "_get_urlopener",
-    "_get_no_redirect_urlopener", "_NoRedirectHandler",
-    "_async_urlopen", "_async_urlopen_no_redirect",
-    "_throttle", "_throttle_rate", "_throttle_sync",
-    "ensure", "_existing_artifacts", "read_lines", "iter_lines",
-    "count_nonblank", "merge_unique", "merge_unique_str", "_downsample_file",
-    "safe_suffix", "_safe_name", "read_jsonl",
-    "_extract_urls_from_ffuf_json", "_merge_dnsx_output",
-    "_dedupe_by_host_path", "_dedupe_by_host_params",
-    "html_escape", "md_escape", "_parse_httpx_tech",
-    "_mmh3_hash", "Progress", "ScanStatus",
-    "Tools",
-    "_run_blocking", "_run", "run_parallel",
-    "_needs_proxychains", "StepResult",
-    "_wait_proc", "_kill_proc", "_cleanup_child_procs", "_register_proc",
-    "_maybe_timeout", "_update_nuclei_templates",
-    "_atomic_write_json", "_parse_phase_csv", "_domain_arg", "_csv_from_phases",
-    "MAX_PARALLEL_JOBS", "_USE_PROXYCHAINS",
-    "_SPAWNED_PIDS", "_SPAWNED_PIDS_LOCK",
-    "_JOB_SEM", "_PIPELINE_CFG", "_TOOL_RC_REGISTRY",
-    "Interactsh",
-    "_counts", "write_summary", "write_html",
-    "write_full_summary", "write_markdown",
+    # ── Core ─────────────────────────────────────────────────────────
+    "__version__", "PipelineConfig",
+    "VALID_PHASES", "FAST_PHASES", "QUICK_SKIP_PHASES", "DOS_PHASES", "PhaseSet",
+    "PIPELINE", "PHASE_DEPS", "STAGES",
+
+    # ── Utilities (public) ───────────────────────────────────────────
+    "C", "LVL", "log", "disable_color", "ensure", "safe_suffix",
+    "read_lines", "iter_lines", "count_nonblank", "read_jsonl",
+    "merge_unique", "merge_unique_str",
+    "html_escape", "md_escape", "write_findings",
+    "Progress", "ScanStatus",
+
+    # ── Process / tools ──────────────────────────────────────────────
+    "Tools", "StepResult", "run_parallel", "MAX_PARALLEL_JOBS",
+
+    # ── Reporting ────────────────────────────────────────────────────
+    "write_summary", "write_html", "write_full_summary", "write_markdown",
+    "write_sarif", "write_faraday", "write_html_dashboard",
+
+    # ── Phase functions ──────────────────────────────────────────────
     "phase_00_SCOPE", "phase_01_RECON", "phase_02_RESOLVE",
     "phase_03_PERMUTE", "phase_04_SCAN", "phase_04b_TAKEOVER_VALIDATE",
     "phase_05_HARVEST", "phase_05b_APISPEC", "phase_06_JSINTEL",
@@ -409,44 +446,85 @@ __all__ = [
     "phase_109_HSTSPRELOAD", "phase_110_THIRDPARTYJS", "phase_111_BROWSERSTORAGE",
     "phase_112_RFI", "phase_113_WEBDAV", "phase_114_SNMP",
     "phase_115_BANNER", "phase_116_PHPINFO", "phase_117_SRVSTATUS",
-    "phase_118_ERRORLEAK", "phase_119_WILDCARDDNS",     "phase_120_DNSREBIND",
+    "phase_118_ERRORLEAK", "phase_119_WILDCARDDNS", "phase_120_DNSREBIND",
     "phase_121_IISASPNET", "phase_122_TOMCAT", "phase_123_NODEJS",
     "phase_124_LARAVEL", "phase_125_DJANGO", "phase_126_SYMFONY",
     "phase_127_CICD", "phase_128_DOCKER", "phase_129_K8S",
     "phase_130_TERRAFORM", "phase_131_ENVDEEP",
     "phase_132_GQLABUSE", "phase_133_APIVERSION", "phase_134_LBDETECT",
-     "phase_135_VHOST", "phase_136_RATELIMITBYPASS",
+    "phase_135_VHOST", "phase_136_RATELIMITBYPASS",
     "phase_137_EMAILFINDER", "phase_138_METAGOOFIL", "phase_139_PORCHPIRATE",
     "phase_140_DORKHUNTER", "phase_141_CRTSH", "phase_142_GITHUBSUB",
     "phase_143_TLSX", "phase_144_ANALYTICSRELS", "phase_145_FAVIRECON",
     "phase_146_JSLUICE", "phase_147_SHORTSCAN", "phase_148_GRPCURL",
+
+    # ── CLI ──────────────────────────────────────────────────────────
     "build_parser", "main", "InteractiveWizard",
+
+    # ── Pipeline / orchestration ─────────────────────────────────────
     "run_pipeline",
+
+    # ── Engines ──────────────────────────────────────────────────────
     "DedupEngine", "MonitorEngine", "RateLimiter", "UARotator",
+
+    # ── Config ───────────────────────────────────────────────────────
     "load_config", "apply_config_to_args", "find_config",
+
+    # ── Notifications ────────────────────────────────────────────────
     "send_notification", "send_scan_summary",
-    "write_sarif", "write_faraday", "write_html_dashboard",
-    "SSHScanner", "create_scanner_from_config",
-    # New v2.1
+
+    # ── Network ──────────────────────────────────────────────────────
+    "Interactsh", "SSHScanner", "create_scanner_from_config",
+
+    # ── Events / plugins ─────────────────────────────────────────────
     "bus", "Event", "EventBus",
     "PhasePlugin", "discover_plugins", "get_registry",
+
+    # ── AI ───────────────────────────────────────────────────────────
     "get_provider", "ai_complete", "ai_configure", "parse_json_response", "LLMProvider",
     "run_triage", "suggest_exploit_chains",
-    "build_graph", "write_attack_surface_html", "write_attack_surface_json",
     "analyze_exploit_chains",
+
+    # ── Attack surface / dashboard ───────────────────────────────────
+    "build_graph", "write_attack_surface_html", "write_attack_surface_json",
     "start_dashboard", "start_dashboard_thread",
+
+    # ── Bot ──────────────────────────────────────────────────────────
     "start_bot", "start_bot_thread",
-    # v3.0
+
+    # ── Artifacts ────────────────────────────────────────────────────
     "ARTIFACTS", "ARTIFACT_REGISTRY", "FILENAME_TO_ARTIFACT",
-    "get_counts", "get_findings_by_severity", "get_findings_for_triage", "get_report_files", "get_coverage", "guess_severity",
+    "get_counts", "get_findings_by_severity", "get_findings_for_triage",
+    "get_report_files", "get_coverage", "guess_severity",
+
+    # ── Target profiling ─────────────────────────────────────────────
     "TargetProfile", "build_target_profile", "save_profile", "load_profile",
+
+    # ── Confidence / PoC / risk ──────────────────────────────────────
     "Confidence", "score_finding", "score_all_findings", "write_confidence_report",
     "generate_pocs", "generate_all_pocs",
-    "get_tool_health_monitor", "ToolHealthMonitor",
     "RiskScore", "calculate_risk_score", "write_risk_score",
-    "BatchScan",
-    "ScanDiff", "compare_scans",
-    "TUIDashboard",
-    "FindingReview", "run_interactive_review",
+
+    # ── Tool health ──────────────────────────────────────────────────
+    "get_tool_health_monitor", "ToolHealthMonitor",
+
+    # ── Batch / compare ──────────────────────────────────────────────
+    "BatchScan", "ScanDiff", "compare_scans",
+
+    # ── TUI / review ─────────────────────────────────────────────────
+    "TUIDashboard", "FindingReview", "run_interactive_review",
+
+    # ── Learning ─────────────────────────────────────────────────────
     "LearningEngine",
+
+    # ── Exceptions (v3.1) ────────────────────────────────────────────
+    "ReconChainError", "ConfigError", "InvalidDomainError", "InvalidPhaseError",
+    "InvalidCookieError", "PipelineError", "OutputPathError", "InsufficientResourcesError",
+    "PhaseTimeoutError", "PhaseCrashError",
+    "ToolError", "ToolNotFoundError", "ToolExecutionError", "ToolTimeoutError",
+    "CircuitBreakerOpenError",
+    "NetworkError", "ProxyError", "HTTP2NotSupportedError", "InteractshError",
+    "PluginError", "PluginLoadError",
+    "ReportError", "StateWriteError", "ReportGenerationError",
+    "IntegrationError", "AIAnalysisError", "BotError", "DashboardError",
 ]

@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-ReconChain Monitor v3
-- Runs reconchain.py against brandenburg.cloud via Tor/proxychains4
-- Checks every 5 min (sleep 300) for errors/warnings/stuck
+ReconChain Monitor v4
+- Runs reconchain.py against brandenburg.cloud via Tor proxy
+- Checks every 2 min (sleep 120) for errors/warnings/stuck
 - Fixes missing tools, restarts failed phases via --resume
 - Reads ScanStatus from /run/user/1000/reconchain_status/ for real progress
 - Loops until scan is complete
@@ -16,11 +16,11 @@ DOMAIN = os.environ.get("RECON_DOMAIN", "brandenburg.cloud")
 if not re.match(r'^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$', DOMAIN):
     sys.exit(f"error: invalid domain {DOMAIN!r} (path traversal check)")
 WORKDIR = Path(os.environ.get("RECON_WORKDIR", str(Path(__file__).resolve().parent)))
-OUTDIR = WORKDIR / f"out_{DOMAIN}"
+OUTDIR = WORKDIR / "out" / DOMAIN
 STATE_FILE = OUTDIR / "state.json"
 SCAN_STATUS_DIR = Path(os.environ.get('XDG_RUNTIME_DIR', f'/run/user/{os.getuid()}')) / 'reconchain_status'
 SCAN_STATUS_FILE = SCAN_STATUS_DIR / f"{DOMAIN.replace('.', '_')}.json"
-CHECK_INTERVAL = 300
+CHECK_INTERVAL = 120
 MAX_IDLE = 3
 
 os.chdir(str(WORKDIR))
@@ -112,42 +112,8 @@ def main() -> int:
         "-d", DOMAIN, "-o", str(OUTDIR),
         "--proxy", "socks5://127.0.0.1:9050",
         "--proxy-timeout-multiplier", "2.0",
-        "--sample-urls-fuzz", "3",
-        "--sample-urls-params", "3",
-        "--sample-urls-cmdi", "2",
-        "--sample-hosts-ssl", "1",
-        "--sample-hosts-origin", "2",
-        "--sample-hosts-cloud", "1",
-        "--sample-hosts-git", "1",
-        "--sample-hosts-graphql", "1",
-        "--sample-hosts-waf", "1",
-        "--sample-urls-xss-blind", "3",
-        "--sample-urls-domxss", "3",
-        "--sample-urls-ssti", "2",
-        "--sample-urls-nosqli", "3",
-        "--sample-endpoints-race", "2",
-        "--sample-hosts-jwt", "3",
-        "--sample-urls-xxe", "2",
-        "--sample-urls-redirect", "3",
-        "--sample-hosts-ratelimit", "2",
-        "--sample-urls-ldap", "2",
-        "--sample-urls-crlf", "3",
-        "--sample-urls-upload", "2",
-        "--sample-hosts-smuggle", "2",
-        "--sample-hosts-h2smuggle", "2",
-        "--sample-hosts-frameworks", "3",
-        "--sample-hosts-cached", "2",
-        "--sample-urls-depcheck", "3",
-        "--sample-hosts-clickjack", "3",
-        "--sample-endpoints-corsadv", "2",
-        "--sample-hosts-jwtadv", "3",
-        "--sample-endpoints-oauth", "2",
-        "--sample-endpoints-pwreset", "2",
-        "--sample-hosts-websocket", "2",
-        "--sample-endpoints-deserial", "2",
-        "--sample-endpoints-l", "3",
-        "--sample-endpoints-post", "2",
-        "--sample-endpoints-cors", "2",
+        "--dos",
+        "--sample-mode", "minimal",
     ]
 
     while attempt < max_attempts:
@@ -163,14 +129,18 @@ def main() -> int:
             proc = run_scan(args_run)
 
         idle = 0
-        prev_done: set = set()
+        prev_artifacts = 0
+        prev_failures: dict = {}
+        prev_state_mtime = 0.0
 
         while True:
             time.sleep(CHECK_INTERVAL)
 
             alive = proc.poll() is None
             status = read_status()
+            state = read_state()
 
+            # --- Status from ScanStatus or state.json ---
             if status:
                 done = set(status.get("completed_phases", []))
                 running = set(status.get("running_phases", []))
@@ -183,71 +153,93 @@ def main() -> int:
                     for e in errors[-3:]:
                         log(f"  Error: {e}")
 
-                # Fix missing tools
                 missing = status.get("missing_tools", [])
                 if missing:
                     fix_missing_tools(missing)
 
-                # Completion check
                 if not running and len(done) > 0:
                     if total != "?" and len(done) >= total:
                         log("=== SCAN COMPLETE ===")
                         return 0
-                    # If no running phases but not all done, might be between phases or stuck
-                    if not phase and attempt < 2:
-                        log("Initial setup phase, waiting...")
-                    else:
-                        log("No running phases — waiting for next phase to start")
+            elif state:
+                # Fallback: track progress via state.json artifact count
+                artifacts = state.get("artifacts", {})
+                n_artifacts = len([k for k in artifacts if k != "count" and k != "failures" and not isinstance(artifacts[k], dict)])
+                failures = state.get("tool_failures", {})
+                mtime = STATE_FILE.stat().st_mtime if STATE_FILE.exists() else 0
+                log(f"Alive={alive} | state.json: {n_artifacts} artifacts, {len(failures)} tool failures, mtime={datetime.fromtimestamp(mtime).strftime('%H:%M:%S')}")
 
-                # Stuck detection: no progress across multiple checks
-                if alive:
-                    if done == prev_done:
-                        # No new completions — also trigger if running phases are stalled
-                        if not running or (running and done == prev_done):
-                            idle += 1
-                            log(f"No progress {idle}/{MAX_IDLE}")
-                            if idle >= MAX_IDLE:
-                                log("Stuck — killing and restarting")
-                                try:
-                                    os.killpg(proc.pid, signal.SIGTERM)
-                                except (ProcessLookupError, OSError):
-                                    pass
-                                try:
-                                    proc.wait(timeout=10)
-                                except Exception:
-                                    try:
-                                        os.killpg(proc.pid, signal.SIGKILL)
-                                    except (ProcessLookupError, OSError):
-                                        pass
-                                    try:
-                                        proc.wait(timeout=5)
-                                    except Exception:
-                                        pass
-                                proc = None
-                                time.sleep(30)  # Minimum delay before restart
-                                break
-                    else:
-                        idle = 0
-                    prev_done = done
+                if failures:
+                    new_fails = {k: v for k, v in failures.items() if prev_failures.get(k, 0) < v}
+                    if new_fails:
+                        log(f"  New tool failures: {new_fails}")
+
+                prev_state_mtime = mtime
+                prev_artifacts = n_artifacts
+                prev_failures = failures
             else:
-                log("Waiting for ScanStatus file...")
-                # Also check if state.json exists
-                if STATE_FILE.exists():
-                    log("state.json exists but no ScanStatus yet")
-                idle = 0
+                log("No ScanStatus or state.json yet — scan initializing")
 
+            # --- Stuck detection: check output dir mtime, logs, and process ---
+            if alive:
+                # Check if any file in output dir was recently modified (within CHECK_INTERVAL)
+                outdir_changed = False
+                if OUTDIR.exists():
+                    try:
+                        latest_mtime = max(f.stat().st_mtime for f in OUTDIR.rglob("*") if f.is_file())
+                        outdir_changed = (time.time() - latest_mtime) < CHECK_INTERVAL
+                    except (ValueError, OSError):
+                        pass
+
+                # Check if any log file was recently written
+                logs_changed = False
+                log_dir = OUTDIR / "logs"
+                if log_dir.exists():
+                    try:
+                        latest_log = max(f.stat().st_mtime for f in log_dir.glob("*.log") if f.is_file())
+                        logs_changed = (time.time() - latest_log) < CHECK_INTERVAL
+                    except (ValueError, OSError):
+                        pass
+
+                if outdir_changed or logs_changed:
+                    idle = 0
+                    if outdir_changed:
+                        log("  Output dir active (files changing)")
+                    if logs_changed:
+                        log("  Logs active (recent writes)")
+                else:
+                    idle += 1
+                    log(f"No activity detected {idle}/{MAX_IDLE} (outdir_changed={outdir_changed}, logs_changed={logs_changed})")
+                    if idle >= MAX_IDLE:
+                        log("Stuck — killing and restarting")
+                        try:
+                            os.killpg(proc.pid, signal.SIGTERM)
+                        except (ProcessLookupError, OSError):
+                            pass
+                        try:
+                            proc.wait(timeout=10)
+                        except Exception:
+                            try:
+                                os.killpg(proc.pid, signal.SIGKILL)
+                            except (ProcessLookupError, OSError):
+                                pass
+                            try:
+                                proc.wait(timeout=5)
+                            except Exception:
+                                pass
+                        proc = None
+                        time.sleep(30)
+                        break
+
+            # --- Log scan output (tail of process stdout) ---
             check_logs()
 
+            # --- Process died ---
             if not alive:
                 rc = proc.poll()
                 log(f"Process died rc={rc}")
-                # Check if it actually completed
-                if status:
-                    done = set(status.get("completed_phases", []))
-                    total = status.get("total_phases", "?")
-                    if total != "?" and len(done) >= total:
-                        log("=== SCAN COMPLETE ===")
-                        return 0
+                if state:
+                    log(f"Last state: {len(state.get('artifacts', {}))} artifacts")
                 break
 
     log(f"Giving up after {max_attempts}")

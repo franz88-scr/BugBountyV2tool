@@ -1,4 +1,9 @@
-"""Subprocess management, job scheduling, and pipeline helpers."""
+"""Subprocess management, job scheduling, and pipeline helpers.
+
+Provides both synchronous (thread-pool based) and async-native execution
+paths for subprocess management, with adaptive concurrency control and
+circuit breaker protection.
+"""
 from __future__ import annotations
 import argparse
 import asyncio
@@ -92,6 +97,7 @@ def reset_globals() -> None:
     global _USE_PROXYCHAINS, _JOB_SEM, _PROXY_TIMEOUT_MULTIPLIER
     global _OS_PROC_ACTIVE, _OS_PROC_SEM
     global _CIRCUIT_BREAKER_FAILURES, _CIRCUIT_BREAKER_OPEN
+    global _PROXY_LOCK
     # BUG 18 FIX: Stop monitor FIRST before replacing semaphores
     # to prevent old monitor thread from resizing stale semaphore
     from reconchain.resource_monitor import reset_resource_monitor
@@ -104,6 +110,7 @@ def reset_globals() -> None:
     for _f in dataclasses.fields(_default):
         setattr(_PIPELINE_CFG, _f.name, getattr(_default, _f.name))
     _PROXY_TIMEOUT_MULTIPLIER = 1.5
+    _PROXY_LOCK = None
     _OS_PROC_ACTIVE = 0
     _OS_PROC_SEM = AdaptiveThreadSemaphore(MAX_OS_PROCS)
     _CIRCUIT_BREAKER_FAILURES = {}
@@ -121,7 +128,7 @@ def _set_child_limits() -> None:
 
     Caps max child processes and max file size to prevent a single tool from
     exhausting the host's resources.  RLIMIT_AS is intentionally NOT set
-    because Go binaries (amass, subfinder, etc.) allocate large *virtual*
+    because Go binaries (subfinder, dnsx, etc.) allocate large *virtual*
     address spaces (>2 GB) while only using a fraction as RSS (~400 MB).
     Capping RLIMIT_AS kills Go processes with exit code 2.  Actual RAM
     pressure is handled by the ResourceMonitor's RSS-based circuit breaker.
@@ -132,13 +139,9 @@ def _set_child_limits() -> None:
         _nproc = min(_nproc, 512)
         _fsize = min(_fsize, 128 * 1024 * 1024)       # 128 MB
     # NOTE: RLIMIT_AS is intentionally NOT set for safe mode.
-    # Go binaries (amass, subfinder, etc.) need >2 GB virtual address space
+    # Go binaries (subfinder, dnsx, etc.) need >2 GB virtual address space
     # but only use ~400 MB RSS.  Capping RLIMIT_AS kills them with exit code 2.
     # RAM pressure is handled by ResourceMonitor's RSS-based circuit breaker.
-    try:
-        resource.setrlimit(resource.RLIMIT_NPROC, (_nproc, _nproc))
-    except (ValueError, OSError):
-        pass
     try:
         resource.setrlimit(resource.RLIMIT_NPROC, (_nproc, _nproc))
     except (ValueError, OSError):
@@ -180,6 +183,8 @@ async def _run_limited(cmd: List[str], *, stdout: int = asyncio.subprocess.DEVNU
         preexec_fn=_set_child_limits,
         env=env,
     )
+    with _SPAWNED_PIDS_LOCK:
+        _SPAWNED_PIDS.append(proc.pid)
     try:
         stdout_b, stderr_b = await asyncio.wait_for(proc.communicate(), timeout=timeout)
         return proc.returncode or 0, stdout_b or b"", stderr_b or b""
@@ -196,6 +201,12 @@ async def _run_limited(cmd: List[str], *, stdout: int = asyncio.subprocess.DEVNU
             except (ProcessLookupError, PermissionError, OSError):
                 pass
         return -1, b"", b""
+    finally:
+        with _SPAWNED_PIDS_LOCK:
+            try:
+                _SPAWNED_PIDS.remove(proc.pid)
+            except ValueError:
+                pass
 
 
 def _needs_proxychains(cmd: List[str], *, proxychains: Optional[bool] = None) -> bool:
@@ -236,7 +247,7 @@ def _proxify_cmd(cmd: List[str]) -> List[str]:
 _PROXY_VARS = ["ALL_PROXY", "all_proxy", "HTTPS_PROXY", "https_proxy",
                "HTTP_PROXY", "http_proxy", "PROXY"]
 
-_DNS_TOOLS = {"massdns", "dnsx", "puredns", "dig", "nslookup", "host", "subfinder", "amass"}
+_DNS_TOOLS = {"massdns", "dnsx", "puredns", "dig", "nslookup", "host", "subfinder", "findomain"}
 _RAW_TOOLS = {"nmap", "naabu"}
 
 def _bypass_proxy(cmd: List[str]) -> bool:
@@ -249,7 +260,7 @@ def _bypass_proxy(cmd: List[str]) -> bool:
         return False
     if cmd[0] in _DNS_TOOLS | _RAW_TOOLS:
         return True
-    # Bash wrappers of DNS tools (e.g., amass.sh) should also bypass proxy
+    # Bash wrappers of DNS tools (e.g., findomain.sh) should also bypass proxy
     if cmd[0] == "bash" and len(cmd) > 1:
         script_name = Path(cmd[1]).stem.lower()
         for _t in _DNS_TOOLS | _RAW_TOOLS:
@@ -276,11 +287,10 @@ def _run_blocking(cmd: List[str], timeout: int, cwd: Optional[Path], log_path: P
     err_path = log_path.with_suffix(log_path.suffix + ".stderr")
 
     # Save and clear proxy env for DNS tools (Go tools like dnsx respect ALL_PROXY natively)
-    _saved_proxy: Dict[str, Optional[str]] = {}
+    # Instead of mutating os.environ (race-prone), pass a clean env to the subprocess.
+    _subprocess_env: Optional[Dict[str, str]] = None
     if _bypass_proxy(cmd):
-        with _ENV_LOCK:
-            for v in _PROXY_VARS:
-                _saved_proxy[v] = os.environ.pop(v, None)
+        _subprocess_env = {k: v for k, v in os.environ.items() if k not in _PROXY_VARS}
 
     # Block until we're within the hard OS process cap
     # BUG 14 FIX: Add timeout to prevent thread pool exhaustion
@@ -301,6 +311,7 @@ def _run_blocking(cmd: List[str], timeout: int, cwd: Optional[Path], log_path: P
                     stderr=errf,
                     start_new_session=True,
                     preexec_fn=_set_child_limits,
+                    env=_subprocess_env,
                 )
                 _register_proc(proc)
                 if not _wait_proc(proc, timeout):
@@ -325,15 +336,9 @@ def _run_blocking(cmd: List[str], timeout: int, cwd: Optional[Path], log_path: P
         with _OS_PROC_ACTIVE_LOCK:
             _OS_PROC_ACTIVE = max(0, _OS_PROC_ACTIVE - 1)
         _OS_PROC_SEM.release()
-        # Restore proxy env vars after DNS tool completes
-        if _saved_proxy:
-            with _ENV_LOCK:
-                for v, val in _saved_proxy.items():
-                    if val is not None:
-                        os.environ[v] = val
 
 
-async def _run(name: str, cmd: List[str], timeout: int, outdir: Path, note: str = "", quiet: bool = False) -> StepResult:
+async def _run(name: str, cmd: List[str], timeout: int, outdir: Path, note: str = "", quiet: bool = False, max_retries: int = 0) -> StepResult:
     # Circuit breaker: skip tools that have failed too many times
     tool_name = cmd[0] if cmd else ""
     with _CIRCUIT_BREAKER_LOCK:
@@ -347,7 +352,16 @@ async def _run(name: str, cmd: List[str], timeout: int, outdir: Path, note: str 
         return StepResult(name, [], 0, 0.0, outdir / "logs" / f"{name}.log", note=note or "skipped")
     logp = outdir / "logs" / f"{name}.log"
     if not quiet:
-        log("info", f"{name}  $ {cmd[0]} {(' '.join(cmd[1:3]))}{' ...' if len(cmd) > 3 else ''}")
+        _log_args = cmd[:1]
+        for a in cmd[1:3]:
+            lower_a = a.lower()
+            if any(kw in lower_a for kw in ("cookie", "authorization", "bearer", "x-api-key", "x-auth")):
+                _log_args.append("***")
+            else:
+                _log_args.append(a)
+        if len(cmd) > 3:
+            _log_args.append("...")
+        log("info", f"{name}  $ {' '.join(_log_args)}")
 
     async def _exec() -> StepResult:
         rc, dur = await asyncio.to_thread(_run_blocking, cmd, timeout, outdir, logp)
@@ -367,13 +381,31 @@ async def _run(name: str, cmd: List[str], timeout: int, outdir: Path, note: str 
                         log("warn", f"Circuit breaker OPEN for {tool_name}: {_CIRCUIT_BREAKER_FAILURES[tool_name]} consecutive failures — skipping for rest of scan")
                 else:
                     _CIRCUIT_BREAKER_FAILURES[tool_name] = 0
+                    if tool_name in _CIRCUIT_BREAKER_OPEN:
+                        _CIRCUIT_BREAKER_OPEN.discard(tool_name)
+                        log("info", f"Circuit breaker CLOSED for {tool_name} after successful run")
         return StepResult(name, cmd, rc, dur, logp, note=note)
 
     sem = _JOB_SEM
     if sem is not None:
         async with sem:
-            return await _exec()
-    return await _exec()
+            result = await _exec()
+            # v3.0: Retry logic for transient failures (rc != 0, not timeout/signal)
+            if max_retries > 0 and result.rc not in (0, None, 124, 127) and result.rc > 0:
+                for _attempt in range(max_retries):
+                    log("info", f"{name}: retry {_attempt + 1}/{max_retries} (last rc={result.rc})")
+                    result = await _exec()
+                    if result.rc in (0, 1, 2, None):
+                        break
+            return result
+    result = await _exec()
+    if max_retries > 0 and result.rc not in (0, None, 124, 127) and result.rc > 0:
+        for _attempt in range(max_retries):
+            log("info", f"{name}: retry {_attempt + 1}/{max_retries} (last rc={result.rc})")
+            result = await _exec()
+            if result.rc in (0, 1, 2, None):
+                break
+    return result
 
 
 def _wait_proc(proc: subprocess.Popen, timeout: int) -> bool:
@@ -621,3 +653,147 @@ def _csv_from_phases(value: object) -> Set[str]:
     if isinstance(value, str):
         return _parse_phase_csv(value)
     return set()
+
+
+# ── Async-native job scheduler ──────────────────────────────────────
+
+
+class AsyncJobScheduler:
+    """Async-native job scheduler with adaptive concurrency and backpressure.
+
+    Unlike the thread-pool based run_parallel(), this scheduler uses native
+    asyncio semaphores and subprocess management for lower overhead and
+    better integration with async pipeline phases.
+
+    Features:
+    - Adaptive concurrency: scales workers based on system load
+    - Backpressure: blocks producers when queue is full
+    - Circuit breaker integration: skips repeatedly-failing tools
+    - Memory-aware: reduces concurrency under memory pressure
+    """
+
+    def __init__(
+        self,
+        *,
+        max_concurrent: int = 0,
+        max_queue_size: int = 64,
+        adaptive: bool = True,
+    ) -> None:
+        if max_concurrent <= 0:
+            max_concurrent = max(4, os.cpu_count() or 4)
+        self._base_concurrency = max_concurrent
+        self._max_concurrent = max_concurrent
+        self._semaphore: Optional[asyncio.Semaphore] = None
+        self._queue_size = max_queue_size
+        self._adaptive = adaptive
+        self._active_tasks: int = 0
+        self._completed: int = 0
+        self._failed: int = 0
+        self._start_time: float = 0.0
+        self._memory_pressure: bool = False
+
+    def _ensure_semaphore(self) -> asyncio.Semaphore:
+        if self._semaphore is None:
+            self._semaphore = asyncio.Semaphore(self._max_concurrent)
+        return self._semaphore
+
+    def _check_memory_pressure(self) -> None:
+        """Reduce concurrency if system is under memory pressure."""
+        if not self._adaptive:
+            return
+        try:
+            import psutil
+            mem = psutil.virtual_memory()
+            if mem.percent > 85 and not self._memory_pressure:
+                self._memory_pressure = True
+                new_max = max(2, self._max_concurrent // 2)
+                log("warn", f"AsyncJobScheduler: memory pressure ({mem.percent}%), "
+                    f"reducing concurrency {self._max_concurrent} → {new_max}")
+                self._max_concurrent = new_max
+                # Note: semaphore cannot be resized; new jobs will use the old limit
+            elif mem.percent < 70 and self._memory_pressure:
+                self._memory_pressure = False
+                self._max_concurrent = self._base_concurrency
+                log("info", f"AsyncJobScheduler: memory recovered ({mem.percent}%), "
+                    f"concurrency restored to {self._max_concurrent}")
+        except ImportError:
+            pass
+
+    async def run_job(
+        self,
+        name: str,
+        cmd: List[str],
+        timeout: int,
+        outdir: Path,
+        *,
+        note: str = "",
+        quiet: bool = False,
+        max_retries: int = 0,
+    ) -> StepResult:
+        """Run a single job with semaphore-controlled concurrency."""
+        sem = self._ensure_semaphore()
+        self._check_memory_pressure()
+
+        async with sem:
+            self._active_tasks += 1
+            try:
+                result = await _run(
+                    name, cmd, timeout, outdir,
+                    note=note, quiet=quiet, max_retries=max_retries,
+                )
+                if result.rc in (0, 1, 2, None):
+                    self._completed += 1
+                else:
+                    self._failed += 1
+                return result
+            finally:
+                self._active_tasks -= 1
+
+    async def run_batch(
+        self,
+        jobs: List[Tuple[str, List[str], int]],
+        outdir: Path,
+        *,
+        desc: str = "jobs",
+        quiet: bool = False,
+    ) -> List[StepResult]:
+        """Run a batch of jobs with progress tracking and adaptive concurrency."""
+        self._start_time = time.monotonic()
+        self._completed = 0
+        self._failed = 0
+
+        pbar = tqdm(total=len(jobs), desc=desc, leave=False)
+
+        async def _tracked(name: str, cmd: List[str], timeout: int) -> StepResult:
+            result = await self.run_job(name, cmd, timeout, outdir, quiet=quiet)
+            pbar.update(1)
+            return result
+
+        try:
+            # Safe mode: serial execution
+            if _PIPELINE_CFG.safe_mode and len(jobs) > 1:
+                results: List[StepResult] = []
+                for n, c, t in jobs:
+                    results.append(await _tracked(n, c, t))
+                return results
+
+            # Normal mode: concurrent execution with gather
+            coros = [_tracked(n, c, t) for n, c, t in jobs]
+            return await asyncio.gather(*coros)
+        finally:
+            pbar.close()
+
+    @property
+    def stats(self) -> Dict[str, Any]:
+        """Return scheduler statistics."""
+        elapsed = time.monotonic() - self._start_time if self._start_time else 0.0
+        return {
+            "base_concurrency": self._base_concurrency,
+            "current_concurrency": self._max_concurrent,
+            "active_tasks": self._active_tasks,
+            "completed": self._completed,
+            "failed": self._failed,
+            "memory_pressure": self._memory_pressure,
+            "elapsed_seconds": round(elapsed, 2),
+            "throughput": round(self._completed / max(0.001, elapsed), 2),
+        }

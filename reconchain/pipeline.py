@@ -1,5 +1,6 @@
 """Pipeline executor: runs phases stage-by-stage with state management."""
 from __future__ import annotations
+
 import argparse
 import asyncio
 import atexit
@@ -7,54 +8,87 @@ import contextlib
 import inspect
 import json
 import os
-import sys
 import shutil
 import signal
 import socket
+import sys
 import threading
 import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Optional, Set
 
-from reconchain.config import PipelineConfig, FAST_PHASES, DOS_PHASES
+from reconchain.config import DOS_PHASES, FAST_PHASES, PipelineConfig
+from reconchain.dedup import DedupEngine
+from reconchain.events import bus
+from reconchain.interactsh import Interactsh
+from reconchain.monitor import MonitorEngine
 from reconchain.phases import (
-    PHASE_DEPS, PIPELINE as _PIPELINE,
+    PHASE_DEPS,
+)
+from reconchain.phases import (
+    PIPELINE as _PIPELINE,
 )
 from reconchain.process import (
     _TOOL_RC_REGISTRY,
-    _run, _cleanup_child_procs, _csv_from_phases,
-    _maybe_timeout, _atomic_write_json, _update_nuclei_templates,
-    _push_phase_proxy, _pop_phase_proxy, MAX_OS_PROCS,
+    MAX_OS_PROCS,
+    _atomic_write_json,
+    _cleanup_child_procs,
+    _csv_from_phases,
+    _maybe_timeout,
+    _pop_phase_proxy,
+    _push_phase_proxy,
+    _run,
+    _update_nuclei_templates,
 )
 from reconchain.reporting import (
-    _counts, _coverage, write_summary, write_html, write_markdown,
-    write_full_summary, write_sarif, write_faraday, write_html_dashboard,
+    _counts,
+    _coverage,
+    write_faraday,
+    write_full_summary,
+    write_html,
+    write_html_dashboard,
+    write_markdown,
+    write_sarif,
+    write_summary,
 )
-from reconchain.config import VALID_PHASES
+from reconchain.resource_monitor import (
+    AdaptiveSemaphore,
+    AdaptiveThreadSemaphore,
+    get_resource_monitor,
+)
 from reconchain.tools import Tools
 from reconchain.utils import (
-    Progress, ScanStatus, ensure, log, read_lines,
-    _auto_detect_cookies, _downsample_file, _validate_cookie,
+    Progress,
+    ScanStatus,
+    _auto_detect_cookies,
+    _downsample_file,
+    _validate_cookie,
+    ensure,
+    log,
+    read_lines,
 )
-from reconchain.interactsh import Interactsh
-from reconchain.dedup import DedupEngine
-from reconchain.monitor import MonitorEngine
 from reconchain.verify import filter_outputs
-from reconchain.resource_monitor import AdaptiveSemaphore, AdaptiveThreadSemaphore, ResourceMonitor, get_resource_monitor
 
 
 def _snapshot_findings(outdir: Path) -> Dict[str, Set[str]]:
-    """Snapshot all .txt files in outdir for incremental diff comparison."""
+    """Snapshot all .txt files in outdir for incremental diff comparison.
+
+    Uses streaming reads to avoid loading entire files into memory.
+    """
     snapshot: Dict[str, Set[str]] = {}
     for fp in outdir.glob("*.txt"):
         if fp.name.startswith("."):
             continue
-        lines = set()
-        for ln in fp.read_text(encoding="utf-8", errors="ignore").splitlines():
-            ln = ln.strip()
-            if ln and not ln.startswith("#"):
-                lines.add(ln)
+        lines: Set[str] = set()
+        try:
+            with fp.open(encoding="utf-8", errors="ignore") as f:
+                for ln in f:
+                    ln = ln.strip()
+                    if ln and not ln.startswith("#"):
+                        lines.add(ln)
+        except OSError:
+            continue
         if lines:
             snapshot[fp.name] = lines
     return snapshot
@@ -99,10 +133,11 @@ def _preflight_memory_check(safe_mode: bool = False) -> None:
         min_swap = 0.5
 
         if total_ram_gb < min_total:
+            from reconchain.exceptions import InsufficientResourcesError
             msg = (f"System has only {total_ram_gb:.1f} GB RAM (minimum {min_total:.0f} GB). "
                    f"A full scan will likely freeze the VM. Aborting.")
             log("err", msg)
-            raise SystemExit(1)
+            raise InsufficientResourcesError(msg)
 
         if avail_gb < min_ram:
             msg = (f"Only {avail_gb:.1f} GB RAM available (minimum {min_ram:.0f} GB). "
@@ -125,6 +160,23 @@ async def run_pipeline(args: argparse.Namespace) -> int:
     from reconchain.process import reset_globals
     reset_globals()
     _TOOL_RC_REGISTRY.clear()
+
+    # Load plugins if enabled
+    if not getattr(args, 'no_plugins', False):
+        try:
+            from pathlib import Path as _P
+
+            from reconchain.plugin import discover_plugins, register_plugin_to_pipeline
+            dirs = []
+            plugins_dir = getattr(args, 'plugins_dir', '')
+            if plugins_dir:
+                dirs.append(_P(plugins_dir))
+            plugins = discover_plugins(dirs) if dirs else []
+            if plugins:
+                register_plugin_to_pipeline(plugins)
+                log("info", f"Loaded {len(plugins)} plugin(s)")
+        except Exception as _plug_exc:
+            log("warn", f"plugin loading failed: {_plug_exc}")
     import reconchain.process as _proc_mod
     with _proc_mod._SPAWNED_PIDS_LOCK:
         _proc_mod._SPAWNED_PIDS.clear()
@@ -137,8 +189,21 @@ async def run_pipeline(args: argparse.Namespace) -> int:
     _debug_ts("pipeline starting")
     outdir = Path(args.out).resolve()
     if outdir.exists() and not outdir.is_dir():
-        raise ValueError(f"output path exists and is not a directory: {outdir}")
+        from reconchain.exceptions import OutputPathError
+        raise OutputPathError(f"output path exists and is not a directory: {outdir}")
     outdir.mkdir(parents=True, exist_ok=True)
+    # Audit logging: record scan initiation
+    try:
+        from reconchain.audit import init_audit_log, log_event as _audit
+        init_audit_log(outdir)
+        _audit("scan_start", domain=args.domain, detail={
+            "out": str(outdir),
+            "safe_mode": getattr(args, 'safe', False),
+            "only": sorted(getattr(args, 'only', set())),
+            "skip": sorted(getattr(args, 'skip', set())),
+        })
+    except Exception:
+        pass  # best-effort
     for tmp in outdir.glob("*.tmp"):
         tmp.unlink(missing_ok=True)
     for tmp in outdir.glob("*.ds_tmp"):
@@ -149,7 +214,6 @@ async def run_pipeline(args: argparse.Namespace) -> int:
     if incremental and any(outdir.glob("*.txt")):
         _pre_scan_snapshot = _snapshot_findings(outdir)
         log("info", f"Incremental mode: captured {len(_pre_scan_snapshot)} files for diff")
-    import urllib.parse
     state_path = outdir / "state.json"
     state: Dict[str, Any] = {
         "domain": args.domain,
@@ -311,7 +375,12 @@ async def run_pipeline(args: argparse.Namespace) -> int:
     import dataclasses
 
     def _ss(val: int) -> int:
-        """Halve a sample size when safe mode is active, minimum 1."""
+        """Apply sample size mode: minimal=1, normal=default, all=sys.maxsize, safe_mode halves."""
+        mode = getattr(args, 'sample_mode', 'normal')
+        if mode == 'minimal':
+            return 1
+        if mode == 'all':
+            return sys.maxsize
         return max(1, val // 2) if _safe_mode else val
 
     _new_cfg = PipelineConfig(
@@ -439,6 +508,26 @@ async def run_pipeline(args: argparse.Namespace) -> int:
     # Enhancement modules
     _dedup_engine = DedupEngine(outdir / "dedup_state.json")
     _monitor = MonitorEngine()
+
+    # v3.0: Tool health monitor
+    _tool_health = None
+    try:
+        from reconchain.tool_health import get_tool_health_monitor
+        _tool_health = get_tool_health_monitor(outdir / "tool_health.json")
+    except Exception:
+        pass
+
+    # v3.0: Target profiling (after initial recon phases run)
+    _target_profile = None
+
+    # v3.0: Learning engine for FP filtering
+    _learning = None
+    try:
+        from reconchain.learning import LearningEngine
+        _learning = LearningEngine(outdir / "fp_patterns.json")
+    except Exception:
+        pass
+
     _pipeline = getattr(sys.modules.get('reconchain'), 'PIPELINE', None) or _PIPELINE
     phase_map = {name: fn for name, fn, _ in _pipeline}
 
@@ -458,6 +547,26 @@ async def run_pipeline(args: argparse.Namespace) -> int:
     def _apply(name: str, result: Dict[str, Any]) -> None:
         prev.update(result or {})
         state["artifacts"].update({k: v for k, v in (result or {}).items() if not isinstance(v, str) or Path(v).exists()})
+        # Emit finding events for new artifact files — read only tail (last 3 lines)
+        for k, v in (result or {}).items():
+            if isinstance(v, str) and v.endswith(".txt"):
+                try:
+                    _fpath = Path(v)
+                    if _fpath.exists() and _fpath.stat().st_size > 0:
+                        import collections
+                        with _fpath.open("rb") as _f:
+                            _tail = collections.deque(_f, maxlen=3)
+                        for _raw in _tail:
+                            _line = _raw.decode(errors="replace").strip()
+                            if _line:
+                                bus.emit("finding.new", {
+                                    "text": _line,
+                                    "phase": name,
+                                    "source": k,
+                                    "domain": args.domain,
+                                })
+                except Exception:
+                    pass
         for m in t.missing:
             if m not in state["missing_tools"]:
                 state["missing_tools"].append(m)
@@ -512,6 +621,19 @@ async def run_pipeline(args: argparse.Namespace) -> int:
             # where pause could be set between the check and the wait.
             if _resmon is not None:
                 await _resmon.wait_if_paused()
+            # v3.0: Smart gating — skip phases deemed unnecessary by target profile
+            if _target_profile is not None and not _target_profile.should_run(name):
+                _debug_ts(f"phase {name} skipped by target profile")
+                progress.next(name)
+                bus.emit("phase.skip", {"phase": name, "reason": "target_profile"})
+                return {}
+            # v3.0: Tool health — skip if tool has been auto-disabled
+            if _tool_health is not None:
+                _tool_name = name.split("-", 1)[-1].lower() if "-" in name else name.lower()
+                if _tool_health.is_disabled(_tool_name):
+                    _debug_ts(f"phase {name} skipped — tool {_tool_name} auto-disabled by health monitor")
+                    progress.next(name)
+                    return {}
             _debug_ts(f"phase {name} acquired semaphore, starting")
             fn = phase_map[name]
             kwargs = {
@@ -532,6 +654,7 @@ async def run_pipeline(args: argparse.Namespace) -> int:
             scan_status.set_phase(name)
             scan_status.add_running(name)
             t0 = datetime.now()
+            bus.emit("phase.start", {"phase": name, "ts": time.time()})
             result: Dict[str, Any] = {}
             await _push_phase_proxy(name, proxy, vuln_proxy)
             try:
@@ -542,6 +665,7 @@ async def run_pipeline(args: argparse.Namespace) -> int:
             except Exception as e:
                 log("err", f"phase {name} crashed: {e}")
                 scan_status.add_error(str(e))
+                bus.emit("phase.fail", {"phase": name, "error": str(e)})
                 result = {}
             finally:
                 try:
@@ -555,9 +679,25 @@ async def run_pipeline(args: argparse.Namespace) -> int:
                     "end": t1.isoformat(timespec="seconds"),
                     "elapsed_seconds": round(elapsed, 1),
                 }
+                # v3.0: Record tool health (success/failure per tool)
+                if _tool_health is not None:
+                    try:
+                        for _tk, _tv in _TOOL_RC_REGISTRY.items():
+                            if isinstance(_tv, int):
+                                if _tv == 0:
+                                    _tool_health.record_success(_tk, elapsed)
+                                else:
+                                    _tool_health.record_failure(_tk, f"rc={_tv}")
+                    except Exception:
+                        pass
                 scan_status.add_completed(name)
                 scan_status.set_missing(state.get("missing_tools", []))
                 progress.next(name)
+                bus.emit("phase.complete", {
+                    "phase": name,
+                    "elapsed": elapsed,
+                    "count": sum(1 for v in (result or {}).values() if isinstance(v, str) and v.endswith(".txt")),
+                })
             return result
 
     _shutdown_event = threading.Event()
@@ -630,6 +770,15 @@ async def run_pipeline(args: argparse.Namespace) -> int:
             ram_gb = _resmon.ram_available_gb
             cpu = _resmon.cpu_percent
             conc = _resmon.current_concurrency
+            # Emit resource update to event bus (for dashboard/bot)
+            try:
+                bus.emit("resource.update", {
+                    "cpu": cpu,
+                    "ram_gb": ram_gb,
+                    "concurrency": conc,
+                })
+            except Exception:
+                pass
             if ram_gb < 1.0:
                 log("warn", f"LOW MEMORY: {ram_gb:.1f} GB available — concurrency={conc}, CPU={cpu:.0f}%")
             elif cpu > 90:
@@ -697,6 +846,14 @@ async def run_pipeline(args: argparse.Namespace) -> int:
                     _apply(name, result)
                     completed_phases.add(name)
                     _debug_ts(f"phase {name} completed ({len(completed_phases)}/{len(phases_to_run)})")
+                    try:
+                        from reconchain.audit import log_event as _audit_phase
+                        _audit_phase("phase_complete", domain=args.domain, detail={
+                            "phase": name,
+                            "progress": f"{len(completed_phases)}/{len(phases_to_run)}",
+                        })
+                    except Exception:
+                        pass
                     # Add phases that are now ready (all deps satisfied)
                     for _candidate in phases_to_run:
                         if _candidate not in completed_phases and _candidate not in pending_tasks:
@@ -710,17 +867,24 @@ async def run_pipeline(args: argparse.Namespace) -> int:
                     try:
                         _SENSITIVE_KEYWORDS = {"cookie", "session", "credential", "secret", "token", "password", "auth", "extra_headers"}
                         _SENSITIVE_KEYS = {"cookie", "COOKIE", "COOKIE_A", "COOKIE_B", "extra_headers", "EXTRA_HEADERS", "credentials", "credentials_queue"}
-                        _state_for_disk = json.loads(json.dumps(state, default=str))
-                        for _sk in list(_state_for_disk.keys()):
-                            if _sk in _SENSITIVE_KEYS or any(s in _sk.lower() for s in _SENSITIVE_KEYWORDS):
-                                _state_for_disk.pop(_sk, None)
-                        if "artifacts" in _state_for_disk:
-                            _sensitive_artifacts = {"password_spray", "sqlmap", "cookie_audit", "session_analysis", "api_key_leaks", "js_secrets", "js_secrets_deep", "secret_rotation"}
-                            _state_for_disk["artifacts"] = {
-                                k: v for k, v in _state_for_disk["artifacts"].items()
-                                if not any(s in k.lower() for s in _sensitive_artifacts)
-                            }
-                        _atomic_write_json(state_path, _state_for_disk)
+                        _SAFE_STATE_KEYS = {
+                            "domain", "outdir", "started_at", "updated_at", "completed_phases",
+                            "running_phases", "total_phases", "phase", "phase_progress",
+                            "missing_tools", "tool_failures", "artifacts", "counts",
+                            "coverage", "oast_urls", "oast_triggered", "errors",
+                        }
+                        # Filter first, then serialize once (avoids json.loads(json.dumps()) round-trip)
+                        _filtered_state = {}
+                        for _sk, _sv in state.items():
+                            if _sk in _SAFE_STATE_KEYS and _sk not in _SENSITIVE_KEYS:
+                                if _sk == "artifacts" and isinstance(_sv, dict):
+                                    _filtered_state[_sk] = {
+                                        ak: av for ak, av in _sv.items()
+                                        if not any(s in ak.lower() for s in _SENSITIVE_KEYWORDS)
+                                    }
+                                else:
+                                    _filtered_state[_sk] = _sv
+                        _atomic_write_json(state_path, _filtered_state)
                     except Exception as e:
                         log("warn", f"state.json write failed: {e}")
     finally:
@@ -751,6 +915,12 @@ async def run_pipeline(args: argparse.Namespace) -> int:
         except Exception:
             pass
         filter_outputs(outdir)
+        # v3.0: Write tool health report
+        if _tool_health is not None:
+            try:
+                _tool_health.write_report(outdir)
+            except Exception:
+                pass
         # Remove empty output files to reduce noise
         _empty_removed = 0
         for _fp in outdir.glob("*.txt"):
@@ -763,6 +933,47 @@ async def run_pipeline(args: argparse.Namespace) -> int:
         if _empty_removed:
             log("info", f"Removed {_empty_removed} empty output files")
         counts = _counts(outdir)
+
+        # v3.0: Build target profile from early recon data (used for smart gating on future scans)
+        try:
+            from reconchain.target_profile import build_target_profile, save_profile
+            _target_profile = build_target_profile(outdir, args.domain)
+            save_profile(_target_profile, outdir)
+            log("ok", f"target profile: {_target_profile.cloud_provider or 'unknown'} cloud, "
+                f"{len(_target_profile.technologies)} techs, "
+                f"{_target_profile.httpx_confidence:.0%} confidence")
+        except Exception as _tp_exc:
+            log("warn", f"target profiling failed: {_tp_exc}")
+
+        # v3.0: Risk scoring
+        try:
+            from reconchain.severity import calculate_risk_score, write_risk_score
+            _risk = calculate_risk_score(outdir)
+            write_risk_score(outdir, _risk)
+            log("ok", f"risk score: {_risk.grade} ({_risk.total_score:.0f}/100)")
+        except Exception as _risk_exc:
+            log("warn", f"risk scoring failed: {_risk_exc}")
+
+        # v3.0: Confidence scoring
+        try:
+            from reconchain.confidence import score_all_findings, write_confidence_report
+            _conf_scores = score_all_findings(outdir)
+            if _conf_scores:
+                write_confidence_report(outdir, _conf_scores)
+                _confirmed = sum(1 for s in _conf_scores if s.confidence.value == "confirmed")
+                _likely = sum(1 for s in _conf_scores if s.confidence.value == "likely")
+                log("ok", f"confidence: {_confirmed} confirmed, {_likely} likely, {len(_conf_scores)} total")
+        except Exception as _conf_exc:
+            log("warn", f"confidence scoring failed: {_conf_exc}")
+
+        # v3.0: Auto-PoC generation
+        try:
+            from reconchain.poc import generate_all_pocs
+            _poc_path = generate_all_pocs(outdir)
+            if _poc_path and _poc_path.exists():
+                log("ok", f"auto-pocs → {_poc_path}")
+        except Exception as _poc_exc:
+            log("warn", f"auto-PoC generation failed: {_poc_exc}")
         if t.has("gowitness"):
             try:
                 gowitness_targets = outdir / "host_targets.txt"
@@ -807,6 +1018,103 @@ async def run_pipeline(args: argparse.Namespace) -> int:
             log("ok", f"dashboard → {dj_path}")
         except Exception as _rep_exc:
             log("warn", f"report generation failed: {_rep_exc}")
+
+        # --- Post-scan: Exploit chain analysis (heuristic) ---
+        _exploit_chains_enabled = getattr(args, 'exploit_chains', True)
+        if _exploit_chains_enabled:
+            try:
+                from reconchain.exploit_chain import analyze_exploit_chains
+                _chains = analyze_exploit_chains(outdir)
+                if _chains:
+                    log("ok", f"exploit chains: {len(_chains)} chains identified")
+            except Exception as _chain_exc:
+                log("warn", f"exploit chain analysis failed: {_chain_exc}")
+
+        # --- Post-scan: Attack surface graph ---
+        _attack_graph = getattr(args, 'attack_graph', False)
+        if _attack_graph or counts.get("subdomains", 0) > 0:
+            try:
+                from reconchain.attack_surface import (
+                    build_graph,
+                    write_attack_surface_html,
+                    write_attack_surface_json,
+                )
+                _graph = build_graph(outdir)
+                if _graph["nodes"]:
+                    write_attack_surface_json(outdir, args.domain, _graph)
+                    write_attack_surface_html(outdir, args.domain, _graph)
+            except Exception as _graph_exc:
+                log("warn", f"attack surface generation failed: {_graph_exc}")
+
+        # --- Post-scan: AI-powered analysis ---
+        _ai_enabled = getattr(args, 'ai_provider', 'none') != 'none'
+        if _ai_enabled:
+            try:
+                from reconchain.ai import configure as ai_configure
+                from reconchain.ai_exploit import suggest_exploit_chains
+                from reconchain.ai_triage import run_triage
+
+                _ai_cache = outdir / "ai_cache"
+                _ai_cache.mkdir(exist_ok=True)
+                ai_configure(
+                    provider_name=getattr(args, 'ai_provider', 'dry-run'),
+                    model=getattr(args, 'ai_model', ''),
+                    cache_dir=_ai_cache,
+                )
+
+                _scan_duration = sum(v.get("elapsed_seconds", 0) for v in phase_timing.values())
+                _duration_str = f"{int(_scan_duration // 60)}m {int(_scan_duration % 60)}s"
+
+                # AI triage
+                log("AI: running vulnerability triage...")
+                _triage_results = await run_triage(outdir, args.domain, _duration_str)
+
+                # AI exploit chain suggestions
+                log("AI: generating exploit chain suggestions...")
+                await suggest_exploit_chains(outdir, args.domain)
+
+            except Exception as _ai_exc:
+                log("warn", f"AI analysis failed: {_ai_exc}")
+
+        # --- Start live dashboard if configured ---
+        _dashboard_port = getattr(args, 'dashboard_port', 0)
+        if _dashboard_port:
+            try:
+                from reconchain.dashboard_server import start_dashboard
+                _dashboard_host = getattr(args, 'dashboard_host', '127.0.0.1')
+                start_dashboard(
+                    host=_dashboard_host,
+                    port=_dashboard_port,
+                    open_browser=getattr(args, 'dashboard_browser', True),
+                )
+            except Exception as _dash_exc:
+                log("warn", f"dashboard server failed: {_dash_exc}")
+
+        # --- Start companion bot if configured ---
+        _bot_platform = getattr(args, 'bot', '')
+        if _bot_platform:
+            try:
+                from reconchain.bot import start_bot_thread
+                start_bot_thread(
+                    platform=_bot_platform,
+                    token=getattr(args, 'bot_token', ''),
+                    channel_id=getattr(args, 'bot_channel', ''),
+                    mention_on_critical=getattr(args, 'bot_mention', True),
+                )
+            except Exception as _bot_exc:
+                log("warn", f"companion bot failed: {_bot_exc}")
+
+        _scan_duration_val = sum(v.get("elapsed_seconds", 0) for v in phase_timing.values())
+        _duration_str = f"{int(_scan_duration_val // 60)}m {int(_scan_duration_val % 60)}s"
+
+        # --- Emit scan complete event ---
+        bus.emit("scan.complete", {
+            "domain": args.domain,
+            "total_findings": sum(counts.values()),
+            "duration": _duration_str,
+            "stats": counts,
+        })
+
         # Incremental mode: compute diff
         if incremental and _pre_scan_snapshot:
             try:

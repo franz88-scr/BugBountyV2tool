@@ -211,10 +211,13 @@ def _request(host: str, path: str, timeout: int = 10) -> bytes:
 
 def _norm_line(raw: str) -> str:
     raw = raw.strip()
+    parsed = urllib.parse.urlparse(raw)
+    if parsed.scheme and parsed.netloc:
+        path = re.sub(r'/+', '/', parsed.path)
+        return urllib.parse.urlunparse(parsed._replace(path=path)).rstrip("/")
     while raw.startswith("//"):
         raw = raw[2:]
-    while raw.count("//") > 1:
-        raw = raw.replace("//", "/")
+    raw = re.sub(r'/+', '/', raw)
     return raw.rstrip("/")
 
 _STATIC_EXT = frozenset({
@@ -228,7 +231,7 @@ def _is_static_url(url: str) -> bool:
     return any(path.endswith(ext) for ext in _STATIC_EXT)
 
 
-_SKIP_PARAMS = frozenset({"v", "ver", "version", "id", "_", "t"})
+_SKIP_PARAMS = frozenset({"v", "ver", "version", "_", "t"})
 
 _TOKEN_PARAM_RE = re.compile(
     r"^(?:"

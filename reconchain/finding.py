@@ -189,13 +189,13 @@ class Finding:
             self.cwe = self.auto_cwe()
         if self.severity == "info" and self.vuln_type:
             self.severity = self.auto_severity()
-        if not self.cvss and self.vuln_type:
+        if self.cvss is None and self.vuln_type:
             self.cvss = self.auto_cvss()
         return self
 
 
 def _generate_finding_id(phase: str, evidence: str) -> str:
-    raw = f"{phase}:{evidence[:100]}"
+    raw = f"{evidence[:120]}"
     h = hashlib.md5(raw.encode()).hexdigest()[:8]
     return f"RC-{h}"
 
@@ -290,7 +290,7 @@ def _guess_vuln_type(text: str) -> str:
         return "file_upload"
     if any(kw in lower for kw in ("deserial", "unsafe deserialization")):
         return "deserialization"
-    if any(kw in lower for kw in ("race condition", "race condition")):
+    if any(kw in lower for kw in ("race condition", "race-condition")):
         return "race_condition"
     if any(kw in lower for kw in ("smuggling", "request smuggling", "cl.te", "te.cl")):
         return "smuggle"
@@ -367,6 +367,10 @@ class FindingStore:
             "critical": [], "high": [], "medium": [], "low": [], "info": [],
         }
         for f in self.load():
+            bucket = result.get(f.severity)
+            if bucket is None:
+                bucket = result.setdefault(f.severity, [])
+            bucket.append(f)
             result.setdefault(f.severity, []).append(f)
         return result
 
@@ -400,5 +404,17 @@ class FindingStore:
 
     def save_json(self, path: Optional[Path] = None) -> Path:
         out = path or (self.outdir / "findings_structured.json")
-        out.write_text(self.to_json())
+        import tempfile, os as _os
+        fd, tmp_path = tempfile.mkstemp(dir=str(out.parent), suffix=".tmp")
+        try:
+            with _os.fdopen(fd, "w") as f:
+                json.dump([f.to_dict() for f in self.load()], f, indent=2, default=str)
+                f.flush()
+                _os.fsync(f.fileno())
+            _os.replace(tmp_path, str(out))
+        except Exception:
+            import contextlib
+            with contextlib.suppress(Exception):
+                _os.unlink(tmp_path)
+            raise
         return out

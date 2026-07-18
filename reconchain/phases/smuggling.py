@@ -555,7 +555,8 @@ async def phase_38b_H2SMUGGLE(
             negotiated = sock.selected_alpn_protocol()
             if negotiated != "h2":
                 sock.close()
-                raise ConnectionError("server does not support h2")
+                from reconchain.exceptions import HTTP2NotSupportedError
+                raise HTTP2NotSupportedError("server does not support h2")
             config = h2.config.H2Configuration(client_side=True, header_encoding="utf-8")
             conn = h2.connection.H2Connection(config=config)
             conn.initiate_connection()
@@ -637,7 +638,8 @@ async def phase_38b_H2SMUGGLE(
             negotiated = sock.selected_alpn_protocol()
             if negotiated != "h2":
                 sock.close()
-                raise ConnectionError("server does not support h2")
+                from reconchain.exceptions import HTTP2NotSupportedError
+                raise HTTP2NotSupportedError("server does not support h2")
             config = h2.config.H2Configuration(client_side=True, header_encoding="utf-8")
             conn = h2.connection.H2Connection(config=config)
             conn.initiate_connection()

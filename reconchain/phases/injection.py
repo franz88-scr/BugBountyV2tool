@@ -478,8 +478,9 @@ async def phase_11b_SQLMAP(
         if sqlmap_log.exists():
             for ln in read_lines(sqlmap_log):
                 lower = ln.lower()
-                if any(kw in lower for kw in ("sql injection", "parameter", "payload:", "type: ", "title:")):
-                    findings.append(ln)
+                if any(kw in lower for kw in ("sql injection", "payload:", "type: boolean-based", "type: time-based", "type: union query", "is vulnerable")):
+                    if not any(neg in lower for neg in ("not injectable", "not tested", "no parameter")):
+                        findings.append(ln)
     else:
         findings.append("[info] sqlmap not installed; skipping automated SQL injection testing")
     if not findings:

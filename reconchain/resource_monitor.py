@@ -2,15 +2,14 @@
 from __future__ import annotations
 
 import asyncio
-import logging
 import os
 import signal
 import threading
 import time
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Any, Callable, Dict, List, Optional
 
-_log = logging.getLogger("resmon")
+from reconchain.utils import log
 
 
 class AdaptiveSemaphore:
@@ -28,10 +27,15 @@ class AdaptiveSemaphore:
         self._permits = init_val
         self._cond: Optional[asyncio.Condition] = None
         self._lock = threading.Lock()
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
 
     def _get_cond(self) -> asyncio.Condition:
         if self._cond is None:
             self._cond = asyncio.Condition()
+            try:
+                self._loop = asyncio.get_running_loop()
+            except RuntimeError:
+                pass
         return self._cond
 
     @property
@@ -109,6 +113,13 @@ class AdaptiveSemaphore:
                 async with cond:
                     cond.notify_all()
             loop.create_task(_notify())
+        else:
+            # Fallback: notify from sync context using the loop from bind()
+            if self._loop is not None and self._loop.is_running():
+                async def _notify_fb():
+                    async with cond:
+                        cond.notify_all()
+                self._loop.create_task(_notify_fb())
 
     def locked(self) -> bool:
         with self._lock:
@@ -399,7 +410,7 @@ class ResourceMonitor:
         arbitrary depth). Fallback: snapshot PIDs first, then kill to avoid
         PID recycling hitting wrong processes.
         """
-        _log.warning(
+        log("warn",
             f"EMERGENCY PAUSE: RAM={self.ram_available_gb:.1f}GB "
             f"(<{self._ram_emergency / (1024**3):.1f}GB). "
             f"Killing child processes to free memory."
@@ -448,7 +459,7 @@ class ResourceMonitor:
                     os.kill(pid, signal.SIGTERM)
                 except (OSError, ProcessLookupError, PermissionError):
                     pass
-            _log.warning(f"Sent SIGTERM to {len(to_kill)} child processes")
+            log("warn", f"Sent SIGTERM to {len(to_kill)} child processes")
 
         # Force SIGKILL after 3s for stubborn processes — use same snapshot
         time.sleep(3)

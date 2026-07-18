@@ -23,3 +23,5 @@ venv/
 *.swp
 *.swo
 *~
+.coverage
+-

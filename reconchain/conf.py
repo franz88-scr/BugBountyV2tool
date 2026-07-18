@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -163,6 +164,7 @@ def apply_config_to_args(cfg: Dict[str, Any], args: Any) -> Any:
     _set_arg_if_default(args, "sqlmap_level", scan.get("sqlmap_level"))
     _set_arg_if_default(args, "sqlmap_risk", scan.get("sqlmap_risk"))
     _set_arg_if_default(args, "exclude_tags", scan.get("nuclei_exclude_tags"))
+    _set_arg_if_default(args, "sample_mode", scan.get("sample_mode"))
 
     # Safe mode support in TOML config
     if scan.get("safe_mode") and not getattr(args, 'safe', False):
@@ -214,9 +216,37 @@ def apply_config_to_args(cfg: Dict[str, Any], args: Any) -> Any:
     if proxy_sec.get("vuln_url"):
         _set_arg_if_default(args, "vuln_proxy", proxy_sec["vuln_url"])
 
-    # [paths] section
-    paths = cfg.get("paths", {})
-    # Tool paths are used by install.sh, not directly by pipeline
+    # [ai] section
+    ai_sec = cfg.get("ai", {})
+    _set_arg_if_default(args, "ai_provider", ai_sec.get("provider"))
+    _set_arg_if_default(args, "ai_model", ai_sec.get("model"))
+    if ai_sec.get("api_key"):
+        provider = ai_sec.get("provider", "openai")
+        env_key = "OPENAI_API_KEY" if provider == "openai" else "ANTHROPIC_API_KEY"
+        _set_env_if_present(env_key, ai_sec["api_key"])
+
+    # [dashboard] section
+    dash_sec = cfg.get("dashboard", {})
+    if dash_sec.get("enabled"):
+        args.dashboard = True
+        if not getattr(args, 'dashboard_port', 0):
+            args.dashboard_port = 8765
+    _set_arg_if_default(args, "dashboard_port", dash_sec.get("port"))
+    _set_arg_if_default(args, "dashboard_host", dash_sec.get("host"))
+
+    # [bot] section
+    bot_sec = cfg.get("bot", {})
+    _set_arg_if_default(args, "bot", bot_sec.get("platform"))
+    _set_arg_if_default(args, "bot_token", bot_sec.get("token"))
+    _set_arg_if_default(args, "bot_channel", bot_sec.get("channel_id"))
+    if bot_sec.get("mention_on_critical"):
+        args.bot_mention = True
+
+    # [plugins] section
+    plug_sec = cfg.get("plugins", {})
+    _set_arg_if_default(args, "plugins_dir", plug_sec.get("directory"))
+
+    # [paths] section — Tool paths are used by install.sh, not directly by pipeline
 
     return args
 
@@ -292,6 +322,25 @@ sqlmap_risk = 1
 [proxy]
 # url = "socks5://127.0.0.1:9050"
 # vuln_url = "socks5://127.0.0.1:9050"
+
+[ai]
+# provider = "ollama"       # openai | anthropic | ollama | dry-run | none
+# model = "llama3"          # gpt-4o, claude-3-5-sonnet-20241022, llama3, etc.
+# api_key = ""              # or use OPENAI_API_KEY / ANTHROPIC_API_KEY env vars
+
+[dashboard]
+# enabled = false
+# host = "127.0.0.1"
+# port = 8765
+
+[bot]
+# platform = "discord"      # discord | slack
+# token = ""                # or use DISCORD_BOT_TOKEN / SLACK_BOT_TOKEN env
+# channel_id = ""           # or use DISCORD_CHANNEL_ID / SLACK_CHANNEL_ID env
+# mention_on_critical = true
+
+[plugins]
+# directory = "~/.config/reconchain/plugins"
 """
 
 
@@ -332,8 +381,16 @@ def list_profiles() -> List[Dict[str, Any]]:
     return profiles
 
 
+def _sanitize_profile_name(name: str) -> str:
+    """Strip path separators and dots from profile names."""
+    return re.sub(r'[/\\.]+', '_', name).strip('_')[:64]
+
+
 def load_profile(name: str) -> Optional[Dict[str, Any]]:
     """Load a wizard profile by name. Returns None if not found."""
+    name = _sanitize_profile_name(name)
+    if not name:
+        return None
     path = _ensure_profiles_dir() / f"{name}.json"
     if not path.is_file():
         return None
@@ -345,6 +402,9 @@ def load_profile(name: str) -> Optional[Dict[str, Any]]:
 
 def save_profile(name: str, data: Dict[str, Any]) -> bool:
     """Save a wizard profile. Returns True on success."""
+    name = _sanitize_profile_name(name)
+    if not name:
+        return False
     _ensure_profiles_dir()
     path = _ensure_profiles_dir() / f"{name}.json"
     try:
@@ -357,6 +417,9 @@ def save_profile(name: str, data: Dict[str, Any]) -> bool:
 
 def delete_profile(name: str) -> bool:
     """Delete a wizard profile by name. Returns True if deleted."""
+    name = _sanitize_profile_name(name)
+    if not name:
+        return False
     path = _ensure_profiles_dir() / f"{name}.json"
     if path.is_file():
         path.unlink()

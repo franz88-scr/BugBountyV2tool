@@ -26,15 +26,24 @@ def _validate_webhook_url(url: str) -> bool:
     hostname = parsed.hostname
     if not hostname:
         return False
-    # Block private/internal/loopback IPs
+    # Block private/internal/loopback IPs (check both literal and resolved)
     try:
         ip = ipaddress.ip_address(hostname)
         if ip.is_private or ip.is_loopback or ip.is_reserved or ip.is_link_local:
             log("warn", f"webhook URL points to private/internal IP ({hostname}): {url[:60]}")
             return False
     except ValueError:
-        # Not an IP — that's fine (it's a hostname like hooks.slack.com)
-        pass
+        # Not a literal IP — resolve and check
+        import socket
+        try:
+            for family, _, _, _, sockaddr in socket.getaddrinfo(hostname, None):
+                resolved = ipaddress.ip_address(sockaddr[0])
+                if resolved.is_private or resolved.is_loopback or resolved.is_reserved or resolved.is_link_local:
+                    log("warn", f"webhook hostname resolves to private IP ({resolved}): {url[:60]}")
+                    return False
+        except (socket.gaierror, OSError):
+            log("warn", f"webhook hostname resolution failed: {hostname}")
+            return False
     return True
 
 
@@ -95,9 +104,10 @@ def send_scan_summary(
     finding_text = "\n".join(findings[:15]) if findings else "  (no findings)"
     missing_text = f"\nMissing tools: {', '.join(missing_tools[:5])}" if missing_tools else ""
 
+    from html import escape as _html_escape
     message = (
         f"<b>ReconChain Scan Complete</b>\n"
-        f"Domain: <code>{domain}</code>\n"
+        f"Domain: <code>{_html_escape(domain)}</code>\n"
         f"Duration: {time_str}\n"
         f"Subdomains: {counts.get('subdomains', 0)}\n"
         f"Live hosts: {counts.get('live_hosts', 0)}\n"

@@ -10,7 +10,7 @@ from reconchain.conf import load_config, apply_config_to_args
 
 def test_version():
     """Test that version is set correctly."""
-    assert __version__ == "2.0.0"
+    assert __version__ == "3.1.0"
 
 
 def test_valid_phases():

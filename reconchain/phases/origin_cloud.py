@@ -310,7 +310,7 @@ async def phase_18_CLOUD(
             f"OUT={shlex.quote(str(cloudfox_outdir))}\n"
             '# Try common AWS profiles; silently skip if no credentials\n'
             'for profile in default dev staging prod; do\n'
-              '  cloudfox aws -p "$profile" --outdir "$OUT" all\n'
+            '  cloudfox aws -p "$profile" --outdir "$OUT" all 2>/dev/null || true\n'
             'done\n'
         )
         runner.chmod(0o700)

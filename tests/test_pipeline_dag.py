@@ -1,8 +1,8 @@
 """Tests for pipeline DAG structure and phase consistency."""
 import pytest
 
-from reconchain.config import VALID_PHASES, FAST_PHASES, DOS_PHASES, QUICK_SKIP_PHASES
-from reconchain.phases import PIPELINE, PHASE_DEPS, STAGES, _PHASE_WEIGHTS as PHASE_WEIGHTS
+from vulnforge.config import VALID_PHASES, FAST_PHASES, DOS_PHASES, QUICK_SKIP_PHASES
+from vulnforge.phases import PIPELINE, PHASE_DEPS, STAGES, _PHASE_WEIGHTS as PHASE_WEIGHTS
 
 
 class TestPipelineDAG:

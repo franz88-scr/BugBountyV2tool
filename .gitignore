@@ -3,6 +3,7 @@ __pycache__/
 *.pyo
 out_*/
 out/
+graphify-out/
 *.log
 *.pid
 state.json

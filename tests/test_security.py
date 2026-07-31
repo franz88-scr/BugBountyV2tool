@@ -21,42 +21,42 @@ class TestPipelineConfigReprRedaction:
     """Ensure sensitive fields are masked in repr output."""
 
     def test_bearer_redacted(self):
-        from reconchain.config import PipelineConfig
+        from vulnforge.config import PipelineConfig
         cfg = PipelineConfig(auth_bearer="secret-token-123")
         r = repr(cfg)
         assert "secret-token-123" not in r
         assert "auth_bearer=***" in r
 
     def test_api_key_redacted(self):
-        from reconchain.config import PipelineConfig
+        from vulnforge.config import PipelineConfig
         cfg = PipelineConfig(auth_api_key="ak-xyz-789")
         r = repr(cfg)
         assert "ak-xyz-789" not in r
         assert "auth_api_key=***" in r
 
     def test_basic_auth_redacted(self):
-        from reconchain.config import PipelineConfig
+        from vulnforge.config import PipelineConfig
         cfg = PipelineConfig(auth_basic="user:pass")
         r = repr(cfg)
         assert "user:pass" not in r
         assert "auth_basic=***" in r
 
     def test_client_cert_redacted(self):
-        from reconchain.config import PipelineConfig
+        from vulnforge.config import PipelineConfig
         cfg = PipelineConfig(auth_client_cert="/path/to/cert")
         r = repr(cfg)
         assert "/path/to/cert" not in r
         assert "auth_client_cert=***" in r
 
     def test_empty_credentials_not_redacted(self):
-        from reconchain.config import PipelineConfig
+        from vulnforge.config import PipelineConfig
         cfg = PipelineConfig()
         r = repr(cfg)
         assert "auth_bearer=''" in r
         assert "auth_api_key=''" in r
 
     def test_non_sensitive_fields_visible(self):
-        from reconchain.config import PipelineConfig
+        from vulnforge.config import PipelineConfig
         cfg = PipelineConfig(rate_limit=100, sqlmap_level=3)
         r = repr(cfg)
         assert "rate_limit=100" in r
@@ -70,32 +70,32 @@ class TestBatchDomainValidation:
     """Batch file domains must be validated to prevent path traversal."""
 
     def test_valid_domains_accepted(self):
-        from reconchain.utils import _is_valid_hostname
+        from vulnforge.utils import _is_valid_hostname
         assert _is_valid_hostname("example.com")
         assert _is_valid_hostname("sub.example.co.uk")
         assert _is_valid_hostname("a-b.c-d.example.com")
 
     def test_path_traversal_rejected(self):
-        from reconchain.utils import _is_valid_hostname
+        from vulnforge.utils import _is_valid_hostname
         assert not _is_valid_hostname("../../etc")
         assert not _is_valid_hostname("../secret")
         assert not _is_valid_hostname("foo/../bar.com")
 
     def test_injection_chars_rejected(self):
-        from reconchain.utils import _is_valid_hostname
+        from vulnforge.utils import _is_valid_hostname
         assert not _is_valid_hostname("example.com; rm -rf /")
         assert not _is_valid_hostname("example.com`whoami`")
         assert not _is_valid_hostname("example.com$(id)")
         assert not _is_valid_hostname("example.com|cat /etc/passwd")
 
     def test_empty_and_whitespace_rejected(self):
-        from reconchain.utils import _is_valid_hostname
+        from vulnforge.utils import _is_valid_hostname
         assert not _is_valid_hostname("")
         assert not _is_valid_hostname("  ")
         assert not _is_valid_hostname("\t")
 
     def test_ip_address_rejected(self):
-        from reconchain.utils import _is_valid_hostname
+        from vulnforge.utils import _is_valid_hostname
         assert not _is_valid_hostname("192.168.1.1")
         assert not _is_valid_hostname("10.0.0.1")
 
@@ -107,7 +107,7 @@ class TestStateJsonFiltering:
     """State.json should only contain whitelisted safe keys."""
 
     def test_sensitive_keys_excluded(self, tmp_path):
-        from reconchain.process import _atomic_write_json
+        from vulnforge.process import _atomic_write_json
         state = {
             "domain": "example.com",
             "outdir": "/tmp/out",
@@ -175,7 +175,7 @@ class TestAuditLogging:
     """Test the audit logging module."""
 
     def test_audit_log_created(self, tmp_path):
-        from reconchain.audit import init_audit_log, log_event, disable, enable
+        from vulnforge.audit import init_audit_log, log_event, disable, enable
         disable()
         try:
             path = init_audit_log(tmp_path)
@@ -186,7 +186,7 @@ class TestAuditLogging:
             enable()
 
     def test_log_event_writes_jsonl(self, tmp_path):
-        from reconchain.audit import init_audit_log, log_event, disable, enable
+        from vulnforge.audit import init_audit_log, log_event, disable, enable
         disable()
         try:
             init_audit_log(tmp_path)
@@ -208,7 +208,7 @@ class TestAuditLogging:
             disable()
 
     def test_disabled_audit_writes_nothing(self, tmp_path):
-        from reconchain.audit import init_audit_log, log_event, disable
+        from vulnforge.audit import init_audit_log, log_event, disable
         disable()
         try:
             init_audit_log(tmp_path)
@@ -216,7 +216,7 @@ class TestAuditLogging:
             assert not (tmp_path / "audit.jsonl").exists() or \
                 (tmp_path / "audit.jsonl").read_text().strip() == ""
         finally:
-            from reconchain.audit import enable
+            from vulnforge.audit import enable
             enable()
 
 
@@ -227,7 +227,7 @@ class TestProxyEnvSafety:
     """Verify proxy env is passed via env= parameter, not mutated."""
 
     def test_bypass_proxy_function(self):
-        from reconchain.process import _bypass_proxy
+        from vulnforge.process import _bypass_proxy
         assert _bypass_proxy(["dnsx", "-l", "subs.txt"])
         assert _bypass_proxy(["nmap", "-sV", "target"])
         assert _bypass_proxy(["naabu", "-l", "subs.txt"])
@@ -236,7 +236,7 @@ class TestProxyEnvSafety:
         assert not _bypass_proxy([])
 
     def test_bypass_proxy_wrapped_in_bash(self):
-        from reconchain.process import _bypass_proxy
+        from vulnforge.process import _bypass_proxy
         assert _bypass_proxy(["bash", "/path/to/findomain.sh", "-t", "example.com"])
         assert _bypass_proxy(["bash", "dnsx-wrapper", "-l", "subs.txt"])
 
@@ -248,30 +248,30 @@ class TestCookieSanitization:
     """Ensure cookie values are sanitized before use."""
 
     def test_strips_newlines(self):
-        from reconchain.utils import _sanitize_header_value
+        from vulnforge.utils import _sanitize_header_value
         result = _sanitize_header_value("session=abc\r\nInjected: true")
         assert "\r" not in result
         assert "\n" not in result
 
     def test_strips_null_bytes(self):
-        from reconchain.utils import _sanitize_header_value
+        from vulnforge.utils import _sanitize_header_value
         result = _sanitize_header_value("session=abc\x00injected")
         assert "\x00" not in result
 
     def test_strips_tabs(self):
-        from reconchain.utils import _sanitize_header_value
+        from vulnforge.utils import _sanitize_header_value
         result = _sanitize_header_value("session=abc\tinjected")
         assert "\t" not in result
 
     def test_cookie_cli_arg_injection_prevented(self):
-        from reconchain.utils import _validate_cookie
+        from vulnforge.utils import _validate_cookie
         # Leading -- should be stripped to prevent arg injection
         result = _validate_cookie("--cookie-value")
         assert result == "cookie-value"
 
     def test_empty_cookie_rejected(self):
-        from reconchain.utils import _validate_cookie
-        from reconchain.exceptions import InvalidCookieError
+        from vulnforge.utils import _validate_cookie
+        from vulnforge.exceptions import InvalidCookieError
         with pytest.raises(InvalidCookieError):
             _validate_cookie("")
         with pytest.raises(InvalidCookieError):
@@ -287,12 +287,12 @@ class TestSubprocessSafety:
     def test_no_shell_true_in_process(self):
         """Ensure process.py never uses shell=True."""
         import inspect
-        from reconchain import process
+        from vulnforge import process
         source = inspect.getsource(process)
         assert "shell=True" not in source, "shell=True found in process.py — security risk"
 
     def test_domain_arg_validation(self):
-        from reconchain.process import _domain_arg
+        from vulnforge.process import _domain_arg
         import argparse
         # Valid domains should pass
         assert _domain_arg("example.com") == "example.com"
@@ -314,7 +314,7 @@ class TestDedupEnginePerformance:
     """Verify the prefix-indexed fuzzy matching is efficient."""
 
     def test_prefix_index_built_on_load(self, tmp_path):
-        from reconchain.dedup import DedupEngine
+        from vulnforge.dedup import DedupEngine
         state = {
             "https://example.com/path1": {"ts": "2024-01-01T00:00:00"},
             "https://example.com/path2": {"ts": "2024-01-01T00:00:01"},
@@ -328,7 +328,7 @@ class TestDedupEnginePerformance:
         assert "http" in engine._prefix_index or "http" in engine._prefix_index
 
     def test_fuzzy_match_uses_prefix_narrowing(self, tmp_path):
-        from reconchain.dedup import DedupEngine
+        from vulnforge.dedup import DedupEngine
         state_path = tmp_path / "dedup.json"
         state_path.write_text("{}")
         engine = DedupEngine(state_path)
@@ -341,7 +341,7 @@ class TestDedupEnginePerformance:
         assert is_dup is True
 
     def test_mark_seen_evicts_oldest(self, tmp_path):
-        from reconchain.dedup import DedupEngine
+        from vulnforge.dedup import DedupEngine
         state_path = tmp_path / "dedup.json"
         state_path.write_text("{}")
         engine = DedupEngine(state_path)
@@ -351,7 +351,7 @@ class TestDedupEnginePerformance:
         assert len(engine._seen) <= 10
 
     def test_clear_resets_prefix_index(self, tmp_path):
-        from reconchain.dedup import DedupEngine
+        from vulnforge.dedup import DedupEngine
         state_path = tmp_path / "dedup.json"
         state_path.write_text("{}")
         engine = DedupEngine(state_path)
@@ -369,7 +369,7 @@ class TestSnapshotStreaming:
     """Verify _snapshot_findings uses streaming reads."""
 
     def test_snapshot_with_large_files(self, tmp_path):
-        from reconchain.pipeline import _snapshot_findings
+        from vulnforge.pipeline import _snapshot_findings
         # Create a large file (1000 lines)
         large_file = tmp_path / "large_subs.txt"
         large_file.write_text("\n".join(f"sub{i}.example.com" for i in range(1000)))
@@ -383,7 +383,7 @@ class TestSnapshotStreaming:
         assert len(snapshot["urls.txt"]) == 2
 
     def test_snapshot_skips_hidden_files(self, tmp_path):
-        from reconchain.pipeline import _snapshot_findings
+        from vulnforge.pipeline import _snapshot_findings
         hidden = tmp_path / ".hidden.txt"
         hidden.write_text("secret\n")
         visible = tmp_path / "visible.txt"
@@ -393,7 +393,7 @@ class TestSnapshotStreaming:
         assert "visible.txt" in snapshot
 
     def test_snapshot_skips_blank_and_comment_lines(self, tmp_path):
-        from reconchain.pipeline import _snapshot_findings
+        from vulnforge.pipeline import _snapshot_findings
         f = tmp_path / "mixed.txt"
         f.write_text("# comment\n\nactual-line\n  \n# another comment\nsecond-line\n")
         snapshot = _snapshot_findings(tmp_path)

@@ -1,10 +1,10 @@
-"""Tests for the recon phase sub-modules (reconchain.phases.recon.*)."""
+"""Tests for the recon phase sub-modules (vulnforge.phases.recon.*)."""
 import asyncio
 from pathlib import Path
 
 import pytest
 
-from reconchain.phases.recon import (
+from vulnforge.phases.recon import (
     phase_00_SCOPE,
     phase_01_RECON,
     phase_02_RESOLVE,
@@ -25,45 +25,45 @@ from reconchain.phases.recon import (
     _SOURCE_MAP_RE,
 )
 
-from reconchain.tools import Tools
+from vulnforge.tools import Tools
 
 
 class TestReconSubModuleImports:
     def test_scope_import(self):
-        from reconchain.phases.recon.scope import phase_00_SCOPE
+        from vulnforge.phases.recon.scope import phase_00_SCOPE
         assert callable(phase_00_SCOPE)
 
     def test_subdomain_import(self):
-        from reconchain.phases.recon.subdomain import phase_01_RECON, phase_03_PERMUTE
+        from vulnforge.phases.recon.subdomain import phase_01_RECON, phase_03_PERMUTE
         assert callable(phase_01_RECON)
         assert callable(phase_03_PERMUTE)
 
     def test_dns_import(self):
-        from reconchain.phases.recon.dns import phase_02_RESOLVE
+        from vulnforge.phases.recon.dns import phase_02_RESOLVE
         assert callable(phase_02_RESOLVE)
 
     def test_scan_import(self):
-        from reconchain.phases.recon.scan import phase_04_SCAN, phase_04b_TAKEOVER_VALIDATE
+        from vulnforge.phases.recon.scan import phase_04_SCAN, phase_04b_TAKEOVER_VALIDATE
         assert callable(phase_04_SCAN)
         assert callable(phase_04b_TAKEOVER_VALIDATE)
 
     def test_harvest_import(self):
-        from reconchain.phases.recon.harvest import phase_05_HARVEST, phase_05b_APISPEC
+        from vulnforge.phases.recon.harvest import phase_05_HARVEST, phase_05b_APISPEC
         assert callable(phase_05_HARVEST)
         assert callable(phase_05b_APISPEC)
 
     def test_jsintel_import(self):
-        from reconchain.phases.recon.jsintel import phase_06_JSINTEL, _JS_SECRET_PATTERNS, _SOURCE_MAP_RE
+        from vulnforge.phases.recon.jsintel import phase_06_JSINTEL, _JS_SECRET_PATTERNS, _SOURCE_MAP_RE
         assert callable(phase_06_JSINTEL)
         assert isinstance(_JS_SECRET_PATTERNS, list)
         assert _SOURCE_MAP_RE is not None
 
     def test_params_import(self):
-        from reconchain.phases.recon.params import phase_07_PARAMS
+        from vulnforge.phases.recon.params import phase_07_PARAMS
         assert callable(phase_07_PARAMS)
 
     def test_osint_import(self):
-        from reconchain.phases.recon.osint import (
+        from vulnforge.phases.recon.osint import (
             phase_84_WHOIS, phase_85_ASN, phase_86_DORK,
             phase_87_SHODAN, phase_88_EMPLOYEE, phase_89_PASSIVEDNS,
         )
@@ -95,7 +95,7 @@ class TestBackwardCompatImports:
         assert callable(phase_89_PASSIVEDNS)
 
     def test_phases_package_reexports(self):
-        from reconchain.phases import (
+        from vulnforge.phases import (
             phase_00_SCOPE as p0,
             phase_01_RECON as p1,
             _JS_SECRET_PATTERNS as js,
@@ -107,15 +107,15 @@ class TestBackwardCompatImports:
         assert sm is not None
 
     def test_secrets_git_still_imports(self):
-        from reconchain.phases.secrets_git import _JS_SECRET_PATTERNS, _SOURCE_MAP_RE
+        from vulnforge.phases.secrets_git import _JS_SECRET_PATTERNS, _SOURCE_MAP_RE
         assert isinstance(_JS_SECRET_PATTERNS, list)
 
     def test_pipeline_data_structures(self):
-        from reconchain.phases import PIPELINE, PHASE_DEPS, STAGES, _PHASE_WEIGHTS
-        assert len(PIPELINE) == 164
-        assert len(PHASE_DEPS) == 164
-        assert len(STAGES) == 29
-        assert len(_PHASE_WEIGHTS) == 164
+        from vulnforge.phases import PIPELINE, PHASE_DEPS, STAGES, _PHASE_WEIGHTS
+        assert len(PIPELINE) == 213
+        assert len(PHASE_DEPS) == 213
+        assert len(STAGES) == 45
+        assert len(_PHASE_WEIGHTS) == 213
 
 
 class TestJSIntelPatterns:

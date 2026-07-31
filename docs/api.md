@@ -1,13 +1,20 @@
 # REST API
 
-ReconChain includes a lightweight REST API server for querying scan findings programmatically.
+VulnForge includes a lightweight REST API server for querying scan findings programmatically.
+
+> **Note:** the API server is currently exposed as a library module, not wired into the CLI. The `--api-port` flag is parsed but does not start the server. Use the programmatic API below.
 
 ## Quick Start
 
-```bash
-# Start scan with API server
-reconchain -d example.com --api-port 8080
+```python
+from pathlib import Path
+from vulnforge.api import start_api_server
 
+port = start_api_server(Path("./out/example.com"), port=8080)
+# API is now running on http://127.0.0.1:8080
+```
+
+```bash
 # Query findings
 curl http://127.0.0.1:8080/api/v1/findings
 curl http://127.0.0.1:8080/api/v1/findings?severity=high
@@ -104,8 +111,8 @@ GET /api/v1/coverage
 ```json
 {
   "tested_phases": 45,
-  "total_phases": 164,
-  "coverage_pct": 27.4,
+  "total_phases": 213,
+  "coverage_pct": 21.1,
   "phases_with_output": ["01-RECON", "02-RESOLVE", ...]
 }
 ```
@@ -122,23 +129,23 @@ All endpoints include CORS headers (`Access-Control-Allow-Origin: *`) for browse
 
 ## Architecture
 
-The API is built on Python's `http.server` module — zero external dependencies. It runs as a daemon thread alongside the main pipeline. The `FindingStore` class lazily loads findings from the output directory and caches them.
+The API is built on Python's `http.server` module — zero external dependencies. It runs as a daemon thread. The `FindingStore` class lazily loads findings from the output directory and caches them.
 
 ```
-Pipeline thread                  API thread (daemon)
-    │                               │
-    │  emit("finding.new", ...)     │
-    │───────────────────────────→  GET /api/v1/findings
-    │                               │  FindingStore.load()
-    │                               │  → reads artifact files
-    │                               │  → filters by query params
-    │                               │  → returns JSON
+Main thread                         API thread (daemon)
+    │                                   │
+    │  start_api_server(outdir)         │
+    │──────────────────────────────────→ GET /api/v1/findings
+    │                                   │  FindingStore.load()
+    │                                   │  → reads artifact files
+    │                                   │  → filters by query params
+    │                                   │  → returns JSON
 ```
 
 ## Programmatic Usage
 
 ```python
-from reconchain.api import start_api_server, stop_api_server
+from vulnforge.api import start_api_server, stop_api_server
 from pathlib import Path
 
 port = start_api_server(Path("./out/example.com"), port=8080)

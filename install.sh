@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-# install.sh — install every external tool reconchain.py depends on.
+# install.sh — install every external tool vulnforge.py depends on.
 
 # Security: All git clones use pinned tags/branches where possible.
 # Go tools are installed from source via `go install` (module checksums verified by Go module proxy).
@@ -720,7 +720,7 @@ if [[ ":$PATH:" != *":$GOPATH_BIN:"* ]]; then
 
     echo "" >> "$SHELL_RC"
 
-    echo "# reconchain Go tools" >> "$SHELL_RC"
+    echo "# vulnforge Go tools" >> "$SHELL_RC"
 
     echo "export PATH=\$PATH:$GOPATH_BIN" >> "$SHELL_RC"
 
@@ -745,4 +745,4 @@ if ! command -v python >/dev/null 2>&1 && command -v python3 >/dev/null 2>&1; th
   fi
 fi
 
-ok "install complete. run: python3 reconchain.py -d example.com -o ./out"
+ok "install complete. run: python3 vulnforge.py -d example.com -o ./out"

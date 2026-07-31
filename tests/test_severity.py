@@ -4,8 +4,8 @@ from pathlib import Path
 
 import pytest
 
-from reconchain.severity import RiskScore, calculate_risk_score, write_risk_score, SEVERITY_WEIGHTS
-from reconchain.artifacts import guess_severity, SEVERITY_KEYWORDS
+from vulnforge.severity import RiskScore, calculate_risk_score, write_risk_score, SEVERITY_WEIGHTS
+from vulnforge.artifacts import guess_severity, SEVERITY_KEYWORDS
 
 
 class TestGuessSeverity:

@@ -5,7 +5,8 @@ from http.client import HTTPMessage
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
-from reconchain.utils import (
+from vulnforge.pipeline import _CREDENTIAL_STORE
+from vulnforge.utils import (
     _auto_detect_cookies,
     _extra_headers_dict,
     _extra_http_args,
@@ -13,6 +14,7 @@ from reconchain.utils import (
     _validate_cookie,
     parse_set_cookie_headers,
 )
+from vulnforge.exceptions import InvalidCookieError
 
 
 class TestSanitizeHeaderValue:
@@ -51,12 +53,12 @@ class TestValidateCookie:
 
     def test_empty_raises(self):
         import pytest
-        with pytest.raises(ValueError, match="empty"):
+        with pytest.raises((ValueError, InvalidCookieError), match="empty"):
             _validate_cookie("")
 
     def test_whitespace_only_raises(self):
         import pytest
-        with pytest.raises(ValueError, match="empty"):
+        with pytest.raises((ValueError, InvalidCookieError), match="empty"):
             _validate_cookie("   ")
 
     def test_strips_and_validates(self):
@@ -103,47 +105,59 @@ class TestAutoDetectCookies:
 
 
 class TestExtraHeadersDict:
-    def test_includes_cookie(self, monkeypatch):
-        monkeypatch.setenv("COOKIE", "session=abc")
-        monkeypatch.delenv("EXTRA_HEADERS", raising=False)
-        headers = _extra_headers_dict()
-        assert headers["Cookie"] == "session=abc"
+    def test_includes_cookie(self):
+        _CREDENTIAL_STORE["COOKIE"] = "session=abc"
+        try:
+            headers = _extra_headers_dict()
+            assert headers["Cookie"] == "session=abc"
+        finally:
+            _CREDENTIAL_STORE.pop("COOKIE", None)
 
-    def test_no_cookie_when_empty(self, monkeypatch):
-        monkeypatch.delenv("COOKIE", raising=False)
-        monkeypatch.delenv("EXTRA_HEADERS", raising=False)
+    def test_no_cookie_when_empty(self):
+        _CREDENTIAL_STORE.pop("COOKIE", None)
+        _CREDENTIAL_STORE.pop("EXTRA_HEADERS", None)
         headers = _extra_headers_dict()
         assert "Cookie" not in headers
 
-    def test_extra_headers_combined(self, monkeypatch):
-        monkeypatch.setenv("COOKIE", "session=abc")
-        monkeypatch.setenv("EXTRA_HEADERS", "Authorization: Bearer tok\nX-Custom: val")
-        headers = _extra_headers_dict()
-        assert headers["Cookie"] == "session=abc"
-        assert headers["Authorization"] == "Bearer tok"
-        assert headers["X-Custom"] == "val"
+    def test_extra_headers_combined(self):
+        _CREDENTIAL_STORE["COOKIE"] = "session=abc"
+        _CREDENTIAL_STORE["EXTRA_HEADERS"] = "Authorization: Bearer tok\nX-Custom: val"
+        try:
+            headers = _extra_headers_dict()
+            assert headers["Cookie"] == "session=abc"
+            assert headers["Authorization"] == "Bearer tok"
+            assert headers["X-Custom"] == "val"
+        finally:
+            _CREDENTIAL_STORE.pop("COOKIE", None)
+            _CREDENTIAL_STORE.pop("EXTRA_HEADERS", None)
 
 
 class TestExtraHttpArgs:
-    def test_includes_cookie_header(self, monkeypatch):
-        monkeypatch.setenv("COOKIE", "session=abc")
-        monkeypatch.delenv("EXTRA_HEADERS", raising=False)
-        args = _extra_http_args()
-        assert "-H" in args
-        assert "Cookie: session=abc" in args
+    def test_includes_cookie_header(self):
+        _CREDENTIAL_STORE["COOKIE"] = "session=abc"
+        try:
+            args = _extra_http_args()
+            assert "-H" in args
+            assert "Cookie: session=abc" in args
+        finally:
+            _CREDENTIAL_STORE.pop("COOKIE", None)
 
-    def test_no_cookie_when_empty(self, monkeypatch):
-        monkeypatch.delenv("COOKIE", raising=False)
-        monkeypatch.delenv("EXTRA_HEADERS", raising=False)
+    def test_no_cookie_when_empty(self):
+        _CREDENTIAL_STORE.pop("COOKIE", None)
+        _CREDENTIAL_STORE.pop("EXTRA_HEADERS", None)
         args = _extra_http_args()
         assert args == []
 
-    def test_extra_headers_appended(self, monkeypatch):
-        monkeypatch.setenv("COOKIE", "session=abc")
-        monkeypatch.setenv("EXTRA_HEADERS", "X-Foo: bar")
-        args = _extra_http_args()
-        assert "Cookie: session=abc" in args
-        assert "X-Foo: bar" in args
+    def test_extra_headers_appended(self):
+        _CREDENTIAL_STORE["COOKIE"] = "session=abc"
+        _CREDENTIAL_STORE["EXTRA_HEADERS"] = "X-Foo: bar"
+        try:
+            args = _extra_http_args()
+            assert "Cookie: session=abc" in args
+            assert "X-Foo: bar" in args
+        finally:
+            _CREDENTIAL_STORE.pop("COOKIE", None)
+            _CREDENTIAL_STORE.pop("EXTRA_HEADERS", None)
 
 
 class TestParseSetCookieHeaders:

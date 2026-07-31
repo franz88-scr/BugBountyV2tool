@@ -1,4 +1,4 @@
-name: ReconChain CI
+name: VulnForge CI
 
 on:
   push:
@@ -28,10 +28,10 @@ jobs:
           pip install ruff pytest
       
       - name: Check with ruff
-        run: ruff check reconchain/
+        run: ruff check vulnforge/
       
       - name: Format check with ruff
-        run: ruff format --check reconchain/
+        run: ruff format --check vulnforge/
       
       - name: Run tests
         run: pytest tests/ -v
@@ -62,7 +62,7 @@ jobs:
         run: pip install bandit
       
       - name: Run bandit security scanner
-        run: bandit -r reconchain/ -f json -o bandit-report.json -ll
+        run: bandit -r vulnforge/ -f json -o bandit-report.json -ll
       
       - name: Upload security report
         uses: actions/upload-artifact@5d5ccaddad64fb895c6d1e2e68d512d25c7b8000 # v4.1.1

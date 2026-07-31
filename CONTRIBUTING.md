@@ -13,8 +13,8 @@ Clone the repo and install in development mode:
 
     pytest tests/ -v
 
-    ruff check reconchain/
-    ruff format reconchain/
+    ruff check vulnforge/
+    ruff format vulnforge/
 
 ## Code Style
 
@@ -26,7 +26,7 @@ Clone the repo and install in development mode:
 
 ## Adding a New Phase
 
-1. Add the phase function to the appropriate module in reconchain/phases/
+1. Add the phase function to the appropriate module in vulnforge/phases/
 2. Add the phase ID to VALID_PHASES in config.py
 3. Add the phase to PIPELINE and PHASE_DEPS in phases/__init__.py
 4. Add an ArtifactDef in artifacts.py

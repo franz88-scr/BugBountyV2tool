@@ -8,7 +8,7 @@ from pathlib import Path
 import hypothesis
 from hypothesis import given, strategies as st, settings, assume
 
-from reconchain.config import PipelineConfig, VALID_PHASES
+from vulnforge.config import PipelineConfig, VALID_PHASES
 
 
 # ── Domain validation ───────────────────────────────────────────────
@@ -16,7 +16,7 @@ from reconchain.config import PipelineConfig, VALID_PHASES
 @given(st.text(min_size=1, max_size=255))
 @settings(max_examples=200, suppress_health_check=[hypothesis.HealthCheck.too_slow])
 def test_is_valid_hostname_never_crashes(domain: str):
-    from reconchain.utils import _is_valid_hostname
+    from vulnforge.utils import _is_valid_hostname
     try:
         result = _is_valid_hostname(domain)
         assert isinstance(result, bool)
@@ -27,14 +27,14 @@ def test_is_valid_hostname_never_crashes(domain: str):
 @given(st.sampled_from(["example.com", "test.org", "sub.domain.co.uk", "a.b.c"]))
 @settings(max_examples=50)
 def test_valid_domains_accepted(domain: str):
-    from reconchain.utils import _is_valid_hostname
+    from vulnforge.utils import _is_valid_hostname
     assert _is_valid_hostname(domain) is True
 
 
 @given(st.sampled_from(["-invalid.com", ".leading.dot", " spaces", "a" * 256 + ".com"]))
 @settings(max_examples=50)
 def test_invalid_domains_rejected(domain: str):
-    from reconchain.utils import _is_valid_hostname
+    from vulnforge.utils import _is_valid_hostname
     assert _is_valid_hostname(domain) is False
 
 
@@ -99,7 +99,7 @@ def test_phase_set_operations(phases: list):
 @given(st.text(min_size=1, max_size=50))
 @settings(max_examples=200)
 def test_phase_parse_csv_never_crashes(csv_str: str):
-    from reconchain.process import _parse_phase_csv
+    from vulnforge.process import _parse_phase_csv
     try:
         result = _parse_phase_csv(csv_str)
         assert isinstance(result, set)
@@ -112,7 +112,7 @@ def test_phase_parse_csv_never_crashes(csv_str: str):
 @given(st.text(min_size=1, max_size=500))
 @settings(max_examples=200)
 def test_guess_severity_never_crashes(text: str):
-    from reconchain.artifacts import guess_severity
+    from vulnforge.artifacts import guess_severity
     result = guess_severity(text)
     assert result in ("critical", "high", "medium", "low", "info")
 
@@ -120,7 +120,7 @@ def test_guess_severity_never_crashes(text: str):
 @given(st.sampled_from(["critical", "high", "medium", "low", "info"]))
 @settings(max_examples=20)
 def test_severity_weights_cover_all_levels(sev: str):
-    from reconchain.severity import SEVERITY_WEIGHTS
+    from vulnforge.severity import SEVERITY_WEIGHTS
     assert sev in SEVERITY_WEIGHTS
     assert SEVERITY_WEIGHTS[sev] > 0
 
@@ -134,7 +134,7 @@ def test_severity_weights_cover_all_levels(sev: str):
 @settings(max_examples=50)
 def test_merge_unique_never_crashes(lines: list):
     """merge_unique(srcs, dst) merges src files into dst."""
-    from reconchain.utils import merge_unique
+    from vulnforge.utils import merge_unique
     outdir = Path(tempfile.mkdtemp())
     src_dir = outdir / "src"
     src_dir.mkdir()
@@ -149,7 +149,7 @@ def test_merge_unique_never_crashes(lines: list):
 
 def test_merge_unique_deduplicates():
     """merge_unique should deduplicate lines across source files."""
-    from reconchain.utils import merge_unique
+    from vulnforge.utils import merge_unique
     outdir = Path(tempfile.mkdtemp())
     src_dir = outdir / "src"
     src_dir.mkdir()
@@ -166,7 +166,7 @@ def test_merge_unique_deduplicates():
 @given(st.text(min_size=1, max_size=200))
 @settings(max_examples=200)
 def test_is_under_domain_never_crashes(path: str):
-    from reconchain.utils import _is_under_domain
+    from vulnforge.utils import _is_under_domain
     try:
         result = _is_under_domain(path, "example.com")
         assert isinstance(result, bool)
@@ -179,7 +179,7 @@ def test_is_under_domain_never_crashes(path: str):
 @given(st.text(min_size=1, max_size=50))
 @settings(max_examples=100)
 def test_remediation_lookup_never_crashes(vuln_type: str):
-    from reconchain.remediation import get_remediation, has_remediation, get_remediation_text
+    from vulnforge.remediation import get_remediation, has_remediation, get_remediation_text
     r = get_remediation(vuln_type)
     assert r is None or hasattr(r, "cwe")
     assert isinstance(has_remediation(vuln_type), bool)
@@ -192,7 +192,7 @@ def test_remediation_lookup_never_crashes(vuln_type: str):
 @given(st.floats(min_value=0.0, max_value=1.0), st.text(min_size=1, max_size=100))
 @settings(max_examples=100)
 def test_confidence_score_bounds(cvss: float, text: str):
-    from reconchain.confidence import score_finding
+    from vulnforge.certainty import score_finding
     try:
         score = score_finding({"cvss": cvss, "text": text})
         assert 0.0 <= score <= 1.0
@@ -203,18 +203,18 @@ def test_confidence_score_bounds(cvss: float, text: str):
 # ── Artifact registry ───────────────────────────────────────────────
 
 def test_artifact_registry_not_empty():
-    from reconchain.artifacts import ARTIFACTS
+    from vulnforge.artifacts import ARTIFACTS
     assert len(ARTIFACTS) > 0
 
 
 def test_artifact_registry_unique_keys():
-    from reconchain.artifacts import ARTIFACTS
+    from vulnforge.artifacts import ARTIFACTS
     keys = [a.key for a in ARTIFACTS]
     assert len(keys) == len(set(keys))
 
 
 def test_artifact_registry_unique_filenames():
-    from reconchain.artifacts import ARTIFACTS
+    from vulnforge.artifacts import ARTIFACTS
     filenames = [a.filename for a in ARTIFACTS]
     assert len(filenames) == len(set(filenames))
 
@@ -224,7 +224,7 @@ def test_artifact_registry_unique_filenames():
 @given(st.text(min_size=1, max_size=50), st.dictionaries(st.text(min_size=1, max_size=20), st.text(max_size=100)))
 @settings(max_examples=100)
 def test_event_bus_emit_subscribe(event_type: str, data: dict):
-    from reconchain.events import EventBus
+    from vulnforge.events import EventBus
     bus = EventBus()
     received = []
     bus.subscribe(event_type, lambda e: received.append(e))

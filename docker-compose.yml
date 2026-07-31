@@ -1,7 +1,7 @@
 services:
-  reconchain:
+  vulnforge:
     build: .
-    container_name: reconchain
+    container_name: vulnforge
     security_opt:
       - no-new-privileges:true
     cap_drop:
@@ -21,5 +21,5 @@ services:
           cpus: "1.0"
     volumes:
       - ./out:/data/out
-    entrypoint: ["python3", "/opt/reconchain/reconchain.py"]
+    entrypoint: ["python3", "/opt/vulnforge/vulnforge.py"]
     command: ["--help"]

@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from reconchain.finding import (
+from vulnforge.finding import (
     Finding,
     FindingStore,
     _generate_finding_id,

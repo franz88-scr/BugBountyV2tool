@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-ReconChain Monitor v4
-- Runs reconchain.py against brandenburg.cloud via Tor proxy
+VulnForge Monitor v4
+- Runs vulnforge.py against brandenburg.cloud via Tor proxy
 - Checks every 2 min (sleep 120) for errors/warnings/stuck
 - Fixes missing tools, restarts failed phases via --resume
-- Reads ScanStatus from /run/user/1000/reconchain_status/ for real progress
+- Reads ScanStatus from /run/user/1000/vulnforge_status/ for real progress
 - Loops until scan is complete
 """
 from __future__ import annotations
@@ -18,7 +18,7 @@ if not re.match(r'^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$', DOMAIN):
 WORKDIR = Path(os.environ.get("RECON_WORKDIR", str(Path(__file__).resolve().parent)))
 OUTDIR = WORKDIR / "out" / DOMAIN
 STATE_FILE = OUTDIR / "state.json"
-SCAN_STATUS_DIR = Path(os.environ.get('XDG_RUNTIME_DIR', f'/run/user/{os.getuid()}')) / 'reconchain_status'
+SCAN_STATUS_DIR = Path(os.environ.get('XDG_RUNTIME_DIR', f'/run/user/{os.getuid()}')) / 'vulnforge_status'
 SCAN_STATUS_FILE = SCAN_STATUS_DIR / f"{DOMAIN.replace('.', '_')}.json"
 CHECK_INTERVAL = 120
 MAX_IDLE = 3
@@ -45,7 +45,7 @@ def read_state() -> dict | None:
     return None
 
 def run_scan(args: list[str]) -> subprocess.Popen:
-    cmd = ["python3", "reconchain.py"] + args
+    cmd = ["python3", "vulnforge.py"] + args
     log(f"Starting: {' '.join(cmd)}")
     return subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, start_new_session=True)
 
@@ -97,7 +97,7 @@ def check_logs() -> None:
 
 def main() -> int:
     log("=" * 60)
-    log(f"ReconChain Monitor — {DOMAIN}")
+    log(f"VulnForge Monitor — {DOMAIN}")
     log(f"Output: {OUTDIR}")
     log(f"Status: {SCAN_STATUS_FILE}")
     log(f"Check every {CHECK_INTERVAL}s, max {MAX_IDLE} idle cycles before restart")

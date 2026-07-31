@@ -3,9 +3,9 @@ import sys
 import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
-from reconchain.config import VALID_PHASES, __version__
-from reconchain.phases import PIPELINE, PHASE_DEPS, STAGES
-from reconchain.conf import load_config, apply_config_to_args
+from vulnforge.config import VALID_PHASES, __version__
+from vulnforge.phases import PIPELINE, PHASE_DEPS, STAGES
+from vulnforge.conf import load_config, apply_config_to_args
 
 
 def test_version():

@@ -9,9 +9,9 @@ mkdir -p "$OUTDIR"
 
 {
 echo "=== $(date '+%Y-%m-%d %H:%M:%S') ==="
-if pgrep -f "python3.*reconchain\.py" > /dev/null 2>&1 || pgrep -f "reconchain\.py" > /dev/null 2>&1; then
+if pgrep -f "python3.*vulnforge\.py" > /dev/null 2>&1 || pgrep -f "vulnforge\.py" > /dev/null 2>&1; then
     echo "Status: RUNNING"
-    echo "Monitor PID: $(pgrep -f "reconchain\.py" | head -1 || echo 'unknown')"
+    echo "Monitor PID: $(pgrep -f "vulnforge\.py" | head -1 || echo 'unknown')"
 else
     echo "Status: NOT RUNNING"
 fi

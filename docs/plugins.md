@@ -1,6 +1,6 @@
 # Plugin Development Guide
 
-ReconChain supports custom scan phases via a plugin system. Plugins are Python files containing classes that subclass `PhasePlugin` and are injected into the pipeline DAG as first-class phases.
+VulnForge supports custom scan phases via a plugin system. Plugins are Python files containing classes that subclass `PhasePlugin` and are injected into the pipeline DAG as first-class phases.
 
 ## Quick Start
 
@@ -10,7 +10,7 @@ ReconChain supports custom scan phases via a plugin system. Plugins are Python f
 # my_scanner.py
 from pathlib import Path
 from typing import Any, Dict
-from reconchain.plugin import PhasePlugin
+from vulnforge.plugin import PhasePlugin
 
 class MyScanner(PhasePlugin):
     name = "MY-SCANNER"          # unique phase ID
@@ -40,17 +40,17 @@ class MyScanner(PhasePlugin):
 ```
 
 2. Place the file in one of:
-   - `~/.config/reconchain/plugins/` (default)
+   - `~/.config/vulnforge/plugins/` (default)
    - A custom directory via `--plugins-dir ./my_plugins`
 
 3. Run:
 ```bash
-reconchain -d example.com --plugins-dir ./my_plugins
+vulnforge -d example.com --plugins-dir ./my_plugins
 ```
 
 4. List discovered plugins:
 ```bash
-reconchain --list-plugins --plugins-dir ./my_plugins
+vulnforge --list-plugins --plugins-dir ./my_plugins
 ```
 
 ## PhasePlugin API
@@ -119,7 +119,7 @@ async def run(self, outdir, t, only, skip, prev, force=False, **kwargs):
 
 Plugins are discovered from:
 
-1. `~/.config/reconchain/plugins/` (checked first)
+1. `~/.config/vulnforge/plugins/` (checked first)
 2. `--plugins-dir <path>` (additional directories)
 
 Discovery rules:
@@ -155,8 +155,8 @@ This means:
 import json
 from pathlib import Path
 from typing import Any, Dict
-from reconchain.plugin import PhasePlugin
-from reconchain.utils import log
+from vulnforge.plugin import PhasePlugin
+from vulnforge.utils import log
 
 class NucleiCustom(PhasePlugin):
     name = "CUSTOM-NUCLEI"

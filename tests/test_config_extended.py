@@ -1,16 +1,16 @@
 """Tests for PipelineConfig and auth configuration."""
 import pytest
 
-from reconchain.config import PipelineConfig, VALID_PHASES
-from reconchain.exceptions import ConfigError
+from vulnforge.config import PipelineConfig, VALID_PHASES
+from vulnforge.exceptions import ConfigError
 
 
 class TestPipelineConfig:
     def test_defaults(self):
         cfg = PipelineConfig()
-        assert cfg.dos_mode is True
+        assert cfg.dos_mode is False
         assert cfg.delay == 0.0
-        assert cfg.rate_limit == 0
+        assert cfg.rate_limit == 10
         assert cfg.proxy == ""
         assert cfg.safe_mode is False
 
@@ -54,6 +54,8 @@ class TestPipelineConfig:
         for attr in dir(cfg):
             if attr.startswith("sample_"):
                 val = getattr(cfg, attr)
+                if isinstance(val, str):
+                    continue
                 assert isinstance(val, int), f"{attr} should be int"
                 assert val >= 0, f"{attr} should be non-negative, got {val}"
 

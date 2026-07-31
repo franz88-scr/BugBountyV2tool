@@ -152,13 +152,13 @@ RUN gem install wpscan --no-document
 RUN git clone --depth 1 --branch 3.2 https://github.com/drwetter/testssl.sh.git /opt/testssl.sh
 
 # ════════════════════════════════════════════════════════════════════
-# Stage 2: Runtime — minimal image with only binaries + reconchain
+# Stage 2: Runtime — minimal image with only binaries + vulnforge
 # ════════════════════════════════════════════════════════════════════
 FROM python:3.12-slim AS runtime
 
 ENV DEBIAN_FRONTEND=noninteractive \
     GOPATH=/opt/go \
-    PATH="/opt/reconchain:/opt/go/bin:/usr/local/go/bin:${PATH}"
+    PATH="/opt/vulnforge:/opt/go/bin:/usr/local/go/bin:${PATH}"
 
 # ── Runtime-only system packages (no build-essential, no ruby-dev) ─
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -198,32 +198,36 @@ RUN ln -sf /opt/sqlmap/sqlmap.py /usr/local/bin/sqlmap && \
     ln -sf /opt/testssl.sh/testssl.sh /usr/local/bin/testssl.sh && \
     chmod +x /opt/go/bin/* || true
 
-# ── Reconchain source ─────────────────────────────────────────────
-COPY reconchain.py reconchain/ pyproject.toml /opt/reconchain/
-RUN pip install --no-cache-dir /opt/reconchain
+# ── VulnForge source ─────────────────────────────────────────────
+COPY vulnforge.py vulnforge/ pyproject.toml /opt/vulnforge/
+RUN pip install --no-cache-dir /opt/vulnforge
 
 # ── Non-root user ──────────────────────────────────────────────────
-RUN useradd -r -s /bin/false -d /data reconchain && \
-    mkdir -p /data && chown reconchain:reconchain /data && \
+RUN useradd -r -s /bin/false -d /data vulnforge && \
+    mkdir -p /data && chown vulnforge:vulnforge /data && \
     chmod 0o700 /data
 
-USER reconchain
+USER vulnforge
 WORKDIR /data
 
 HEALTHCHECK --interval=30s --timeout=10s --retries=3 \
     CMD python3 -c "import shutil; assert shutil.which('nuclei'), 'nuclei not found'" && \
-        python3 -c "from reconchain.config import __version__; print(f'reconchain {__version__} ok')"
+        python3 -c "from vulnforge.config import __version__; print(f'vulnforge {__version__} ok')"
 
 # ── Security notes ─────────────────────────────────────────────────
 # Run with additional hardening:
 #   docker run --security-opt no-new-privileges:true \
 #              --read-only --tmpfs /tmp:rw,noexec,nosuid \
 #              --cap-drop ALL --cap-add NET_BIND_SERVICE \
-#              reconchain ...
+#              vulnforge ...
+
+
+
+
 #
 # Scan the image with:
-#   docker scout cves reconchain:latest
-#   trivy image reconchain:latest
+#   docker scout cves vulnforge:latest
+#   trivy image vulnforge:latest
 
-ENTRYPOINT ["python3", "/opt/reconchain/reconchain.py"]
+ENTRYPOINT ["python3", "/opt/vulnforge/vulnforge.py"]
 CMD ["--help"]

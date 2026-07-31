@@ -70,14 +70,14 @@ while [[ "$restart_count" -lt "$max_restarts" ]]; do
     if [[ -f "$OUTDIR/state.json" ]]; then
         log "Attempt $restart_count — resuming from state.json"
         rc=0
-        setsid timeout "$TIMEOUT" python3 reconchain.py -d "$DOMAIN" -o "$OUTDIR" --resume "${EXTRA[@]}" 2>&1 &
+        setsid timeout "$TIMEOUT" python3 vulnforge.py -d "$DOMAIN" -o "$OUTDIR" --resume "${EXTRA[@]}" 2>&1 &
         CHILD_PID=$!
         wait "$CHILD_PID" 2>/dev/null || rc=$?
         CHILD_PID=""
     else
         log "Attempt $restart_count — fresh start"
         rc=0
-        setsid timeout "$TIMEOUT" python3 reconchain.py -d "$DOMAIN" -o "$OUTDIR" --force "${EXTRA[@]}" 2>&1 &
+        setsid timeout "$TIMEOUT" python3 vulnforge.py -d "$DOMAIN" -o "$OUTDIR" --force "${EXTRA[@]}" 2>&1 &
         CHILD_PID=$!
         wait "$CHILD_PID" 2>/dev/null || rc=$?
         CHILD_PID=""

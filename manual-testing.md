@@ -10,7 +10,7 @@ that address previously manual gaps:
 | `K`   | Deep JS secrets (custom regex for 13 secret types, source map extraction) | `js_secrets_deep.txt` |
 | `L`   | Auth bypass header fuzzing, mass-assignment field listing, API endpoint collection | `auth_bypass.txt` |
 
-Run them: `reconchain.py -d example.com -o ./out --only G2,J,K,L`
+Run them: `vulnforge.py -d example.com -o ./out --only G2,J,K,L`
 
 However, several critical attack surfaces are **only addressable manually**. This guide
 catalogues common gaps with actionable steps.

@@ -1,8 +1,8 @@
 """Tests for the ReconChain exception hierarchy."""
 import pytest
 
-from reconchain.exceptions import (
-    ReconChainError,
+from vulnforge.exceptions import (
+    VulnForgeError,
     ConfigError,
     InvalidDomainError,
     InvalidPhaseError,
@@ -47,7 +47,7 @@ class TestExceptionInheritance:
             IntegrationError, AIAnalysisError, BotError, DashboardError,
         ]
         for cls in exc_classes:
-            assert issubclass(cls, ReconChainError), f"{cls.__name__} should inherit ReconChainError"
+            assert issubclass(cls, VulnForgeError), f"{cls.__name__} should inherit VulnForgeError"
 
     def test_config_hierarchy(self):
         assert issubclass(InvalidDomainError, ConfigError)
@@ -122,7 +122,7 @@ class TestExceptionAttributes:
 
 class TestExceptionMessageFormatting:
     def test_base_exception_message(self):
-        e = ReconChainError("something went wrong")
+        e = VulnForgeError("something went wrong")
         assert str(e) == "something went wrong"
 
     def test_config_error_message(self):
@@ -169,11 +169,11 @@ class TestExceptionCatchable:
             IntegrationError("i"),
         ]
         for exc in exceptions_to_test:
-            with pytest.raises(ReconChainError):
+            with pytest.raises(VulnForgeError):
                 raise exc
 
     def test_catchable_from_package(self):
-        from reconchain import ReconChainError as RCE
+        from vulnforge import VulnForgeError as RCE
         with pytest.raises(RCE):
             raise ToolExecutionError("test", 1)
 
@@ -182,8 +182,8 @@ class TestPluginErrorFromPluginModule:
     def test_plugin_error_raised(self):
         import asyncio
         from pathlib import Path
-        from reconchain.plugin import PhasePlugin
-        from reconchain.exceptions import PluginError
+        from vulnforge.plugin import PhasePlugin
+        from vulnforge.exceptions import PluginError
         plugin = PhasePlugin()
         with pytest.raises(PluginError, match="must implement run"):
             asyncio.run(

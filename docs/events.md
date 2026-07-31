@@ -1,11 +1,11 @@
 # Event Bus Reference
 
-ReconChain uses an in-process event bus (`EventBus`) for real-time communication between the pipeline and subscriber components (dashboard, bot, AI triage, notifications).
+VulnForge uses an in-process event bus (`EventBus`) for real-time communication between the pipeline and subscriber components (dashboard, bot, AI triage, notifications).
 
 ## Quick Usage
 
 ```python
-from reconchain.events import bus, Event
+from vulnforge.events import bus, Event
 
 # Subscribe to events
 bus.subscribe("phase.start", lambda e: print(f"Phase started: {e.data['phase']}"))
@@ -46,7 +46,7 @@ bus.emit("finding.new", {"url": "https://...", "vuln": "xss", "severity": "high"
 
 ### `bus` (module-level singleton)
 
-The default `EventBus` instance shared across all ReconChain components.
+The default `EventBus` instance shared across all VulnForge components.
 
 ## Event Types
 
@@ -99,7 +99,7 @@ class MyPlugin(PhasePlugin):
     # ...
 
     async def run(self, outdir, t, only, skip, prev, force=False, **kwargs):
-        from reconchain.events import bus
+        from vulnforge.events import bus
 
         bus.emit("phase.start", {"phase": self.name})
 

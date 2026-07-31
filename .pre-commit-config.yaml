@@ -32,8 +32,8 @@ repos:
 
   - repo: local
     hooks:
-      - id: reconchain-test
-        name: reconchain tests
+      - id: vulnforge-test
+        name: vulnforge tests
         entry: python -m pytest tests/ -x -q
         language: python
         files: \.py$

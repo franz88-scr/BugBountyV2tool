@@ -1,7 +1,7 @@
 """Tests for the remediation module."""
 import pytest
 
-from reconchain.remediation import (
+from vulnforge.remediation import (
     REMEDIATIONS,
     Remediation,
     get_remediation,

@@ -62,8 +62,8 @@ class TestScopePhaseIntegration:
     """Test scope phase with realistic config inputs."""
 
     def test_scope_extracts_domain(self, tmp_path):
-        from reconchain.phases.recon.scope import phase_00_SCOPE
-        from reconchain.tools import Tools
+        from vulnforge.phases.recon.scope import phase_00_SCOPE
+        from vulnforge.tools import Tools
         t = Tools()
         result = asyncio.run(
             phase_00_SCOPE("example.com", tmp_path, t, set(), set())
@@ -76,8 +76,8 @@ class TestScopePhaseIntegration:
             assert "example.com" in content
 
     def test_scope_skip_returns_empty(self, tmp_path):
-        from reconchain.phases.recon.scope import phase_00_SCOPE
-        from reconchain.tools import Tools
+        from vulnforge.phases.recon.scope import phase_00_SCOPE
+        from vulnforge.tools import Tools
         t = Tools()
         result = asyncio.run(
             phase_00_SCOPE("example.com", tmp_path, t, set(), {"00-SCOPE"})
@@ -220,7 +220,7 @@ class TestHTTPCacheIntegration:
     """Test the HTTP response cache mechanism."""
 
     def test_cache_put_and_get(self):
-        from reconchain.utils import _HTTPResponseCache
+        from vulnforge.utils import _HTTPResponseCache
         cache = _HTTPResponseCache(max_size=100, ttl=60)
         cache.put("https://example.com", 200, b"ok")
         result = cache.get("https://example.com")
@@ -230,12 +230,12 @@ class TestHTTPCacheIntegration:
         assert body == b"ok"
 
     def test_cache_miss(self):
-        from reconchain.utils import _HTTPResponseCache
+        from vulnforge.utils import _HTTPResponseCache
         cache = _HTTPResponseCache(max_size=100, ttl=60)
         assert cache.get("https://nonexistent.com") is None
 
     def test_cache_eviction(self):
-        from reconchain.utils import _HTTPResponseCache
+        from vulnforge.utils import _HTTPResponseCache
         cache = _HTTPResponseCache(max_size=10, ttl=60)
         for i in range(15):
             cache.put(f"https://example.com/{i}", 200, f"data{i}".encode())
@@ -243,7 +243,7 @@ class TestHTTPCacheIntegration:
         assert len(cache._cache) <= 10
 
     def test_cache_invalidation(self):
-        from reconchain.utils import _HTTPResponseCache
+        from vulnforge.utils import _HTTPResponseCache
         cache = _HTTPResponseCache(max_size=100, ttl=60)
         cache.put("https://example.com", 200, b"ok")
         cache.invalidate()
@@ -257,7 +257,7 @@ class TestDNSCacheIntegration:
     """Test the DNS resolution cache."""
 
     def test_dns_cache_put_and_get(self):
-        from reconchain.utils import _DNSCache
+        from vulnforge.utils import _DNSCache
         cache = _DNSCache(max_size=100, ttl=60)
         cache.put("example.com", {"93.184.216.34"})
         result = cache.get("example.com")
@@ -265,12 +265,12 @@ class TestDNSCacheIntegration:
         assert "93.184.216.34" in result
 
     def test_dns_cache_miss(self):
-        from reconchain.utils import _DNSCache
+        from vulnforge.utils import _DNSCache
         cache = _DNSCache(max_size=100, ttl=60)
         assert cache.get("nonexistent.example") is None
 
     def test_dns_cache_empty_resolution(self):
-        from reconchain.utils import _DNSCache
+        from vulnforge.utils import _DNSCache
         cache = _DNSCache(max_size=100, ttl=60)
         cache.put("noresolve.example", set())
         result = cache.get("noresolve.example")

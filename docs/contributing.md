@@ -1,4 +1,4 @@
-# Contributing to ReconChain
+# Contributing to VulnForge
 
 ## Development Setup
 
@@ -17,7 +17,7 @@ pip install -e ".[dev]"
 python -m pytest tests/ -q
 
 # Run with coverage
-python -m pytest tests/ --cov=reconchain --cov-report=term-missing -q
+python -m pytest tests/ --cov=vulnforge --cov-report=term-missing -q
 
 # Run specific test file
 python -m pytest tests/test_security.py -v
@@ -35,7 +35,7 @@ python -m pytest tests/test_security.py -v
 ## Project Structure
 
 ```
-reconchain/           # Main package (see docs/architecture.md)
+vulnforge/           # Main package (see docs/architecture.md)
 tests/                # Test suite
 docs/                 # Documentation
   ├── architecture.md # Module structure and design
@@ -47,21 +47,21 @@ docs/                 # Documentation
 
 ## Adding a New Phase
 
-1. Choose the appropriate module in `reconchain/phases/`
+1. Choose the appropriate module in `vulnforge/phases/`
 2. Implement the phase function following the standard signature:
    ```python
    async def phase_XX_NAME(outdir: Path, t: Tools, only: PhaseSet, skip: PhaseSet, prev: Dict[str, Any], force: bool = False) -> Dict[str, Any]:
    ```
-3. Add the phase to `PIPELINE` in `reconchain/phases/__init__.py`
+3. Add the phase to `PIPELINE` in `vulnforge/phases/__init__.py`
 4. Add dependency edges in `PHASE_DEPS`
 5. Assign to the correct stage in `STAGES`
 6. Add tests in `tests/`
 
 ## Adding a New Exception
 
-Add to `reconchain/exceptions.py` following the hierarchy:
+Add to `vulnforge/exceptions.py` following the hierarchy:
 ```
-ReconChainError (base)
+VulnForgeError (base)
 ├── ConfigError
 ├── PipelineError
 ├── ToolError
@@ -80,7 +80,7 @@ import pytest
 from unittest.mock import patch, MagicMock
 
 def test_example():
-    with patch("reconchain.process.subprocess.Popen") as mock_popen:
+    with patch("vulnforge.process.subprocess.Popen") as mock_popen:
         mock_popen.return_value.returncode = 0
         mock_popen.return_value.communicate.return_value = (b"output", b"")
         # ... test code ...

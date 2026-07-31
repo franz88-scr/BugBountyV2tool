@@ -3,14 +3,14 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "reconchain"
+name = "vulnforge"
 version = "3.1.0"
-description = "A stdlib Python orchestrator for chained reconnaissance tooling."
+description = "A stdlib Python orchestrator for chained vulnerability discovery tooling."
 readme = "README.md"
 requires-python = ">=3.9"
 license = { text = "MIT" }
-authors = [{ name = "ReconChain contributors" }]
-keywords = ["reconnaissance", "security", "bug-bounty", "automation"]
+authors = [{ name = "VulnForge contributors" }]
+keywords = ["vulnerability", "security", "bug-bounty", "automation", "reconnaissance"]
 classifiers = [
   "Programming Language :: Python :: 3",
   "Programming Language :: Python :: 3 :: Only",
@@ -44,10 +44,11 @@ dev = [
 ]
 
 [project.scripts]
-reconchain = "reconchain:main"
+vulnforge = "vulnforge:main"
+reconchain = "vulnforge:main"
 
 [tool.setuptools]
-packages = ["reconchain", "reconchain.phases", "reconchain.phases.recon", "reconchain.cli"]
+packages = ["vulnforge", "vulnforge.phases", "vulnforge.phases.recon", "vulnforge.cli"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -55,12 +56,12 @@ pythonpath = ["."]
 addopts = "--tb=short -q"
 
 [tool.coverage.run]
-source = ["reconchain"]
+source = ["vulnforge"]
 branch = true
 omit = [
-    "reconchain/bot.py",
-    "reconchain/dashboard_server.py",
-    "reconchain/distributed.py",
+    "vulnforge/bot.py",
+    "vulnforge/dashboard_server.py",
+    "vulnforge/distributed.py",
     "tests/*",
 ]
 

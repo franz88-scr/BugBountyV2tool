@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 """
-reconchain.py — recon orchestrator.
+reconchain.py — backward-compat shim for vulnforge.
 
-This is now a thin shim that delegates to the reconchain/ package.
-All phase logic, reporting, and pipeline orchestration live in
-reconchain/ submodules (reconchain/phases/, reporting.py, pipeline.py, etc.).
+Delegates to the vulnforge/ package. The `reconchain` CLI command
+and `reconchain.py` entry point still work via this shim.
 
 Usage:
   python3 reconchain.py -d example.com -o ./out
@@ -14,7 +13,7 @@ Usage:
 from __future__ import annotations
 import sys
 
-from reconchain import main
+from vulnforge import main
 
 if __name__ == "__main__":
     sys.exit(main())

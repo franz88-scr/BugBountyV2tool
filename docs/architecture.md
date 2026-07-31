@@ -2,94 +2,114 @@
 
 ## Overview
 
-ReconChain is a Python-based bug bounty reconnaissance pipeline orchestrator that chains 164 security phases across 27 DAG stages. Given a target domain, it orchestrates 43+ external security tools into a single resumable pipeline.
+VulnForge is a Python-based bug bounty reconnaissance pipeline orchestrator that chains **213 security phases** across **45 DAG stages**. Given a target domain, it orchestrates **40+ external security tools** into a single resumable pipeline with adaptive resource management.
 
 ## Module Structure
 
 ```
-reconchain/
-├── __init__.py              # Package re-exports + docstring
-├── cli/                     # CLI package (decomposed from cli.py)
+vulnforge/
+├── __init__.py              # Package exports + main() dispatch
+├── cli/                     # CLI package
 │   ├── __init__.py          # Re-exports: build_parser, main, InteractiveWizard
 │   ├── banner.py            # ASCII banner display
-│   ├── helpers.py           # main() entry point, _run_single(), dispatch logic
-│   ├── parser.py            # ArgumentParser with 9 argument groups
-│   └── wizard.py            # Interactive setup wizard (911 lines)
+│   ├── helpers.py           # main() entry point, mode dispatch
+│   ├── parser.py            # ArgumentParser with 8 groups, 179 flags
+│   └── wizard.py            # Interactive setup wizard (1619 lines)
 │
-├── config.py                # PipelineConfig (130+ fields), phase defs, presets
-├── pipeline.py              # DAG executor, state management (1148 lines)
-├── process.py               # Subprocess management, circuit breaker, rate limiting
-├── utils.py                 # Logging, HTTP helpers, file I/O, caches (1252 lines)
+├── config.py                # PipelineConfig (130+ fields), VALID_PHASES (213), presets
+├── conf.py                  # TOML vulnforge.cfg loading (CLI wins), wizard profiles
+├── pipeline.py              # DAG executor, state persistence, report orchestration
+├── process.py               # Subprocess management, RLIMIT, circuit breaker, rate limiting
+├── resource_monitor.py      # Adaptive CPU/RAM concurrency scaling
+├── scheduler.py             # Async job scheduling
+├── throttle.py              # Token-bucket rate limiting
+├── utils.py                 # Logging, HTTP/DNS helpers, file I/O, caches
 ├── tools.py                 # External tool detection (cached binary lookup)
 │
-├── phases/                  # 164 security phase implementations
-│   ├── __init__.py          # PIPELINE list, PHASE_DEPS DAG, STAGES ordering
-│   ├── recon/               # Subdomain enumeration, DNS, URL harvesting
-│   │   ├── __init__.py      # Re-exports all recon phases
+├── phases/                  # 213 security phase implementations
+│   ├── __init__.py          # PIPELINE list, PHASE_DEPS DAG, STAGES (45) ordering
+│   ├── recon/               # Subdomain, DNS, live probing, harvesting, JS, params, OSINT
 │   │   ├── scope.py         # Domain scope validation
-│   │   ├── subdomain.py     # Subdomain enumeration (subfinder, findomain)
-│   │   ├── dns.py           # DNS resolution + DNS cache
-│   │   ├── scan.py          # Live host detection (httpx)
-│   │   ├── harvest.py       # URL/endpoint harvesting
-│   │   ├── jsintel.py       # JavaScript analysis
-│   │   ├── params.py        # Parameter discovery
-│   │   └── osint.py         # OSINT gathering
-│   ├── injection.py         # XSS, SQLi, SSTI
-│   ├── injection_misc.py    # NoSQLi, XXE, CMDi, SSRF
-│   ├── auth.py              # JWT, OAuth, IDOR, session
-│   ├── auth_bypass.py       # CSRF, SAML, forced browse
-│   ├── client_side.py       # Cache poison, CORS, clickjack, CRLF
-│   ├── encoding.py          # SSI, null byte, unicode bypasses
-│   ├── fuzzing.py           # ffuf, WAF detect/bypass
-│   ├── smuggling.py         # HTTP/2 smuggling, race conditions
-│   ├── vuln_scan.py         # Nuclei, TLS, OOB
-│   ├── network.py           # RFI, WebDAV, SNMP
-│   ├── third_party.py       # SRI, HSTS, mixed content
-│   ├── origin_cloud.py      # Origin IP, cloud buckets
-│   ├── secrets_git.py       # Secrets, git exposure
+│   │   ├── subdomain.py     # Subdomain enumeration (subfinder, findomain, alterx, dnsgen)
+│   │   ├── dns.py           # DNS resolution + DNS cache (puredns, massdns, dnsx)
+│   │   ├── scan.py          # Port scanning + live host detection (naabu, nmap, httpx)
+│   │   ├── harvest.py       # URL/endpoint harvesting (gau, waymore, katana)
+│   │   ├── jsintel.py       # JavaScript analysis (SecretFinder, xnLinkFinder)
+│   │   ├── params.py        # Parameter discovery (arjun)
+│   │   └── osint.py         # WHOIS and passive OSINT
+│   ├── injection.py         # XSS (dalfox, kxss, Gxss), SQLi (sqlmap), SSTI
+│   ├── injection_misc.py    # NoSQLi, XXE, CMDi (commix), SSRF, LDAP, deserialization
+│   ├── auth.py              # JWT, OAuth, IDOR, password reset
+│   ├── auth_bypass.py       # CSRF, SAML, forced browse, method override
+│   ├── account.py           # Account enumeration, 2FA, ATO
+│   ├── client_side.py       # Cache poison, CORS (corsy), clickjack, CRLF (crlfuzz)
+│   ├── advanced_inject.py   # DOM XSS via Playwright, blind XSS via OAST
+│   ├── encoding.py          # SSI, null byte, double encoding, unicode bypasses
+│   ├── fuzzing.py           # Endpoint fuzzing (ffuf), WAF detect/bypass (wafw00f)
+│   ├── smuggling.py         # HTTP/2 request smuggling, race conditions
+│   ├── vuln_scan.py         # Nuclei, testssl.sh, wpscan, trivy
+│   ├── network.py           # RFI, WebDAV, SNMP, banner grab
+│   ├── third_party.py       # SRI, HSTS, mixed content, third-party JS
+│   ├── origin_cloud.py      # Origin IP, cloud buckets (cloud_enum, cloudfox)
+│   ├── secrets_git.py       # Secrets (trufflehog, gitleaks, unfurl), git exposure
 │   ├── web_infra.py         # CDN, CSP, file upload
-│   ├── email_misc.py        # Email sec, SMTP, workflow
+│   ├── graphql_chain.py     # GraphQL (inql, clairvoyance, graphinder) + evidence phases
+│   ├── email_misc.py        # Email security, SMTP enumeration, workflow
+│   ├── llm_ai.py            # LLM/AI application security phases
+│   ├── cloud.py             # Cloud metadata, exposed databases, bucket perms
+│   ├── cms.py, cms_deep.py  # CMS fingerprinting + deep checks (Magento, SharePoint, etc.)
+│   ├── modern_web.py, modern_proto.py   # Modern protocols (gRPC, H2/H3, WebTransport)
+│   ├── bizlogic.py          # Business logic, payments, coupons, multi-tenancy
+│   ├── sso.py               # SSO/SAML advanced
+│   ├── electron.py, webrtc.py, pwa_security.py   # App/desktop/browser security
+│   ├── cookie_security.py, redos.py, protocol.py # Cookie audit, ReDoS, misc protocol
+│   ├── encoding.py, extended.py, supplychain.py  # Bypasses, TLSX, dependency exposure
 │   └── infra.py             # Backward-compat re-export shim
 │
-├── exceptions.py            # 28-class exception hierarchy
+├── exceptions.py            # VulnForgeError hierarchy (28 classes)
 ├── audit.py                 # Structured JSONL audit logging
 ├── dedup.py                 # Cross-phase deduplication (prefix-indexed)
 │
 ├── finding.py               # Structured Finding dataclass
 ├── remediation.py           # CWE-to-fix mappings (25 vuln types)
 ├── severity.py              # Risk scoring (A-F grades)
-├── artifacts.py             # Artifact registry, severity classification
-├── confidence.py            # Finding confidence scoring
+├── artifacts.py             # Artifact registry (~200 per-phase files)
+├── certainty.py             # Finding confidence scoring
 ├── exploit_chain.py         # Cross-phase exploit chain analysis
+├── attack_surface.py        # Attack surface graph generation
 │
-├── api.py                   # REST API server (stdlib http.server)
-├── ratelimiter.py           # Token-bucket rate limiter
-├── ratelimit.py             # Per-tool rate limiting
 ├── reporting.py             # HTML, Markdown, JSON, SARIF, Faraday reports
+├── proof.py                 # Auto-PoC generation
+├── target_profile.py        # Target profiling + auto-tuning
+├── tool_health.py           # Tool health monitoring
 │
-├── ai.py                    # LLM provider abstraction
+├── ai.py                    # LLM provider abstraction (openai/anthropic/ollama/dry-run)
 ├── ai_triage.py             # AI-powered vulnerability triage
 ├── ai_exploit.py            # AI-powered exploit suggestions
 │
-├── attack_surface.py        # Attack surface graph generation
-├── bot.py                   # Discord/Slack companion bot
+├── api.py, openapi.py       # REST API server + OpenAPI spec (stdlib; library API)
 ├── dashboard_server.py      # Live web dashboard (SSE)
 ├── tui.py                   # Terminal UI dashboard
-│
-├── events.py                # In-process event bus (pub/sub)
-├── plugin.py                # Plugin/extension system
+├── bot.py, notify.py        # Discord/Slack companion bot, webhook notifications
 ├── distributed.py           # SSH-based distributed scanning
+├── plugin.py, marketplace.py# Plugin system (live), marketplace client (library)
 ├── interactsh.py            # OOB interaction tracking
-├── learning.py              # False-positive learning
-├── monitor.py               # Scheduled re-scan
-├── notify.py                # Slack/Discord/Telegram notifications
-├── poc.py                   # Auto-PoC generation
+├── events.py                # In-process event bus (pub/sub)
+├── credentials.py           # Encrypted credential store (library)
+├── compliance.py            # PCI DSS / HIPAA / SOC 2 reporting (library)
+├── threat_intel.py          # MITRE ATT&CK mapping + threat feeds (library)
+├── ml_phase_selector.py, ml_vuln.py   # Phase selection + vuln classification (library)
+├── diff.py                  # Scan comparison
 ├── review.py                # Interactive finding review
-├── target_profile.py        # Target profiling + auto-tuning
-├── tool_health.py           # Tool health monitoring
-├── useragent.py             # User-agent rotation
-└── verify.py                # Output verification/filtering
+├── fleet.py                 # Batch scan runner
+├── filter.py                # Finding filtering helpers
+├── adapters.py              # Cross-phase result adapters
+├── spoof.py                 # Request fingerprint spoofing
+├── browser.py               # Browser automation helpers (Playwright)
+└── py.typed                 # PEP 561 marker
 ```
+
+Modules marked *library* exist with full implementations but are not yet wired into the CLI/pipeline; they are invoked programmatically.
 
 ## Pipeline Execution Flow
 
@@ -107,6 +127,11 @@ reconchain/
     │  → preset selection  │
     │  → phase selection   │
     │  → profile save/load │
+    └──────────┬──────────┘
+               │
+    ▼─────────────────────┐
+    │ Config file         │  ./vulnforge.cfg or
+    │ (TOML, CLI wins)    │  ~/.config/vulnforge/vulnforge.cfg
     └──────────┬──────────┘
                │
     ▼─────────────────────┐
@@ -145,11 +170,11 @@ reconchain/
     ▼─────────────────────┐
     │  Report Generation   │
     │  ├─ summary.json     │
-    │  ├─ report.html      │
-    │  ├─ report.md        │
+    │  ├─ report.html/md   │
     │  ├─ results.sarif    │  (if --format sarif)
-    │  ├─ dashboard.html   │  (if --dashboard)
-    │  └─ risk_score.json  │
+    │  ├─ results.faraday  │
+    │  ├─ dashboard.html   │
+    │  └─ risk/confidence  │
     └──────────┬──────────┘
                │
     ▼─────────────────────┐
@@ -157,6 +182,7 @@ reconchain/
     │  ├─ exploit chains   │
     │  ├─ confidence score │
     │  ├─ remediation      │
+    │  ├─ AI triage        │  (if --ai-provider set)
     │  └─ audit log        │
     └─────────────────────┘
 ```
@@ -171,11 +197,11 @@ Target domain
     │
 [01-RECON] ──→ subdomain enumeration
     │
-[02-RESOLVE] ─→ DNS resolution ──→ live_hosts.txt
+[02-RESOLVE] ─→ DNS resolution ──→ resolved.txt
     │
 [03-PERMUTE] ─→ permutation-based subs
     │
-[04-SCAN] ───→ httpx probing ──→ urls_all.txt, tech.txt
+[04-SCAN] ───→ port scan + httpx probing ──→ urls_all.txt, tech.txt
     │
 [05-HARVEST] ─→ URL/endpoint harvesting
     │
@@ -192,14 +218,14 @@ Target domain
     ├─→ [14-ORIGIN] ───→ origin IP discovery
     ├─→ [15-SECRETS] ──→ secret/credential detection
     │
-    ... (stages 12-27)
+    ... (stages 5-44)
     │
 [POST-SCAN]
     ├─→ DedupEngine (cross-phase deduplication)
     ├─→ exploit chain analysis
     ├─→ confidence scoring
     ├─→ risk scoring (A-F grade)
-    └─→ report generation (HTML, MD, JSON, SARIF)
+    └─→ report generation (HTML, MD, JSON, SARIF, Faraday)
 ```
 
 ## Key Design Decisions
@@ -211,7 +237,7 @@ Target domain
 | **Resumable** | State persisted to `state.json` after every phase. `--resume` picks up where left off. |
 | **Subprocess isolation** | Each tool runs as a subprocess with `RLIMIT_*` resource limits. Circuit breaker pauses after 3 failures. |
 | **Event bus** | Components communicate via pub/sub (`EventBus`). No polling or file watching needed. |
-| **Artifact registry** | Single source of truth for all 150+ output files. Prevents drift between phases and reports. |
+| **Artifact registry** | Single source of truth for all ~200 output files. Prevents drift between phases and reports. |
 | **Prefix-indexed dedup** | `DedupEngine` uses first-3-char prefix index for O(1) candidate narrowing on 50k+ findings. |
 | **Adaptive concurrency** | `AdaptiveThreadSemaphore` scales job count and subprocess limits based on real-time CPU/RAM. |
 | **Structured findings** | `Finding` dataclass with CWE, CVSS, severity, remediation, confidence score. |
@@ -222,48 +248,53 @@ Target domain
 ```
 ┌─────────────────────────────────────────────────┐
 │                Input Validation                   │
-│  ├─ Domain validation (_is_valid_hostname)        │
-│  ├─ Output path confinement (stays in ./out/)     │
-│  ├─ Batch file domain filtering                   │
-│  └─ State.json whitelist filtering                │
+│  ├─ Domain validation (hostname regex)           │
+│  ├─ Output path confinement (stays in ./out/)    │
+│  ├─ Batch file domain filtering                  │
+│  └─ State.json whitelist filtering               │
 ├─────────────────────────────────────────────────┤
 │              Secret Management                    │
-│  ├─ PipelineConfig.__repr__ redacts auth fields   │
-│  ├─ Auth bearer/api_key/basic/client_cert         │
-│  ├─ Cookie sanitization in logging                │
-│  └─ No secrets in subprocess env (env= param)     │
+│  ├─ PipelineConfig.__repr__ redacts auth fields  │
+│  ├─ Auth bearer/api_key/basic/client_cert        │
+│  ├─ Cookie sanitization in logging               │
+│  └─ No secrets in subprocess env (env= param)    │
 ├─────────────────────────────────────────────────┤
 │              Audit Logging                        │
-│  ├─ JSONL structured audit trail                  │
-│  ├─ scan_start / phase_complete events            │
-│  ├─ Timestamps + phase metadata                   │
-│  └─ Configurable enable/disable                   │
+│  ├─ JSONL structured audit trail                 │
+│  ├─ scan_start / phase_complete events           │
+│  ├─ Timestamps + phase metadata                  │
+│  └─ Configurable enable/disable                  │
 ├─────────────────────────────────────────────────┤
 │              Process Isolation                    │
-│  ├─ RLIMIT_NPROC, RLIMIT_AS, RLIMIT_NOFILE       │
-│  ├─ Per-process resource limits                   │
-│  ├─ Circuit breaker (3 failures → pause)          │
-│  └─ Child process cleanup on shutdown             │
+│  ├─ RLIMIT_NPROC (2048), RLIMIT_FSIZE (512 MB)  │
+│  ├─ Core dumps disabled                          │
+│  ├─ Circuit breaker (3 failures → pause)         │
+│  ├─ Emergency kill below 1 GB free RAM           │
+│  └─ Child process cleanup on shutdown            │
 └─────────────────────────────────────────────────┘
 ```
 
 ## Test Coverage
 
-- **183 tests** across 8 test files
+- **388+ tests** across 19 test files
 - Security tests: repr redaction, input validation, state filtering, audit logging, proxy safety, dedup performance, subprocess safety
 - Integration tests: phase integration, mocked subprocess output parsing, data flow, HTTP/DNS cache
-- Unit tests: exception hierarchy, CLI package, recon phases, config validation, pipeline DAG
+- Unit tests: exception hierarchy, CLI package, recon phases, config validation, pipeline DAG, threat intel
 
-## New in v3.1
+## Version History Highlights
 
-- **Modular CLI**: `cli.py` decomposed into `cli/` package (banner, parser, wizard, helpers)
-- **Modular Recon**: `recon.py` decomposed into `phases/recon/` package (8 focused modules)
-- **28-class Exception Hierarchy**: Typed exceptions for every failure mode
-- **PipelineConfig Validation**: `__post_init__` validates all 130+ fields at construction
-- **Binary Hash Verification**: Dockerfile SHA256 ARGs for reproducible builds
-- **Docker Security**: Non-root user, hardened run notes
-- **Secret Management**: `__repr__` redaction for auth fields
-- **Input Sanitization**: Domain validation, output path confinement
-- **Audit Logging**: Structured JSONL audit trail
-- **Performance**: Prefix-indexed dedup, HTTP response cache, DNS cache, memory optimizations
-- **Developer Experience**: Argument groups in `--help`, epilog with examples, 9 docstring improvements
+**v3.1**
+- Modular CLI: `cli/` package (banner, parser, wizard, helpers)
+- Modular recon: `phases/recon/` package (8 focused modules)
+- 28-class exception hierarchy rooted at `VulnForgeError`
+- PipelineConfig validation of 130+ fields at construction
+- Structured `Finding` dataclass with CWE/CVSS/severity/remediation/confidence
+- SARIF + Faraday reporting, REST API module, rate limiter, auth methods
+- Docker: SHA256-verified binaries, non-root user, hardened run notes
+- Secret management (`__repr__` redaction), input sanitization, JSONL audit log
+- Performance: prefix-indexed dedup, HTTP/DNS response caches
+
+**v3.0**
+- Phase catalog expanded to 213 phases across 45 DAG stages
+- AI triage, exploit chains, attack surface graphs, target profiling
+- Adaptive resource monitor, circuit breaker, safe mode

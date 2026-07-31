@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Monitor reconchain.py run, restarting on failure/stuck/browser opens."""
+"""Monitor vulnforge.py run, restarting on failure/stuck/browser opens."""
 from __future__ import annotations
 import argparse, re, subprocess, time, sys, os, psutil
 from pathlib import Path
@@ -42,7 +42,7 @@ def kill_proc_tree(proc):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Monitor reconchain.py run")
+    parser = argparse.ArgumentParser(description="Monitor vulnforge.py run")
     parser.add_argument("-d", "--domain", required=True, help="target domain")
     parser.add_argument("-o", "--outdir", default="", help="output directory")
     parser.add_argument("--proxy", default="", help="proxy URL")
@@ -59,7 +59,7 @@ def main():
 
     OUTDIR.mkdir(parents=True, exist_ok=True)
 
-    cmd = ["python3", str(WORKDIR / "reconchain.py"),
+    cmd = ["python3", str(WORKDIR / "vulnforge.py"),
         "-d", DOMAIN, "-o", str(OUTDIR),
         "--sample-urls-fuzz", "10", "--sample-urls-params", "10",
     ]

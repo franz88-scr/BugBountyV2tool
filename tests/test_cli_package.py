@@ -1,13 +1,13 @@
-"""Tests for the CLI sub-package (reconchain.cli)."""
+"""Tests for the CLI sub-package (vulnforge.cli)."""
 import argparse
 from io import StringIO
 from unittest.mock import patch
 
 import pytest
 
-from reconchain.cli import build_parser, InteractiveWizard, main
-from reconchain.cli.banner import _banner
-from reconchain.cli.parser import build_parser as build_parser_direct
+from vulnforge.cli import build_parser, InteractiveWizard, main
+from vulnforge.cli.banner import _banner
+from vulnforge.cli.parser import build_parser as build_parser_direct
 
 
 class TestBanner:
@@ -20,7 +20,7 @@ class TestBanner:
         _banner()
         captured = capsys.readouterr()
         assert "3.1.0" in captured.out
-        assert "ReconChain" in captured.out
+        assert "VulnForge" in captured.out
 
     def test_direct_import_same_as_package(self):
         assert build_parser is build_parser_direct
@@ -125,15 +125,15 @@ class TestInteractiveWizard:
         assert w is not None
 
     def test_wizard_has_clean_input(self):
-        from reconchain.cli.wizard import _clean_input
+        from vulnforge.cli.wizard import _clean_input
         assert callable(_clean_input)
 
     def test_wizard_has_prompt(self):
-        from reconchain.cli.wizard import _prompt
+        from vulnforge.cli.wizard import _prompt
         assert callable(_prompt)
 
     def test_wizard_has_prompt_yes_no(self):
-        from reconchain.cli.wizard import _prompt_yes_no
+        from vulnforge.cli.wizard import _prompt_yes_no
         assert callable(_prompt_yes_no)
 
 

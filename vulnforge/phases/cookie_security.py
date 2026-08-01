@@ -54,13 +54,19 @@ async def phase_194_COOKIETOSS(
                 host, method="GET", headers={"User-Agent": "Mozilla/5.0", **ct_extra_headers}
             )
             status, headers, body = await _async_urlopen_no_redirect(ct_urlopen, req, timeout=10)
-            set_cookie_headers = headers.get_all("Set-Cookie") if hasattr(headers, "get_all") else []
+            set_cookie_headers = (
+                headers.get_all("Set-Cookie") if hasattr(headers, "get_all") else []
+            )
             if not set_cookie_headers:
                 set_cookie_val = headers.get("Set-Cookie", "")
                 set_cookie_headers = [set_cookie_val] if set_cookie_val else []
 
             parsed_hostname = urllib.parse.urlparse(host).netloc.split(":")[0]
-            parent_domain = ".".join(parsed_hostname.split(".")[-2:]) if parsed_hostname.count(".") >= 1 else parsed_hostname
+            parent_domain = (
+                ".".join(parsed_hostname.split(".")[-2:])
+                if parsed_hostname.count(".") >= 1
+                else parsed_hostname
+            )
 
             for sc in set_cookie_headers:
                 if "__Host-" not in sc and "__Secure-" not in sc:
@@ -89,7 +95,9 @@ async def phase_194_COOKIETOSS(
                 },
             )
             _, test_headers, _ = await _async_urlopen_no_redirect(ct_urlopen, test_req, timeout=10)
-            resp_cookies = test_headers.get_all("Set-Cookie") if hasattr(test_headers, "get_all") else []
+            resp_cookies = (
+                test_headers.get_all("Set-Cookie") if hasattr(test_headers, "get_all") else []
+            )
             if not resp_cookies:
                 resp_cookies_val = test_headers.get("Set-Cookie", "")
                 resp_cookies = [resp_cookies_val] if resp_cookies_val else []
@@ -105,7 +113,9 @@ async def phase_194_COOKIETOSS(
             pass
         return results
 
-    ct_results = await asyncio.gather(*[_check_cookie_toss(t) for t in targets], return_exceptions=True)
+    ct_results = await asyncio.gather(
+        *[_check_cookie_toss(t) for t in targets], return_exceptions=True
+    )
     for r in ct_results:
         if isinstance(r, list):
             findings.extend(r)

@@ -682,9 +682,21 @@ async def phase_20_GRAPHQL(
         # Field suggestion brute-force with extended fields
         try:
             extended_fields = [
-                "users", "user", "admin", "password", "email", "token",
-                "secret", "config", "apiKey", "api_key", "accessToken",
-                "refreshToken", "resetToken", "session", "credentials",
+                "users",
+                "user",
+                "admin",
+                "password",
+                "email",
+                "token",
+                "secret",
+                "config",
+                "apiKey",
+                "api_key",
+                "accessToken",
+                "refreshToken",
+                "resetToken",
+                "session",
+                "credentials",
             ]
             for ext_field in extended_fields:
                 suggest_q = json.dumps(
@@ -699,7 +711,9 @@ async def phase_20_GRAPHQL(
                 _, _, su_body = await _async_urlopen(_gql_no_redirect, su_req, timeout=5)
                 su_text = su_body.decode("utf-8", errors="ignore")
                 if "__type" in su_text and "fields" in su_text:
-                    findings.append(f"[gql-field-suggest] {ep} — sensitive type '{ext_field}' suggested")
+                    findings.append(
+                        f"[gql-field-suggest] {ep} — sensitive type '{ext_field}' suggested"
+                    )
         except Exception:
             pass
         # Depth-limit bypass via recursive fragment (self-referencing)

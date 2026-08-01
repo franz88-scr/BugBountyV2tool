@@ -711,14 +711,39 @@ async def phase_27_SSPP(
 
 
 _DEP_CHECK_PATTERNS: List[Tuple[str, str, str, str]] = [
-    ("jquery", r"jquery[.-]?([\d.]+)", "3.5.0", "CVE-2020-11023+ (XSS via HTML parsing)"),
-    ("angular", r"angular[.-]?([\d.]+)", "1.8.0", "CVE-2022-25869 (XSS)"),
-    ("react", r"react[.-]?([\d.]+)", "16.14.0", "CVE-2023-XXXX (various)"),
-    ("lodash", r"lodash[.-]?([\d.]+)", "4.17.21", "CVE-2021-23337 (prototype pollution)"),
-    ("vue", r"vue[.-]?([\d.]+)", "2.7.0", "CVE-2023-XXXX (XSS)"),
+    (
+        "jquery",
+        r"jquery[.-]?([\d.]+)",
+        "3.5.0",
+        "CVE-2020-11022/CVE-2020-11023 (XSS in htmlPrefilter)",
+    ),
+    (
+        "angular",
+        r"angular[.-]?([\d.]+)",
+        "1.8.4",
+        "CVE-2022-25869 (XSS via IE page caching; angular EOL, no fixed version)",
+    ),
+    ("react", r"react[.-]?([\d.]+)", "16.14.0", "outdated (no tracked core react CVE)"),
+    (
+        "lodash",
+        r"lodash[.-]?([\d.]+)",
+        "4.17.21",
+        "CVE-2021-23337 (prototype pollution via defaultsDeep)",
+    ),
+    ("vue", r"vue[.-]?([\d.]+)", "2.7.0", "outdated (Vue 2 EOL; no tracked core CVE)"),
     ("moment", r"moment[.-]?([\d.]+)", "2.29.4", "CVE-2022-24785 (ReDoS)"),
-    ("bootstrap", r"bootstrap[.-]?([\d.]+)", "4.6.2", "CVE-2020-11023 (XSS)"),
-    ("express", r"express[.-]?([\d.]+)", "4.18.2", "CVE-2022-24999 (qs prototype pollution)"),
+    (
+        "bootstrap",
+        r"bootstrap[.-]?([\d.]+)",
+        "4.3.1",
+        "CVE-2019-8331 (XSS in tooltip/popover data-template)",
+    ),
+    (
+        "express",
+        r"express[.-]?([\d.]+)",
+        "4.17.3",
+        "CVE-2022-24999 (prototype poisoning via bundled qs < 6.10.3)",
+    ),
 ]
 
 

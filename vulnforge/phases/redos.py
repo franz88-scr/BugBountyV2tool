@@ -94,7 +94,9 @@ async def phase_192_REDOS(
                     for k, vals in qs.items():
                         for v in vals:
                             if k == param_name:
-                                query_parts.append(f"{urllib.parse.quote_plus(k)}={encoded_payload}")
+                                query_parts.append(
+                                    f"{urllib.parse.quote_plus(k)}={encoded_payload}"
+                                )
                             else:
                                 query_parts.append(
                                     f"{urllib.parse.quote_plus(k)}={urllib.parse.quote_plus(v)}"
@@ -103,8 +105,9 @@ async def phase_192_REDOS(
                     test_url = urllib.parse.urlunparse(parsed._replace(query=test_qs))
 
                     redos_req = urllib.request.Request(
-                        test_url, method="GET",
-                        headers={"User-Agent": "Mozilla/5.0", **redos_extra_headers}
+                        test_url,
+                        method="GET",
+                        headers={"User-Agent": "Mozilla/5.0", **redos_extra_headers},
                     )
                     t1 = asyncio.get_event_loop().time()
                     p_status, _, _ = await _async_urlopen(redos_urlopen, redos_req, timeout=15)
@@ -125,7 +128,9 @@ async def phase_192_REDOS(
                     continue
         return results
 
-    probe_results = await asyncio.gather(*[_probe_redos(u) for u in param_urls], return_exceptions=True)
+    probe_results = await asyncio.gather(
+        *[_probe_redos(u) for u in param_urls], return_exceptions=True
+    )
     for pr in probe_results:
         if isinstance(pr, list):
             findings.extend(pr)

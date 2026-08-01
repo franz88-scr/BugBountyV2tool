@@ -101,7 +101,8 @@ def _snapshot_findings(outdir: Path) -> Dict[str, Set[str]]:
 
 def _diff_findings(before: Dict[str, Set[str]], after: Dict[str, Set[str]], outdir: Path) -> None:
     """Compare before/after snapshots and write diff files."""
-    diff_dir = ensure(outdir / "diff")
+    diff_dir = outdir / "diff"
+    diff_dir.mkdir(parents=True, exist_ok=True)
     total_new = 0
     for fname, new_lines in sorted(after.items()):
         old_lines = before.get(fname, set())
@@ -606,8 +607,66 @@ async def run_pipeline(args: argparse.Namespace) -> int:
         return (not only or name in only) and name not in skip
 
     phases_to_run = [name for name, _, _ in _pipeline if _selected(name)]
+
+    # ML-guided phase selection: restrict the run to the top-N predicted phases
+    _ml_budget = getattr(args, "ml_select", 0)
+    if _ml_budget > 0:
+        try:
+            from vulnforge.ml_phase_selector import select_optimal_phases
+
+            _target_info: Dict[str, Any] = {}
+            _profile_fp = outdir / "target_profile.json"
+            if _profile_fp.exists():
+                try:
+                    _target_info = json.loads(_profile_fp.read_text(encoding="utf-8"))
+                except Exception:
+                    _target_info = {}
+            _suggested = set(
+                select_optimal_phases(target_info=_target_info, budget_phases=_ml_budget)
+            )
+            _kept = [name for name in phases_to_run if name in _suggested]
+            if not _kept and phases_to_run:
+                log("warn", "ML phase selection excluded all phases; running the full set")
+            else:
+                _dropped = len(phases_to_run) - len(_kept)
+                phases_to_run = _kept
+                log(
+                    "info",
+                    f"ML phase selection: kept {len(phases_to_run)} phases, "
+                    f"dropped {_dropped} (budget {_ml_budget})",
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception as _ml_exc:
+            log("warn", f"ML phase selection failed: {_ml_exc}")
+
     progress = Progress(phases_to_run)
     scan_status.set_total(len(phases_to_run))
+
+    # Terminal UI dashboard (disabled with --no-tui or when stderr is not a TTY)
+    _tui = None
+    if not getattr(args, "no_tui", False) and sys.stderr.isatty():
+        try:
+            from vulnforge.tui import get_tui
+
+            _tui_instance = get_tui()
+            _tui = _tui_instance
+            _tui_instance.update(phases_total=len(phases_to_run))
+            bus.subscribe(
+                "finding.new",
+                lambda _e: _tui_instance.add_finding(str(_e.data.get("text", ""))),
+            )
+            bus.subscribe(
+                "phase.start",
+                lambda _e: _tui_instance.update(phase=str(_e.data.get("phase", ""))),
+            )
+            _tui_instance.start()
+            log("info", "TUI dashboard active (use --no-tui to disable)")
+        except asyncio.CancelledError:
+            raise
+        except Exception as _tui_exc:
+            _tui = None
+            log("warn", f"TUI dashboard disabled: {_tui_exc}")
     active_needs_oast = any(
         name in {"08-FUZZ", "09-VULNSCAN", "10-TLSCMS", "11-INJECT"} for name in phases_to_run
     )
@@ -1283,6 +1342,57 @@ async def run_pipeline(args: argparse.Namespace) -> int:
             except Exception as _graph_exc:
                 log("warn", f"attack surface generation failed: {_graph_exc}")
 
+        # --- Post-scan: Compliance reports (PCI-DSS / HIPAA / SOC2) ---
+        if getattr(args, "compliance", False):
+            try:
+                from vulnforge.compliance import generate_all_compliance_reports
+
+                _comp = generate_all_compliance_reports(outdir, domain=args.domain)
+                log(
+                    "ok",
+                    "compliance: " + ", ".join(f"{k} → {v.name}" for k, v in _comp.items()),
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as _comp_exc:
+                log("warn", f"compliance reports failed: {_comp_exc}")
+
+        # --- Post-scan: Threat intelligence report (MITRE ATT&CK + feeds) ---
+        if getattr(args, "threat_intel", False):
+            try:
+                from vulnforge.threat_intel import generate_threat_intel_report
+
+                _ti_feed = getattr(args, "threat_feed", "")
+                _ti_path = generate_threat_intel_report(
+                    outdir,
+                    domain=args.domain,
+                    feed_path=Path(_ti_feed).resolve() if _ti_feed else None,
+                )
+                log("ok", f"threat intel report → {_ti_path}")
+            except asyncio.CancelledError:
+                raise
+            except Exception as _ti_exc:
+                log("warn", f"threat intel report failed: {_ti_exc}")
+
+        # --- Post-scan: ML vulnerability classification ---
+        if getattr(args, "ml_classify", False):
+            try:
+                from vulnforge.ml_vuln import VulnerabilityClassifier, classify_findings
+
+                _classified = classify_findings(
+                    outdir,
+                    min_confidence=getattr(args, "ml_min_confidence", 0.5),
+                )
+                _mlc_path = VulnerabilityClassifier().export_classified(_classified, outdir)
+                log(
+                    "ok",
+                    f"ML classification: {len(_classified)} findings → {_mlc_path}",
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as _mlc_exc:
+                log("warn", f"ML classification failed: {_mlc_exc}")
+
         # --- Post-scan: AI-powered analysis ---
         _ai_enabled = getattr(args, "ai_provider", "none") != "none"
         if _ai_enabled:
@@ -1331,6 +1441,19 @@ async def run_pipeline(args: argparse.Namespace) -> int:
                 raise
             except Exception as _dash_exc:
                 log("warn", f"dashboard server failed: {_dash_exc}")
+
+        # --- Start REST API server if configured ---
+        _api_port = getattr(args, "api_port", 0)
+        if _api_port:
+            try:
+                from vulnforge.api import start_api_server
+
+                _api_host = getattr(args, "api_host", "127.0.0.1")
+                start_api_server(outdir, host=_api_host, port=_api_port)
+            except asyncio.CancelledError:
+                raise
+            except Exception as _api_exc:
+                log("warn", f"REST API server failed: {_api_exc}")
 
         # --- Start companion bot if configured ---
         _bot_platform = getattr(args, "bot", "")
@@ -1389,5 +1512,12 @@ async def run_pipeline(args: argparse.Namespace) -> int:
             raise
         except Exception as _notify_exc:
             log("warn", f"notification failed: {_notify_exc}")
+        if _tui is not None:
+            try:
+                _tui.stop()
+            except asyncio.CancelledError:
+                raise
+            except Exception as _tui_stop_exc:
+                log("warn", f"TUI shutdown failed: {_tui_stop_exc}")
         progress.close()
     return 0

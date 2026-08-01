@@ -140,6 +140,16 @@ def _parse_simple(path: Path) -> Dict[str, Any]:
     return result
 
 
+def _section(cfg: Dict[str, Any], name: str) -> Dict[str, Any]:
+    """Return a named config section, guarding against non-dict values.
+
+    A top-level scalar key (e.g. ``proxy = "..."``) must not be mistaken for a
+    section; anything that is not a dict is treated as an empty section.
+    """
+    val = cfg.get(name)
+    return val if isinstance(val, dict) else {}
+
+
 def apply_config_to_args(cfg: Dict[str, Any], args: Any) -> Any:
     """Apply config values to argparse Namespace. CLI flags take precedence.
 
@@ -171,7 +181,9 @@ def apply_config_to_args(cfg: Dict[str, Any], args: Any) -> Any:
         return args
 
     # [general] section
-    gen = cfg.get("general", cfg)  # fallback: top-level keys
+    # Fallback to top-level keys, but only scalar ones — section dicts (e.g. [proxy])
+    # must not be picked up as general settings.
+    gen = cfg.get("general", {k: v for k, v in cfg.items() if not isinstance(v, dict)})
     _set_arg_if_default(args, "proxy", gen.get("proxy"))
     _set_arg_if_default(args, "vuln_proxy", gen.get("vuln_proxy"))
     _set_arg_if_default(args, "delay", gen.get("delay"))
@@ -185,7 +197,7 @@ def apply_config_to_args(cfg: Dict[str, Any], args: Any) -> Any:
         args.safe = True
 
     # [scan] section
-    scan = cfg.get("scan", {})
+    scan = _section(cfg, "scan")
     _set_arg_if_default(args, "dos_mode", scan.get("dos_mode"))
     _set_arg_if_default(args, "sqlmap_level", scan.get("sqlmap_level"))
     _set_arg_if_default(args, "sqlmap_risk", scan.get("sqlmap_risk"))
@@ -197,12 +209,12 @@ def apply_config_to_args(cfg: Dict[str, Any], args: Any) -> Any:
         args.safe = True
 
     # [idor] section
-    idor = cfg.get("idor", {})
+    idor = _section(cfg, "idor")
     _set_arg_if_default(args, "cookie_a", idor.get("cookie_a"))
     _set_arg_if_default(args, "cookie_b", idor.get("cookie_b"))
 
     # [api] section — set environment variables
-    api = cfg.get("api", {})
+    api = _section(cfg, "api")
     _set_env_if_present("SHODAN_API_KEY", api.get("shodan_key"))
     _set_env_if_present("WHOISXML_API", api.get("whoisxml_key"))
     _set_env_if_present("PDCP_API_KEY", api.get("projectdiscovery_key"))
@@ -230,21 +242,21 @@ def apply_config_to_args(cfg: Dict[str, Any], args: Any) -> Any:
                 f.write("\n".join(new_tokens) + "\n")
 
     # [notify] section
-    notify = cfg.get("notify", {})
+    notify = _section(cfg, "notify")
     _set_env_if_present("SLACK_WEBHOOK_URL", notify.get("slack_webhook"))
     _set_env_if_present("DISCORD_WEBHOOK_URL", notify.get("discord_webhook"))
     _set_env_if_present("TELEGRAM_BOT_TOKEN", notify.get("telegram_bot_token"))
     _set_env_if_present("TELEGRAM_CHAT_ID", notify.get("telegram_chat_id"))
 
     # [proxy] section (overrides general.proxy)
-    proxy_sec = cfg.get("proxy", {})
+    proxy_sec = _section(cfg, "proxy")
     if proxy_sec.get("url"):
         _set_arg_if_default(args, "proxy", proxy_sec["url"])
     if proxy_sec.get("vuln_url"):
         _set_arg_if_default(args, "vuln_proxy", proxy_sec["vuln_url"])
 
     # [ai] section
-    ai_sec = cfg.get("ai", {})
+    ai_sec = _section(cfg, "ai")
     _set_arg_if_default(args, "ai_provider", ai_sec.get("provider"))
     _set_arg_if_default(args, "ai_model", ai_sec.get("model"))
     if ai_sec.get("api_key"):
@@ -253,16 +265,16 @@ def apply_config_to_args(cfg: Dict[str, Any], args: Any) -> Any:
         _set_env_if_present(env_key, ai_sec["api_key"])
 
     # [dashboard] section
-    dash_sec = cfg.get("dashboard", {})
+    dash_sec = _section(cfg, "dashboard")
     if dash_sec.get("enabled"):
         args.dashboard = True
-        if not getattr(args, "dashboard_port", 0):
-            args.dashboard_port = 8765
     _set_arg_if_default(args, "dashboard_port", dash_sec.get("port"))
+    if dash_sec.get("enabled") and not getattr(args, "dashboard_port", 0):
+        args.dashboard_port = 8765
     _set_arg_if_default(args, "dashboard_host", dash_sec.get("host"))
 
     # [bot] section
-    bot_sec = cfg.get("bot", {})
+    bot_sec = _section(cfg, "bot")
     _set_arg_if_default(args, "bot", bot_sec.get("platform"))
     _set_arg_if_default(args, "bot_token", bot_sec.get("token"))
     _set_arg_if_default(args, "bot_channel", bot_sec.get("channel_id"))
@@ -270,7 +282,7 @@ def apply_config_to_args(cfg: Dict[str, Any], args: Any) -> Any:
         args.bot_mention = True
 
     # [plugins] section
-    plug_sec = cfg.get("plugins", {})
+    plug_sec = _section(cfg, "plugins")
     _set_arg_if_default(args, "plugins_dir", plug_sec.get("directory"))
 
     # [paths] section — Tool paths are used by install.sh, not directly by pipeline

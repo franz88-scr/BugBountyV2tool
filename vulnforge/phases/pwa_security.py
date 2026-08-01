@@ -95,9 +95,7 @@ async def phase_196_PUSHAPI(
             )
             status, headers, body = await _async_urlopen(push_urlopen, req, timeout=10)
             body_text = body.decode("utf-8", errors="ignore") if body else ""
-            findings.append(
-                f"[push-endpoint] {ep} — HTTP {status}"
-            )
+            findings.append(f"[push-endpoint] {ep} — HTTP {status}")
             # Check if endpoint requires auth
             if status == 200:
                 if "unauthorized" not in body_text.lower() and "login" not in body_text.lower():
@@ -136,7 +134,9 @@ async def phase_196_PUSHAPI(
                     raise
                 except Exception:
                     continue
-            push_reg_patterns = re.findall(r'["\']([^"\']*(?:push|subscribe|notification)[^"\']*)["\']', js_text, re.IGNORECASE)
+            push_reg_patterns = re.findall(
+                r'["\']([^"\']*(?:push|subscribe|notification)[^"\']*)["\']', js_text, re.IGNORECASE
+            )
             for pp in push_reg_patterns[:5]:
                 findings.append(f"[push-js-ref] {js} — push-related string: {pp}")
         except asyncio.CancelledError:
@@ -172,9 +172,7 @@ async def phase_196_PUSHAPI(
                 )
         except urllib.error.HTTPError as e:
             if e.code not in (401, 403):
-                findings.append(
-                    f"[push-unsubscribe-accessible] {ep} — HTTP {e.code}"
-                )
+                findings.append(f"[push-unsubscribe-accessible] {ep} — HTTP {e.code}")
         except asyncio.CancelledError:
             raise
         except Exception:

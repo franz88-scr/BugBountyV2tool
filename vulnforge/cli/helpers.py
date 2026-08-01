@@ -111,6 +111,47 @@ def main() -> int:
         list_plugins_cli()
         return 0
 
+    # Handle credential store commands: --cred-set/--cred-get/--cred-rm/--cred-list
+    if (
+        getattr(args, "cred_set", None)
+        or getattr(args, "cred_get", "")
+        or getattr(args, "cred_rm", "")
+        or getattr(args, "cred_list", False)
+    ):
+        from vulnforge.credentials import CredentialStore
+
+        _cred_dir = getattr(args, "cred_dir", "") or str(
+            Path.home() / ".config" / "vulnforge" / "credentials"
+        )
+        store = CredentialStore(Path(_cred_dir))
+        try:
+            if getattr(args, "cred_set", None):
+                name, value = args.cred_set
+                store.save(name, value)
+                print(f"stored credential: {name}")
+            elif getattr(args, "cred_get", ""):
+                value = store.load(args.cred_get)
+                if value is None:
+                    log("err", f"credential not found: {args.cred_get}")
+                    return 1
+                print(value)
+            elif getattr(args, "cred_rm", ""):
+                if store.delete(args.cred_rm):
+                    print(f"deleted credential: {args.cred_rm}")
+                else:
+                    log("err", f"credential not found: {args.cred_rm}")
+                    return 1
+            elif getattr(args, "cred_list", False):
+                creds = store.list_credentials()
+                if not creds:
+                    print("no credentials stored")
+                for c in creds:
+                    print(f"  {c['name']}")
+        except RuntimeError as _cred_exc:
+            log("err", str(_cred_exc))
+            return 1
+        return 0
+
     # Handle --dashboard: auto-set dashboard port
     if getattr(args, "dashboard", False) and not getattr(args, "dashboard_port", 0):
         args.dashboard_port = 8765

@@ -92,7 +92,7 @@ vulnforge/
 ├── tui.py                   # Terminal UI dashboard
 ├── bot.py, notify.py        # Discord/Slack companion bot, webhook notifications
 ├── distributed.py           # SSH-based distributed scanning
-├── plugin.py, marketplace.py# Plugin system (live), marketplace client (library)
+├── plugin.py               # Plugin system
 ├── interactsh.py            # OOB interaction tracking
 ├── events.py                # In-process event bus (pub/sub)
 ├── credentials.py           # Encrypted credential store (library)

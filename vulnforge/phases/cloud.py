@@ -878,11 +878,15 @@ async def phase_136_RATELIMITBYPASS(
                 req = urllib.request.Request(url, headers=headers, method="GET")
                 s, _, _ = await _async_urlopen(_urlopen, req, timeout=12)
                 if s == 200 and baseline_status in (429, 403):
-                    findings.append(f"[ratelimit-bypass] {url} method=X-Forwarded-For_SEQ:{seq_ip} status={s}")
+                    findings.append(
+                        f"[ratelimit-bypass] {url} method=X-Forwarded-For_SEQ:{seq_ip} status={s}"
+                    )
                     break
             except urllib.error.HTTPError as e:
                 if e.code == 200 and baseline_status in (429, 403):
-                    findings.append(f"[ratelimit-bypass] {url} method=X-Forwarded-For_SEQ:{seq_ip} status={e.code}")
+                    findings.append(
+                        f"[ratelimit-bypass] {url} method=X-Forwarded-For_SEQ:{seq_ip} status={e.code}"
+                    )
                     break
             except Exception:
                 pass
@@ -897,11 +901,15 @@ async def phase_136_RATELIMITBYPASS(
                 req = urllib.request.Request(url, headers=headers, method="GET")
                 s, _, _ = await _async_urlopen(_urlopen, req, timeout=12)
                 if s == 200 and baseline_status in (429, 403):
-                    findings.append(f"[ratelimit-bypass] {url} method=X-Real-IP_SEQ:{seq_ip} status={s}")
+                    findings.append(
+                        f"[ratelimit-bypass] {url} method=X-Real-IP_SEQ:{seq_ip} status={s}"
+                    )
                     break
             except urllib.error.HTTPError as e:
                 if e.code == 200 and baseline_status in (429, 403):
-                    findings.append(f"[ratelimit-bypass] {url} method=X-Real-IP_SEQ:{seq_ip} status={e.code}")
+                    findings.append(
+                        f"[ratelimit-bypass] {url} method=X-Real-IP_SEQ:{seq_ip} status={e.code}"
+                    )
                     break
             except Exception:
                 pass

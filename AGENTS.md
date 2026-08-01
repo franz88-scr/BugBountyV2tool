@@ -211,7 +211,10 @@ For every task:
 
 When the user corrects your approach, append a one-line rule here before ending the session. Write it concretely ("Always use X for Y"), never abstractly ("be careful with Y"). If an existing line already covers the correction, tighten it instead of adding a new one. Remove lines when the underlying issue goes away.
 
-- (empty)
+- Always use `VulnerabilityClassifier().export_classified()` to persist ML results; `classify_findings()` returns objects but never writes `classified_vulns.json`.
+- `CredentialStore` export/import only round-trips within a store that shares the salt (key = PBKDF2(hostname+user, per-store salt)); a fresh store cannot decrypt imported entries.
+- Compliance/threat-intel/ML modules read findings only from files matching `vulnforge.artifacts.ARTIFACTS` (e.g. `xss_findings.txt`), not arbitrary `.txt` names.
+- The user prefers running only new/targeted test files over the full pytest suite (slow); write fast, isolated tests.
 
 ---
 

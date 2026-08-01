@@ -1,6 +1,6 @@
 # VulnForge v3.1.0
 
-A stdlib-first Python orchestrator for chained bug-bounty reconnaissance and vulnerability discovery. Given a target domain, VulnForge runs **213 security phases** across **45 DAG stages**, coordinating **40+ external tools** into a single resumable pipeline with adaptive resource management.
+A stdlib-first Python orchestrator for chained bug-bounty reconnaissance and vulnerability discovery. Given a target domain, VulnForge runs **213 phases** across **45 DAG stages**, coordinating **40+ optional external tools** into a single resumable pipeline with adaptive resource management. Most phases are shallow heuristic probes; the pipeline's value is the dependency ordering, state persistence, and resource safety, not the depth of any single check.
 
 ```bash
 vulnforge -d example.com                      # full scan
@@ -16,6 +16,8 @@ vulnforge -d example.com --format sarif       # CI/CD-friendly output
 ```
 
 The `reconchain` command is retained as a backward-compatible alias for `vulnforge`.
+
+**Naming.** The product is named **VulnForge** (`vulnforge` package + CLI). The `reconchain` CLI alias and this repository's container name (`BugBountyV2tool`) are historical names kept for backward compatibility; new work should use `vulnforge`.
 
 ## Installation
 
@@ -51,6 +53,11 @@ The Dockerfile builds the Go/Python/Ruby toolchain and ships a hardened, read-on
 - **Adaptive resource monitor** — concurrency auto-scales on real-time CPU/RAM; circuit breaker pauses after repeated failures; emergency kill below free-RAM thresholds
 - **Multi-format reporting** — HTML, Markdown, JSON, SARIF (CI/CD), Faraday (JSONL), and a self-contained `dashboard.html`
 - **AI triage** — OpenAI, Anthropic, or Ollama for finding classification and exploit-chain suggestions (post-scan; off by default)
+- **Compliance reports** — PCI-DSS v4.0, HIPAA, and SOC2 control assessment from findings (`--compliance`)
+- **Threat intelligence** — MITRE ATT&CK technique mapping plus optional threat-feed indicator matching (`--threat-intel` / `--threat-feed`)
+- **ML classification & phase selection** — rule-based vulnerability classification with confidence scores (`--ml-classify`) and data-driven phase ranking (`--ml-select N`)
+- **Encrypted credential store** — Fernet-encrypted API keys/cookies with rotation and expiry (`--cred-set/--cred-get/--cred-rm/--cred-list`)
+- **REST API** — stdlib HTTP server for querying scan results after a run (`--api-port N`)
 - **Exploit chain analysis** — cross-phase attack-path detection with severity escalation (on by default)
 - **Attack surface graph** — interactive HTML + JSON graph of subdomain/host relationships
 - **Risk and confidence scoring** — A–F risk grades, per-finding confidence, CWE-to-remediation mappings
@@ -59,7 +66,7 @@ The Dockerfile builds the Go/Python/Ruby toolchain and ships a hardened, read-on
 - **Distributed scanning** — SSH-based multi-host orchestration
 - **Live dashboard and bot** — SSE web dashboard, Discord/Slack companion bot, Slack/Discord/Telegram notifications
 - **Secure by default** — RLIMIT caps, rate limiting, secret redaction, input sanitization, JSONL audit log
-- **CLI ergonomics** — 179 flags in 8 groups, interactive wizard, `--daemon`/`--status`, `--compare`, `--review`, batch mode
+- **CLI ergonomics** — 185 flags in 8 groups, interactive wizard, `--daemon`/`--status`, `--compare`, `--review`, batch mode
 
 ## Quick Start
 
@@ -84,7 +91,14 @@ vulnforge -d example.com --proxy socks5://127.0.0.1:9050     # proxy all phases
 vulnforge -d example.com --vuln-proxy socks5://127.0.0.1:9050  # proxy vuln phases only
 vulnforge -d example.com --cookie-a 'session=u1' --cookie-b 'session=u2'  # IDOR diffing
 vulnforge -d example.com --ai-provider ollama --ai-model llama3  # AI triage
-vulnforge -d example.com --distributed --distributed-hosts host1 host2  # SSH cluster
+vulnforge -d example.com --compliance                            # PCI-DSS/HIPAA/SOC2 reports
+vulnforge -d example.com --threat-intel --threat-feed feeds.json # MITRE ATT&CK + feed matches
+vulnforge -d example.com --ml-classify                           # ML classification + confidence
+vulnforge -d example.com --ml-select 15                          # run only the top-15 predicted phases
+vulnforge -d example.com --api-port 8080                         # serve results over REST after scan
+vulnforge --cred-set github_token ghp_xxx                        # store a credential
+vulnforge --cred-get github_token                                # retrieve a credential
+vulnforge --distributed --distributed-hosts host1 host2  # SSH cluster
 vulnforge -d example.com --plugins-dir ./plugins             # load custom phases
 vulnforge -d example.com --notify https://hooks.slack.com/... # notify webhook
 vulnforge -d example.com --bot discord --bot-token TOKEN     # companion bot
@@ -144,7 +158,7 @@ vulnforge --gen-config                                       # write example con
 161-ELECTRON          162-ELECTRONRCE   163-ELECTRONPROTO     164-ELECTRONUPD
 165-DEPCONF           166-TYPOSQUAT     167-H2RAPID           168-H3QUIC
 169-WEBTRANSPORT      170-CLIENTPP      171-CSSINJECT         172-DANGLING
-173-SERVICEWORKER     174-WASMSEC       175-OAUTHDEVICE       175-WS-DEEP
+173-SERVICEWORKER     174-WASMSEC       175-OAUTHDEVICE       175a-WS-DEEP
 176-JWT2SELF          177-SELENIUMXSS   178-APIRACE           179-WAFBYPASS
 180-SWAGGERABUSE      181-MFABYPASS     182-CAPTCHABYPASS     183-CACHEDIG
 184-SSRFPARTIAL       185-MAGENTO       186-SHAREPOINT        187-CONFLUENCE
@@ -154,6 +168,20 @@ vulnforge --gen-config                                       # write example con
 ```
 
 DoS-style phases (race bursts, request smuggling, GraphQL depth attacks, H2 rapid reset, credential spray) are gated behind `--dos` and are off by default.
+
+Not all phases are equal: 32 shell out to real external tools, 3 drive a browser, 174 are active heuristic probes, and 4 are local aggregation. See [Phase Classification](docs/phase-classification.md) for the per-phase breakdown (generated from the source).
+
+## Responsible Use
+
+VulnForge performs **active scanning** against targets. You may only use it against systems you own or are **explicitly authorized** to test. The operator — not the tool — is responsible for complying with all applicable laws and with the scope defined in any engagement contract or bug-bounty program's rules of engagement.
+
+By running VulnForge you agree that:
+
+- You have written authorization for every target you scan.
+- You will not exceed the authorized scope (avoid `--dos` on production systems unless explicitly permitted, and respect rate limits).
+- You will handle all findings and any credentials collected by the tool confidentially and disclose them only through the program's responsible-disclosure process.
+
+The project is distributed under the MIT license with no warranty (see `LICENSE`); misuse of the tool is solely the responsibility of the user.
 
 ## Integrated Tools (40+)
 
@@ -239,6 +267,11 @@ out/example.com/
 ├── exploit_chains.json               # Unless --no-exploit-chains
 ├── risk_score.json                   # Unless --no-risk
 ├── confidence_scores.json            # Unless --no-confidence
+├── compliance_pci_dss.md/.json       # --compliance
+├── compliance_hipaa.md/.json         # --compliance
+├── compliance_soc2.md/.json          # --compliance
+├── threat_intel_report.json          # --threat-intel
+├── classified_vulns.json             # --ml-classify
 ├── target_profile.json               # Unless --no-profile
 ├── tool_health.json / dedup_state.json
 ├── state.json                        # Resume state (after every phase)
@@ -311,7 +344,7 @@ vulnforge/
 ├── dashboard_server.py, tui.py   # SSE web dashboard, terminal UI
 ├── bot.py, notify.py     # Discord/Slack bot, Slack/Discord/Telegram notifications
 ├── distributed.py        # SSH-based distributed scanning
-├── plugin.py, marketplace.py      # Plugin system (live), marketplace (library)
+├── plugin.py               # Plugin system
 ├── interactsh.py         # OOB interaction tracking
 ├── events.py             # In-process event bus (pub/sub)
 ├── audit.py              # Structured JSONL audit logging
@@ -326,13 +359,13 @@ vulnforge/
 └── __init__.py           # Package exports, main()
 ```
 
-Modules marked *library* exist with full implementations but are not yet wired into the CLI/pipeline; they are invoked programmatically.
+Modules marked *library* are invoked programmatically; the rest are exposed via the CLI. Compliance, threat intel, ML classification, ML phase selection, credentials, and the REST API are now wired to flags (`--compliance`, `--threat-intel`, `--ml-classify`, `--ml-select`, `--cred-*`, `--api-port`).
 
 ## Development
 
 ```bash
 python3 -m pip install -e ".[dev]"
-pytest tests/ -v                    # 388+ tests across 19 files
+pytest tests/ -v                    # 435+ tests across 24 files
 ruff check vulnforge/ && ruff format --check vulnforge/
 mypy vulnforge/
 make ci                             # full CI suite

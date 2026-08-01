@@ -81,7 +81,7 @@ class OpenAIProvider(LLMProvider):
                 if choices and isinstance(choices[0], dict):
                     msg = choices[0].get("message", {})
                     if isinstance(msg, dict) and msg.get("content"):
-                        return msg["content"]
+                        return str(msg["content"])
                 log("warn", "warn: OpenAI returned empty output, treating as provider failure")
                 return ""
             except Exception as exc:

@@ -869,6 +869,33 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="only report findings new since last scan (diff mode)",
     )
+    g_rep.add_argument(
+        "--compliance",
+        action="store_true",
+        help="generate PCI-DSS, HIPAA, and SOC2 compliance reports after the scan",
+    )
+    g_rep.add_argument(
+        "--threat-intel",
+        action="store_true",
+        help="generate a MITRE ATT&CK + threat-feed intelligence report after the scan",
+    )
+    g_rep.add_argument(
+        "--threat-feed",
+        type=str,
+        default="",
+        help="path to JSON threat feed for --threat-intel (optional)",
+    )
+    g_rep.add_argument(
+        "--ml-classify",
+        action="store_true",
+        help="classify findings with the ML vulnerability classifier after the scan",
+    )
+    g_rep.add_argument(
+        "--ml-min-confidence",
+        type=float,
+        default=0.5,
+        help="minimum confidence for --ml-classify (default: 0.5)",
+    )
 
     # ── Integration ──────────────────────────────────────────────────
     g_int = p.add_argument_group("integration", "API server, dashboard, and notifications")
@@ -877,6 +904,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=0,
         help="start REST API server on this port (0 = disabled, default: 0)",
+    )
+    g_int.add_argument(
+        "--api-host",
+        type=str,
+        default="127.0.0.1",
+        help="REST API bind address (default: 127.0.0.1; 0.0.0.0 is refused for safety)",
     )
     g_int.add_argument(
         "--daemon",
@@ -1003,6 +1036,33 @@ def build_parser() -> argparse.ArgumentParser:
         "--list-plugins", action="store_true", help="list discovered plugins and exit"
     )
     g_adv.add_argument("--no-plugins", action="store_true", help="disable plugin loading")
+    g_adv.add_argument(
+        "--ml-select",
+        type=int,
+        default=0,
+        help="ML-guided phase selection: only run the top-N predicted phases (0 = disabled)",
+    )
+    g_adv.add_argument(
+        "--cred-dir",
+        type=str,
+        default="",
+        help="credential store directory (default: ~/.config/vulnforge/credentials)",
+    )
+    g_adv.add_argument(
+        "--cred-set",
+        nargs=2,
+        metavar=("NAME", "VALUE"),
+        default=None,
+        help="store an encrypted credential (requires the cryptography package)",
+    )
+    g_adv.add_argument(
+        "--cred-get",
+        type=str,
+        default="",
+        help="print a stored credential value (for use in scripts)",
+    )
+    g_adv.add_argument("--cred-rm", type=str, default="", help="delete a stored credential")
+    g_adv.add_argument("--cred-list", action="store_true", help="list stored credential names")
 
     # ── Meta ─────────────────────────────────────────────────────────
     g_meta = p.add_argument_group("meta", "configuration and display")

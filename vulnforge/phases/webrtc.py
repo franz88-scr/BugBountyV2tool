@@ -134,9 +134,7 @@ async def phase_193_WEBRTC(
                 )
                 status, headers, body = await _async_urlopen(webrtc_urlopen, req, timeout=8)
                 if status < 400 or body:
-                    findings.append(
-                        f"[webrtc-stun-accessible] {ep} — HTTP {status} (CWE-200)"
-                    )
+                    findings.append(f"[webrtc-stun-accessible] {ep} — HTTP {status} (CWE-200)")
         except asyncio.CancelledError:
             raise
         except Exception:

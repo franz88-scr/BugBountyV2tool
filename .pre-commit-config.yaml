@@ -9,6 +9,11 @@ repos:
       - id: check-merge-conflict
       - id: debug-statements
 
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.18.4
+    hooks:
+      - id: gitleaks
+
   - repo: https://github.com/astral-sh/ruff-pre-commit
     rev: v0.3.0
     hooks:
@@ -32,6 +37,11 @@ repos:
 
   - repo: local
     hooks:
+      - id: vulnforge-mypy
+        name: vulnforge typecheck
+        entry: mypy vulnforge/
+        language: system
+        pass_filenames: false
       - id: vulnforge-test
         name: vulnforge tests
         entry: python -m pytest tests/ -x -q

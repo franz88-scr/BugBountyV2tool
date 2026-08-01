@@ -1320,7 +1320,7 @@ async def phase_83_RACEBURST(
     return {"83-RACEBURST": str(_out), "count": len(findings)}
 
 
-async def phase_175_WS_DEEP(
+async def phase_175a_WS_DEEP(
     outdir: Path,
     t: Tools,
     only: PhaseSet,
@@ -1328,15 +1328,17 @@ async def phase_175_WS_DEEP(
     prev: Dict[str, Any],
     force: bool = False,
 ) -> Dict[str, Any]:
-    if skip & {"175-WS-DEEP"}:
+    if skip & {"175a-WS-DEEP"}:
         return {}
     _out = outdir / "websocket_deep.txt"
     if _out.exists() and not force:
-        return {"175-WS-DEEP": str(_out), "count": count_nonblank(_out)}
-    log("info", "Phase 175-WS-DEEP: WebSocket deep fuzzing")
+        return {"175a-WS-DEEP": str(_out), "count": count_nonblank(_out)}
+    log("info", "Phase 175a-WS-DEEP: WebSocket deep fuzzing")
     if _PIPELINE_CFG.proxy or _USE_PROXYCHAINS:
-        log("warn", "175-WS-DEEP: raw socket connections are incompatible with proxy/Tor; skipping")
-        return {"175-WS-DEEP": str(_out), "count": 0}
+        log(
+            "warn", "175a-WS-DEEP: raw socket connections are incompatible with proxy/Tor; skipping"
+        )
+        return {"175a-WS-DEEP": str(_out), "count": 0}
     findings: List[str] = []
 
     ws_endpoints: List[str] = []
@@ -1360,7 +1362,7 @@ async def phase_175_WS_DEEP(
         findings.append("[ws-deep] No WebSocket endpoints to test")
         out = ensure(_out)
         out.write_text("\n".join(findings) + ("\n" if findings else ""))
-        return {"175-WS-DEEP": str(out), "count": 0}
+        return {"175a-WS-DEEP": str(out), "count": 0}
 
     import base64 as _b64
     import socket as _socket
@@ -1566,7 +1568,9 @@ async def phase_175_WS_DEEP(
                 if resp is not None:
                     findings.append(f"[ws-ping-flood-tolerant] {ep} — survived 20 rapid pings")
                 else:
-                    findings.append(f"[ws-ping-flood-closed] {ep} — connection closed after ping flood (DoS risk)")
+                    findings.append(
+                        f"[ws-ping-flood-closed] {ep} — connection closed after ping flood (DoS risk)"
+                    )
                 sock.close()
         except Exception:
             if sock:
@@ -1576,7 +1580,20 @@ async def phase_175_WS_DEEP(
         try:
             sock, _ = _ws_connect(ep)
             if sock:
-                for close_code in [1000, 1001, 1002, 1003, 1004, 1005, 1006, 1011, 1015, 4000, 4001, 4999]:
+                for close_code in [
+                    1000,
+                    1001,
+                    1002,
+                    1003,
+                    1004,
+                    1005,
+                    1006,
+                    1011,
+                    1015,
+                    4000,
+                    4001,
+                    4999,
+                ]:
                     try:
                         close_frame = bytearray()
                         close_frame.append(0x88)
@@ -1605,19 +1622,36 @@ async def phase_175_WS_DEEP(
                 if sock:
                     resp = _ws_send_recv(sock, b"A" * size, timeout=3.0)
                     if resp is not None:
-                        findings.append(f"[ws-large-frame-accepted] {ep} — {size_name} frame ({size} bytes) accepted")
+                        findings.append(
+                            f"[ws-large-frame-accepted] {ep} — {size_name} frame ({size} bytes) accepted"
+                        )
                     else:
-                        findings.append(f"[ws-large-frame-closed] {ep} — {size_name} frame ({size} bytes) caused disconnect")
+                        findings.append(
+                            f"[ws-large-frame-closed] {ep} — {size_name} frame ({size} bytes) caused disconnect"
+                        )
                     sock.close()
             except Exception:
                 pass
 
         # d) Sub-protocol Enumeration
-        for sub_proto in ["graphql-ws", "json", "soap", "wamp", "mqtt", "amqp", "stomp", "v10.stomp", "v11.stomp", "v12.stomp"]:
+        for sub_proto in [
+            "graphql-ws",
+            "json",
+            "soap",
+            "wamp",
+            "mqtt",
+            "amqp",
+            "stomp",
+            "v10.stomp",
+            "v11.stomp",
+            "v12.stomp",
+        ]:
             try:
                 sock = _ws_try_upgrade_with_protocol(host_clean, port, path, scheme, sub_proto)
                 if sock is not None:
-                    findings.append(f"[ws-subprotocol-accepted] {ep} — subprotocol '{sub_proto}' accepted")
+                    findings.append(
+                        f"[ws-subprotocol-accepted] {ep} — subprotocol '{sub_proto}' accepted"
+                    )
                     sock.close()
             except Exception:
                 pass
@@ -1627,7 +1661,9 @@ async def phase_175_WS_DEEP(
             try:
                 sock = _ws_try_upgrade_with_origin(host_clean, port, path, scheme, origin)
                 if sock is not None:
-                    findings.append(f"[ws-cross-origin] {ep} — cross-origin WS accepted (Origin: {origin})")
+                    findings.append(
+                        f"[ws-cross-origin] {ep} — cross-origin WS accepted (Origin: {origin})"
+                    )
                     sock.close()
             except Exception:
                 pass
@@ -1636,5 +1672,5 @@ async def phase_175_WS_DEEP(
         findings.append("[ws-deep] No deep WebSocket findings")
     out = ensure(_out)
     out.write_text("\n".join(findings) + ("\n" if findings else ""))
-    log("ok", f"175-WS-DEEP: {len(findings)} deep WS findings → {out}")
-    return {"175-WS-DEEP": str(_out), "count": len(findings)}
+    log("ok", f"175a-WS-DEEP: {len(findings)} deep WS findings → {out}")
+    return {"175a-WS-DEEP": str(_out), "count": len(findings)}

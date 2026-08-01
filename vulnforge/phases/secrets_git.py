@@ -126,14 +126,20 @@ async def phase_15_SECRETS(
                     if name == "github-tok" and val.startswith("gh"):
                         try:
                             import urllib.request as _ur
+
                             gh_req = urllib.request.Request(
                                 "https://api.github.com/user",
-                                headers={"Authorization": f"Bearer {val}", "User-Agent": "vulnforge"},
+                                headers={
+                                    "Authorization": f"Bearer {val}",
+                                    "User-Agent": "vulnforge",
+                                },
                             )
                             try:
                                 gh_resp = _ur.urlopen(gh_req, timeout=5)
                                 if gh_resp.status == 200:
-                                    findings.append(f"[github-key-live] {val[:16]}... — active GitHub token ({js_url})")
+                                    findings.append(
+                                        f"[github-key-live] {val[:16]}... — active GitHub token ({js_url})"
+                                    )
                             except Exception:
                                 pass
                         except Exception:
@@ -153,11 +159,15 @@ async def phase_15_SECRETS(
                         fb_resp = _ur.urlopen(fb_req, timeout=5)
                         fb_data = fb_resp.read().decode("utf-8", errors="ignore")
                         if fb_data and fb_data != "null":
-                            findings.append(f"[firebase-open] {fb_url}/.json — database is publicly readable!")
+                            findings.append(
+                                f"[firebase-open] {fb_url}/.json — database is publicly readable!"
+                            )
                             findings.append(f"  data: {fb_data[:200]}")
                     except urllib.error.HTTPError as fb_err:
                         if fb_err.code == 401:
-                            findings.append(f"[firebase-restricted] {fb_url}/.json — requires auth (401)")
+                            findings.append(
+                                f"[firebase-restricted] {fb_url}/.json — requires auth (401)"
+                            )
                     except Exception:
                         pass
                 except Exception:

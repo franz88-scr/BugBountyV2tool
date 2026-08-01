@@ -1,4 +1,4 @@
-# Contributing to ReconChain
+# Contributing to VulnForge
 
 ## Development Setup
 
@@ -20,7 +20,7 @@ Clone the repo and install in development mode:
 
 - **Linting**: ruff (enforced via pre-commit hooks)
 - **Formatting**: ruff format
-- **Line length**: 120 characters max
+- **Line length**: 100 characters max
 - **Type hints**: Use typing annotations where practical
 - **Docstrings**: Module-level docstrings required; function docstrings for public API
 

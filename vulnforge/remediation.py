@@ -477,7 +477,9 @@ REMEDIATIONS: Dict[str, Remediation] = {
             "4. Use static regex patterns without user-controlled regex input\n"
             "5. Implement input length limits before regex processing"
         ),
-        references=["https://owasp.org/www-community/attacks/Regular_expression_Denial_of_Service_-_ReDoS"],
+        references=[
+            "https://owasp.org/www-community/attacks/Regular_expression_Denial_of_Service_-_ReDoS"
+        ],
     ),
     "cookie_toss": Remediation(
         cwe="CWE-614",

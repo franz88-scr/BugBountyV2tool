@@ -235,7 +235,9 @@ async def phase_153_BIZLOGIC(
             curr_ep, curr_status = ordered[i]
             next_ep, next_status = ordered[i + 1]
             if curr_status == 200 and next_status == 200:
-                findings.append(f"[state-machine-bypass] {curr_ep} (200) → {next_ep} (200) — no auth gate between steps")
+                findings.append(
+                    f"[state-machine-bypass] {curr_ep} (200) → {next_ep} (200) — no auth gate between steps"
+                )
 
     # Skip/Coupon-Stacking: try multiple coupons in sequence
     coupon_stack_payloads: List[Dict[str, Any]] = [
@@ -341,12 +343,15 @@ async def phase_154_PAYMENT(
     for ep in endpoints[:3]:
         try:
             import asyncio as _asyncio
+
             race_payload = {"amount": 1, "currency": "USD", "items": [{"id": 1, "qty": 1}]}
             race_tasks = []
             for _ in range(5):
                 race_tasks.append(_send_json(ep, race_payload, timeout=10))
             race_results = await _asyncio.gather(*race_tasks, return_exceptions=True)
-            success_count = sum(1 for r in race_results if isinstance(r, dict) and r["status"] in (200, 201))
+            success_count = sum(
+                1 for r in race_results if isinstance(r, dict) and r["status"] in (200, 201)
+            )
             if success_count > 1:
                 findings.append(
                     f"[payment-race] {ep} — {success_count}/5 concurrent payment requests succeeded (potential race condition)"

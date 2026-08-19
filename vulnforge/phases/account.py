@@ -13,6 +13,7 @@ from vulnforge.tools import Tools
 from vulnforge.utils import (
     _async_urlopen,
     _extra_headers_dict,
+    _extract_host,
     _get_urlopener,
     count_nonblank,
     ensure,
@@ -84,7 +85,7 @@ async def phase_191_ATO(
     hosts_file = outdir / "host_targets.txt"
     if not hosts_file.exists():
         hosts_file = outdir / "hosts.txt"
-    targets = [f"https://{h}" if not h.startswith("http") else h for h in read_lines(hosts_file)]
+    targets = [f"https://{_extract_host(h)}" for h in read_lines(hosts_file)]
     all_urls = read_lines(urls_file) if urls_file.exists() else []
 
     # 1. Password reset token predictability

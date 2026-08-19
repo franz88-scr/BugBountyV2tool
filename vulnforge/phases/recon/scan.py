@@ -25,6 +25,7 @@ from vulnforge.utils import (
     _existing_artifacts,
     _extra_headers_dict,
     _extra_http_args,
+    _extract_host,
     _get_urlopener,
     _parse_httpx_tech,
     _safe_name,
@@ -267,7 +268,7 @@ async def phase_04_SCAN(
         if _raw_hosts_file.exists():
             for _ln in read_lines(_raw_hosts_file):
                 if "[404]" not in _ln:
-                    _h_match = _ln.split("]")[0].split("//")[-1].strip()
+                    _h_match = _extract_host(_ln)
                     if _h_match:
                         _live_hosts.add(_h_match)
         _skipped = 0
@@ -389,7 +390,17 @@ async def phase_04b_TAKEOVER_VALIDATE(
                 ln = ln.strip()
                 if not ln:
                     continue
-                url = ln.split()[0] if ln.split() else ln
+                toks = ln.split()
+                url = ""
+                for _t in toks:
+                    if _t.startswith("http://") or _t.startswith("https://"):
+                        url = _t
+                        break
+                if not url:
+                    for _t in toks:
+                        if "." in _t and not _t.startswith("["):
+                            url = _t
+                            break
                 if url and (url.startswith("http://") or url.startswith("https://") or "." in url):
                     candidates.append(url)
     candidates = _dedupe_by_host_path(candidates)

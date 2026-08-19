@@ -158,7 +158,13 @@ async def phase_09_VULNSCAN(
         for ln in lines:
             if "waf-detect" in ln:
                 parts2 = ln.strip().split()
-                host_part = parts2[-1] if parts2 else ""
+                host_part = ""
+                for _p in parts2:
+                    if _p.startswith("http://") or _p.startswith("https://"):
+                        host_part = _p
+                        break
+                if not host_part:
+                    host_part = parts2[1] if len(parts2) > 1 else ""
                 host_part = host_part.replace("http://", "").replace("https://", "")
                 norm = f"waf-detect:{host_part}"
                 if norm in waf_seen:

@@ -77,7 +77,7 @@ async def phase_193_WEBRTC(
             continue
 
     # 2. Check JS files for WebRTC references
-    urls_file = outdir / "js_urls.txt"
+    urls_file = outdir / "urls_js.txt"
     js_urls = read_lines(urls_file) if urls_file.exists() else []
     if not js_urls:
         urls_all = outdir / "urls_all.txt"

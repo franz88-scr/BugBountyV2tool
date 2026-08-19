@@ -70,7 +70,7 @@ async def phase_196_PUSHAPI(
 
     urls_file = outdir / "urls_all.txt"
     all_urls = read_lines(urls_file) if urls_file.exists() else []
-    js_urls_file = outdir / "js_urls.txt"
+    js_urls_file = outdir / "urls_js.txt"
     js_urls = read_lines(js_urls_file) if js_urls_file.exists() else []
     if not js_urls:
         js_urls = [u for u in all_urls if u.lower().endswith(".js")]

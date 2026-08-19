@@ -31,6 +31,7 @@ from vulnforge.utils import (
     _async_urlopen,
     _async_urlopen_no_redirect,
     _extra_headers_dict,
+    _extract_host,
     _get_no_redirect_urlopener,
     _get_urlopener,
     _load_live_hosts,
@@ -212,7 +213,7 @@ async def phase_113_WEBDAV(
     webdav_methods = {"PUT", "DELETE", "MKCOL", "COPY", "MOVE", "PROPFIND", "LOCK", "UNLOCK"}
     sample = getattr(_PIPELINE_CFG, "sample_hosts_webdav", 10)
     for host in hosts[:sample]:
-        host_clean = host.split(":")[0].strip()
+        host_clean = _extract_host(host)
         if not host_clean:
             continue
         for scheme in ("https://", "http://"):
@@ -327,7 +328,7 @@ async def phase_114_SNMP(
 
     sample = getattr(_PIPELINE_CFG, "sample_hosts_snmp", 10)
     for host in hosts[:sample]:
-        host_clean = host.split(":")[0].strip()
+        host_clean = _extract_host(host)
         if not host_clean:
             continue
         try:

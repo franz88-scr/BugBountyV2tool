@@ -166,7 +166,7 @@ async def phase_174_WASMSEC(
         for u in read_lines(urls_file):
             if ".wasm" in u:
                 wasm_urls.append(u)
-    js_file = outdir / "js_urls.txt" if (outdir / "js_urls.txt").exists() else None
+    js_file = outdir / "urls_js.txt" if (outdir / "urls_js.txt").exists() else None
     if js_file:
         for u in read_lines(js_file):
             if ".wasm" in u:

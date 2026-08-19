@@ -832,7 +832,7 @@ async def phase_42_LDAP(
 ) -> Dict[str, Any]:
     if skip & {"42-LDAP"}:
         return {}
-    _out = outdir / "ldap_injection_42.txt"
+    _out = outdir / "ldap_injection.txt"
     if _out.exists() and not force:
         return {"42-LDAP": str(_out), "count": count_nonblank(_out)}
     log("info", "Phase 42-LDAP: LDAP injection detection")

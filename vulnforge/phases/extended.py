@@ -15,6 +15,7 @@ from vulnforge.process import _run_limited
 from vulnforge.tools import Tools
 from vulnforge.utils import (
     _async_urlopen,
+    _extract_host,
     _get_urlopener,
     _throttle_rate,
     ensure,
@@ -280,7 +281,7 @@ async def phase_143_TLSX(
         ][:200]
     for target in targets:
         try:
-            host = target.split("://")[-1].split(":")[0].split("/")[0]
+            host = _extract_host(target)
             rc, stdout, _ = await _run_limited(
                 ["tlsx", "-host", host, "-silent", "-json"],
                 stdout=asyncio.subprocess.PIPE,
@@ -459,7 +460,7 @@ async def phase_148_GRPCURL(
         urls = urls_file.read_text(encoding="utf-8", errors="ignore").splitlines()[:200]
     for url in urls:
         try:
-            host = url.split("://")[-1].split(":")[0].split("/")[0]
+            host = _extract_host(url)
             # Try common gRPC ports
             for port in ["50051", "443"]:
                 try:

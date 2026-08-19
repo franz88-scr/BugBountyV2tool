@@ -24,6 +24,7 @@ from vulnforge.tools import Tools
 from vulnforge.utils import (
     _async_urlopen,
     _extra_headers_dict,
+    _extract_host,
     _get_urlopener,
     _throttle_rate,
     count_nonblank,
@@ -684,7 +685,7 @@ async def phase_41_WEBSOCKET(
             return None
 
     for host in hosts:
-        host_clean = host.split(":")[0] if ":" in host else host
+        host_clean = _extract_host(host)
         for ws_path in _WS_COMMON_PATHS:
             ws_host_safe = host_clean.replace("\r", "").replace("\n", "")
             for scheme in ("wss", "ws"):

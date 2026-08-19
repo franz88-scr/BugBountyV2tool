@@ -3,6 +3,7 @@
 import fnmatch
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+from urllib.parse import urlparse
 
 from vulnforge.phases.helpers import PhaseSet
 from vulnforge.tools import Tools
@@ -68,7 +69,11 @@ async def phase_00_SCOPE(
                 dropped: List[str] = []
                 for ln in read_lines(af):
                     h = ln.strip().lower().rstrip(".")
-                    h = h.split("://")[-1].split("/")[0]
+                    h = h.split()[0] if h.split() else h
+                    if "://" in h:
+                        h = urlparse(h).hostname or ""
+                    else:
+                        h = urlparse("//" + h).hostname or ""
                     in_scope = any(
                         fnmatch.fnmatch(h, pattern) or h.endswith("." + pattern.lstrip("*."))
                         for pattern in scope_patterns

@@ -1076,6 +1076,162 @@ ARTIFACTS: List[ArtifactDef] = [
     ArtifactDef("jsluice", "146-JSLUICE.txt", "JSLuice", "146-JSLUICE", category="osint"),
     ArtifactDef("shortscan", "147-SHORTSCAN.txt", "Short Scan", "147-SHORTSCAN", category="osint"),
     ArtifactDef("grpcurl", "148-GRPCURL.txt", "gRPC", "148-GRPCURL", category="infra"),
+    # Cloud / infra outputs
+    ArtifactDef(
+        "bucket_enum", "bucket_enum.txt", "Bucket Enumeration", "46-BUCKET", vuln_type="bucket"
+    ),
+    ArtifactDef("cdn_detection", "cdn_detection.txt", "CDN Detection", "47-CDN"),
+    ArtifactDef(
+        "content_discovery",
+        "content_discovery.txt",
+        "Content Discovery",
+        "48-CONTENT",
+        vuln_type="info_leak",
+    ),
+    ArtifactDef(
+        "k8s_exposure",
+        "k8s_exposure.txt",
+        "Kubernetes Exposure",
+        "129-K8S",
+        vuln_type="kubernetes",
+        severity_hint="critical",
+    ),
+    # LLM/AI security
+    ArtifactDef(
+        "llm_prompt_injection",
+        "llm_prompt_injection.txt",
+        "LLM Prompt Injection",
+        "149-LLMSEC",
+        vuln_type="llm",
+    ),
+    ArtifactDef(
+        "llm_system_leak",
+        "llm_system_leak.txt",
+        "LLM System Leak",
+        "150-LLMLEAK",
+        vuln_type="llm",
+    ),
+    ArtifactDef(
+        "llm_rag_poison",
+        "llm_rag_poison.txt",
+        "LLM RAG Poisoning",
+        "151-RAGPOISON",
+        vuln_type="llm",
+    ),
+    ArtifactDef(
+        "llm_tool_abuse", "llm_tool_abuse.txt", "LLM Tool Abuse", "152-LLMADV", vuln_type="llm"
+    ),
+    # Business logic
+    ArtifactDef(
+        "bizlogic_workflow",
+        "bizlogic_workflow.txt",
+        "Workflow Bypass",
+        "153-BIZLOGIC",
+        vuln_type="biz_logic",
+    ),
+    ArtifactDef(
+        "bizlogic_payment",
+        "bizlogic_payment.txt",
+        "Payment Manipulation",
+        "154-PAYMENT",
+        vuln_type="biz_logic",
+    ),
+    ArtifactDef(
+        "bizlogic_coupon",
+        "bizlogic_coupon.txt",
+        "Coupon Manipulation",
+        "155-COUPON",
+        vuln_type="biz_logic",
+    ),
+    ArtifactDef(
+        "bizlogic_multitenant",
+        "bizlogic_multitenant.txt",
+        "Multi-tenant Isolation",
+        "156-MTENANT",
+        vuln_type="biz_logic",
+    ),
+    ArtifactDef("bizlogic_2fa", "bizlogic_2fa.txt", "2FA Bypass", "157-2FA", vuln_type="biz_logic"),
+    # SSO / federation
+    ArtifactDef("sso_oidc", "sso_oidc.txt", "SSO OIDC", "158-SSO", vuln_type="oauth"),
+    ArtifactDef("sso_saml", "sso_saml.txt", "SSO SAML", "159-SAMLADV", vuln_type="saml"),
+    ArtifactDef(
+        "sso_token_confusion",
+        "sso_token_confusion.txt",
+        "SSO Token Confusion",
+        "160-SSOCONF",
+        vuln_type="oauth",
+    ),
+    # Electron
+    ArtifactDef(
+        "electron_config",
+        "electron_config.txt",
+        "Electron Config",
+        "161-ELECTRON",
+        vuln_type="electron",
+    ),
+    ArtifactDef(
+        "electron_rce",
+        "electron_rce.txt",
+        "Electron RCE",
+        "162-ELECTRONRCE",
+        vuln_type="electron",
+        severity_hint="critical",
+    ),
+    ArtifactDef(
+        "electron_protocol",
+        "electron_protocol.txt",
+        "Electron Protocol",
+        "163-ELECTRONPROTO",
+        vuln_type="electron",
+    ),
+    ArtifactDef(
+        "electron_updater",
+        "electron_updater.txt",
+        "Electron Updater",
+        "164-ELECTRONUPD",
+        vuln_type="electron",
+    ),
+    # Supply chain
+    ArtifactDef(
+        "supplychain_depconf",
+        "supplychain_depconf.txt",
+        "Dependency Confusion",
+        "165-DEPCONF",
+        vuln_type="supplychain",
+    ),
+    ArtifactDef(
+        "supplychain_typosquat",
+        "supplychain_typosquat.txt",
+        "Typosquatting",
+        "166-TYPOSQUAT",
+        vuln_type="supplychain",
+    ),
+    # Modern protocols
+    ArtifactDef(
+        "modern_h2_rapid_reset",
+        "modern_h2_rapid_reset.txt",
+        "HTTP/2 Rapid Reset",
+        "167-H2RAPID",
+        vuln_type="h2",
+    ),
+    ArtifactDef(
+        "modern_quic_h3", "modern_quic_h3.txt", "HTTP/3 QUIC", "168-H3QUIC", vuln_type="h3"
+    ),
+    ArtifactDef(
+        "modern_webtransport",
+        "modern_webtransport.txt",
+        "WebTransport",
+        "169-WEBTRANSPORT",
+        vuln_type="webtransport",
+    ),
+    # WebSocket deep
+    ArtifactDef(
+        "websocket_deep",
+        "websocket_deep.txt",
+        "WebSocket Deep",
+        "175a-WS-DEEP",
+        vuln_type="websocket",
+    ),
 ]
 
 # ── Indexes for fast lookup ──────────────────────────────────────────────────

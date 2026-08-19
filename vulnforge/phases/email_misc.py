@@ -24,6 +24,7 @@ from vulnforge.tools import Tools
 from vulnforge.utils import (
     _async_urlopen,
     _extra_headers_dict,
+    _extract_host,
     _get_urlopener,
     _throttle_rate,
     count_nonblank,
@@ -299,7 +300,7 @@ async def phase_62_LOG_INJECT(
                 except Exception:
                     continue
     for host in read_lines(outdir / "hosts.txt") if (outdir / "hosts.txt").exists() else []:
-        host_clean = host.split(":")[0].strip() if ":" in host else host.strip()
+        host_clean = _extract_host(host)
         if not host_clean:
             continue
         for header_name in log_headers:
@@ -390,7 +391,7 @@ async def phase_63_DOC_ATTACK(
         log("warn", "63-DOC-ATTACK: no hosts; skipping")
         return {"63-DOC-ATTACK": str(_out), "count": 0}
     for host in hosts[:10]:
-        host_clean = host.split(":")[0].strip()
+        host_clean = _extract_host(host)
         if not host_clean:
             continue
         for scheme in ("https://", "http://"):

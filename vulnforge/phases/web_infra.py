@@ -21,6 +21,7 @@ from vulnforge.utils import (
     _async_urlopen,
     _async_urlopen_no_redirect,
     _extra_headers_dict,
+    _extract_host,
     _get_no_redirect_urlopener,
     _get_urlopener,
     _is_valid_hostname,
@@ -597,7 +598,7 @@ async def phase_52_SERVERLESS(
         log("warn", "52-SERVERLESS: no hosts; skipping")
         return {"52-SERVERLESS": str(_out), "count": 0}
     for host in hosts[:20]:
-        host_clean = host.split(":")[0].strip()
+        host_clean = _extract_host(host)
         if not host_clean:
             continue
         for scheme in ("https://", "http://"):
@@ -663,7 +664,7 @@ async def phase_53_CSP(
         log("warn", "53-CSP: no hosts; skipping")
         return {"53-CSP": str(_out), "count": 0}
     for host in hosts[:20]:
-        host_clean = host.split(":")[0].strip()
+        host_clean = _extract_host(host)
         if not host_clean:
             continue
         for scheme in ("https://", "http://"):
@@ -890,7 +891,7 @@ async def phase_56_EXPOSED_DB(
     ports_file = outdir / "ports.txt"
     all_ports: List[str] = read_lines(ports_file) if ports_file.exists() else []
     for host in hosts[:20]:
-        host_clean = host.split(":")[0].strip()
+        host_clean = _extract_host(host)
         if not host_clean:
             continue
         for port, label in _EXPOSED_DB_PORTS:
@@ -1018,7 +1019,7 @@ async def phase_57_DEFAULT_CREDS(
     ]
 
     for host in hosts[:15]:
-        host_clean = host.split(":")[0].strip()
+        host_clean = _extract_host(host)
         if not host_clean:
             continue
         for scheme in ("https://", "http://"):
@@ -1122,7 +1123,7 @@ async def phase_58_HOST_INJECT(
         log("warn", "58-HOST-INJECT: no hosts; skipping")
         return {"58-HOST-INJECT": str(_out), "count": 0}
     for host in hosts[:10]:
-        host_clean = host.split(":")[0].strip()
+        host_clean = _extract_host(host)
         if not host_clean:
             continue
         for scheme in ("https://", "http://"):

@@ -182,6 +182,24 @@ def _target_token(line: str) -> str:
     return token
 
 
+def _extract_host(host: str) -> str:
+    """Return the bare hostname from a URL, host:port, or httpx-tagged line.
+
+    Handles lines from ``host_targets.txt``/``hosts.txt`` which are httpx
+    output like ``https://example.com [200] [title]`` as well as bare
+    ``example.com`` / ``example.com:8443`` / IPv4 entries.
+    """
+    h = host.strip()
+    if not h:
+        return ""
+    h = h.split()[0]
+    if not h:
+        return ""
+    if "://" in h:
+        return urllib.parse.urlparse(h).hostname or ""
+    return urllib.parse.urlparse("//" + h).hostname or ""
+
+
 def _target_lines(path: Path) -> List[str]:
     return [t for line in read_lines(path) if (t := _target_token(line))]
 
@@ -664,7 +682,16 @@ async def _async_urlopen(
     _resp_holder: List[Any] = [None]
 
     def _fetch() -> Tuple[int, Any, bytes]:
-        resp = urlopen_func(req, timeout=timeout)
+        try:
+            resp = urlopen_func(req, timeout=timeout)
+        except urllib.error.HTTPError as e:
+            with contextlib.suppress(OSError):
+                data = e.read(MAX_RECV + 1)
+                if len(data) > MAX_RECV:
+                    data = data[:MAX_RECV]
+            return (e.code, e.headers, data)
+        except Exception:
+            raise
         _resp_holder[0] = resp
         try:
             data = resp.read(MAX_RECV + 1)

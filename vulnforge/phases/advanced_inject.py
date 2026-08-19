@@ -471,9 +471,12 @@ async def phase_179_WAFBYPASS(
     findings: List[str] = []
     _wb_urlopen = _get_urlopener()
     _wb_extra_headers = _extra_headers_dict()
-    waf_findings: List[str] = prev.get("21-WAF", [])
+    waf_findings: List[str] = []
+    waf_prev = prev.get("21-WAF")
+    if isinstance(waf_prev, str) and Path(waf_prev).exists():
+        waf_findings = read_lines(Path(waf_prev))
     if not waf_findings:
-        waf_file = outdir / "waf.txt"
+        waf_file = outdir / "waf_detection.txt"
         if waf_file.exists():
             waf_findings = read_lines(waf_file)
     urls_file = outdir / "urls_all.txt"
@@ -1096,7 +1099,10 @@ async def phase_184_SSRFPARTIAL(
     findings: List[str] = []
     _sp_urlopen = _get_urlopener()
     _sp_extra_headers = _extra_headers_dict()
-    ssrf_endpoints: List[str] = prev.get("66-SSRF-FULL", [])
+    ssrf_endpoints: List[str] = []
+    ssrf_prev = prev.get("66-SSRF-FULL")
+    if isinstance(ssrf_prev, str) and Path(ssrf_prev).exists():
+        ssrf_endpoints = read_lines(Path(ssrf_prev))
     if not ssrf_endpoints:
         ssrf_file = outdir / "ssrf_full.txt"
         if ssrf_file.exists():

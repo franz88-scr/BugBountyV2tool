@@ -1,25 +1,28 @@
 """Client-side vulnerability phases v2: prototype pollution, CSS injection, dangling markup."""
 
+import asyncio
+import urllib.error
+import urllib.parse
+import urllib.request
+from pathlib import Path
+from typing import Any, Dict, List
+
 from vulnforge.phases.helpers import (
-    _PIPELINE_CFG,
     _SKIP_PARAMS,
-    Any,
-    Dict,
-    List,
-    Path,
     PhaseSet,
-    Tools,
+    _is_static_url,
+)
+from vulnforge.process import _PIPELINE_CFG
+from vulnforge.tools import Tools
+from vulnforge.utils import (
     _async_urlopen,
     _extra_headers_dict,
     _get_urlopener,
-    _is_static_url,
     _throttle_rate,
-    asyncio,
     count_nonblank,
     ensure,
     log,
     read_lines,
-    urllib,
 )
 
 

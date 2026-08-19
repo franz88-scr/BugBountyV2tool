@@ -1,23 +1,22 @@
 """Cookie security phases: cookie tossing and MIME sniffing detection."""
 
-from vulnforge.phases.helpers import (
-    Any,
-    Dict,
-    List,
-    Path,
-    PhaseSet,
-    Tools,
+import asyncio
+import re
+import urllib.error
+import urllib.parse
+import urllib.request
+from pathlib import Path
+from typing import Any, Dict, List
+
+from vulnforge.phases.harness import phase_begin, phase_targets
+from vulnforge.phases.helpers import PhaseSet
+from vulnforge.tools import Tools
+from vulnforge.utils import (
     _async_urlopen,
     _async_urlopen_no_redirect,
     _extra_headers_dict,
     _get_urlopener,
-    asyncio,
-    count_nonblank,
-    ensure,
-    log,
-    re,
     read_lines,
-    urllib,
 )
 
 
@@ -29,23 +28,15 @@ async def phase_194_COOKIETOSS(
     prev: Dict[str, Any],
     force: bool = False,
 ) -> Dict[str, Any]:
-    if skip & {"194-COOKIETOSS"}:
+    run = phase_begin("194-COOKIETOSS", outdir, skip, force, "cookie_toss.txt")
+    if run is None:
         return {}
-    _out = outdir / "cookie_toss.txt"
-    if _out.exists() and not force:
-        return {"194-COOKIETOSS": str(_out), "count": count_nonblank(_out)}
-    log("info", "Phase 194-COOKIETOSS: cookie tossing detection")
-    findings: List[str] = []
     ct_urlopen = _get_urlopener()
     ct_extra_headers = _extra_headers_dict()
 
-    hosts_file = outdir / "host_targets.txt"
-    if not hosts_file.exists():
-        hosts_file = outdir / "hosts.txt"
-    targets = [f"https://{h}" if not h.startswith("http") else h for h in read_lines(hosts_file)]
+    targets = phase_targets(outdir, "hosts")
     if not targets:
-        log("warn", "194-COOKIETOSS: no HTTP targets; skipping")
-        return {"194-COOKIETOSS": str(_out), "count": 0}
+        return run.no_targets("no HTTP targets")
 
     async def _check_cookie_toss(host: str) -> List[str]:
         results: List[str] = []
@@ -118,13 +109,8 @@ async def phase_194_COOKIETOSS(
     )
     for r in ct_results:
         if isinstance(r, list):
-            findings.extend(r)
-    if not findings:
-        findings.append("[cookie-toss] No cookie tossing candidates detected (expected)")
-    out = ensure(_out)
-    out.write_text("\n".join(findings) + ("\n" if findings else ""))
-    log("ok", f"194-COOKIETOSS: {len(findings)} findings -> {out}")
-    return {"194-COOKIETOSS": str(out), "count": len(findings)}
+            run.findings.extend(r)
+    return run.done()
 
 
 async def phase_195_MIMESNIFF(
@@ -135,23 +121,15 @@ async def phase_195_MIMESNIFF(
     prev: Dict[str, Any],
     force: bool = False,
 ) -> Dict[str, Any]:
-    if skip & {"195-MIMESNIFF"}:
+    run = phase_begin("195-MIMESNIFF", outdir, skip, force, "mime_sniff.txt")
+    if run is None:
         return {}
-    _out = outdir / "mime_sniff.txt"
-    if _out.exists() and not force:
-        return {"195-MIMESNIFF": str(_out), "count": count_nonblank(_out)}
-    log("info", "Phase 195-MIMESNIFF: MIME sniffing protection detection")
-    findings: List[str] = []
     ms_urlopen = _get_urlopener()
     ms_extra_headers = _extra_headers_dict()
 
-    hosts_file = outdir / "host_targets.txt"
-    if not hosts_file.exists():
-        hosts_file = outdir / "hosts.txt"
-    targets = [f"https://{h}" if not h.startswith("http") else h for h in read_lines(hosts_file)]
+    targets = phase_targets(outdir, "hosts")
     if not targets:
-        log("warn", "195-MIMESNIFF: no HTTP targets; skipping")
-        return {"195-MIMESNIFF": str(_out), "count": 0}
+        return run.no_targets("no HTTP targets")
 
     urls_file = outdir / "urls_all.txt"
     all_urls = read_lines(urls_file) if urls_file.exists() else []
@@ -165,16 +143,22 @@ async def phase_195_MIMESNIFF(
             _, headers, body = await _async_urlopen(ms_urlopen, req, timeout=10)
             xcto = headers.get("X-Content-Type-Options", "")
             if "nosniff" not in xcto.lower():
-                findings.append(
+                run.findings.append(
                     f"[mime-missing-nosniff] {host} — missing X-Content-Type-Options: nosniff (CWE-200)"
                 )
             # Check Content-Type matches body content
             content_type = headers.get("Content-Type", "")
             if body and content_type:
                 body_str = body.decode("utf-8", errors="ignore").lower()
-                if "text/html" in content_type and "json" in content_type:
-                    findings.append(
-                        f"[mime-conflicting-type] {host} — Content-Type '{content_type}' may be incorrect"
+                looks_html = "<html" in body_str or "<!doctype" in body_str or "<head" in body_str
+                looks_json = body_str.lstrip().startswith(("{", "["))
+                if "text/html" in content_type and looks_json:
+                    run.findings.append(
+                        f"[mime-conflicting-type] {host} — Content-Type '{content_type}' but body looks like JSON"
+                    )
+                elif "json" in content_type and looks_html:
+                    run.findings.append(
+                        f"[mime-conflicting-type] {host} — Content-Type '{content_type}' but body looks like HTML"
                     )
         except asyncio.CancelledError:
             raise
@@ -198,13 +182,13 @@ async def phase_195_MIMESNIFF(
             content_type = headers.get("Content-Type", "")
             xcto = headers.get("X-Content-Type-Options", "")
             if "nosniff" not in xcto.lower():
-                findings.append(
+                run.findings.append(
                     f"[mime-json-no-nosniff] {url} — JSON endpoint without nosniff (CWE-200)"
                 )
             if body and ("application/json" in content_type or "text/javascript" in content_type):
                 body_str = body.decode("utf-8", errors="ignore")
                 if "<script>" in body_str.lower() or "<html" in body_str.lower():
-                    findings.append(
+                    run.findings.append(
                         f"[mime-html-injection] {url} — HTML-like content in JSON response (CWE-200)"
                     )
         except asyncio.CancelledError:
@@ -225,15 +209,10 @@ async def phase_195_MIMESNIFF(
             )
             _, headers, _ = await _async_urlopen(ms_urlopen, req, timeout=10)
             allow = headers.get("Allow", "") or headers.get("allow", "")
-            findings.append(f"[mime-upload-endpoint] {url} — Allow: {allow}")
+            run.findings.append(f"[mime-upload-endpoint] {url} — Allow: {allow}")
         except asyncio.CancelledError:
             raise
         except Exception:
             continue
 
-    if not findings:
-        findings.append("[mime-sniff] No MIME sniffing issues detected (expected)")
-    out = ensure(_out)
-    out.write_text("\n".join(findings) + ("\n" if findings else ""))
-    log("ok", f"195-MIMESNIFF: {len(findings)} findings -> {out}")
-    return {"195-MIMESNIFF": str(out), "count": len(findings)}
+    return run.done()

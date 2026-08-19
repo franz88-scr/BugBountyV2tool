@@ -1,22 +1,21 @@
 """WebRTC security: internal IP leak detection."""
 
-from vulnforge.phases.helpers import (
-    Any,
-    Dict,
-    List,
-    Path,
-    PhaseSet,
-    Tools,
+import asyncio
+import re
+import urllib.error
+import urllib.parse
+import urllib.request
+from pathlib import Path
+from typing import Any, Dict
+
+from vulnforge.phases.harness import phase_begin, phase_targets
+from vulnforge.phases.helpers import PhaseSet
+from vulnforge.tools import Tools
+from vulnforge.utils import (
     _async_urlopen,
     _extra_headers_dict,
     _get_urlopener,
-    asyncio,
-    count_nonblank,
-    ensure,
-    log,
-    re,
     read_lines,
-    urllib,
 )
 
 _WEBRTC_JS_PATTERNS = [
@@ -46,23 +45,15 @@ async def phase_193_WEBRTC(
     prev: Dict[str, Any],
     force: bool = False,
 ) -> Dict[str, Any]:
-    if skip & {"193-WEBRTC"}:
+    run = phase_begin("193-WEBRTC", outdir, skip, force, "webrtc_leak.txt")
+    if run is None:
         return {}
-    _out = outdir / "webrtc_leak.txt"
-    if _out.exists() and not force:
-        return {"193-WEBRTC": str(_out), "count": count_nonblank(_out)}
-    log("info", "Phase 193-WEBRTC: WebRTC internal IP leak detection")
-    findings: List[str] = []
     webrtc_urlopen = _get_urlopener()
     webrtc_extra_headers = _extra_headers_dict()
 
-    hosts_file = outdir / "host_targets.txt"
-    if not hosts_file.exists():
-        hosts_file = outdir / "hosts.txt"
-    targets = [f"https://{h}" if not h.startswith("http") else h for h in read_lines(hosts_file)]
+    targets = phase_targets(outdir, "hosts")
     if not targets:
-        log("warn", "193-WEBRTC: no HTTP targets; skipping")
-        return {"193-WEBRTC": str(_out), "count": 0}
+        return run.no_targets("no HTTP targets")
 
     # 1. Check if page loads WebRTC-related JS
     for host in targets[:20]:
@@ -76,7 +67,7 @@ async def phase_193_WEBRTC(
             body_text = body.decode("utf-8", errors="ignore")
             for pat in _WEBRTC_JS_PATTERNS:
                 if pat.lower() in body_text.lower():
-                    findings.append(
+                    run.findings.append(
                         f"[webrtc-js-detected] {host} — found '{pat}' in page content (CWE-200)"
                     )
                     break
@@ -103,13 +94,13 @@ async def phase_193_WEBRTC(
             js_text = body.decode("utf-8", errors="ignore")
             for pat in _WEBRTC_JS_PATTERNS:
                 if pat.lower() in js_text.lower():
-                    findings.append(
+                    run.findings.append(
                         f"[webrtc-js-file] {js_url} — '{pat}' referenced in JS (CWE-200)"
                     )
                     break
             stun_matches = re.findall(r"(?:stun|turn)[s]?://[^\s\"']+", js_text)
             for sm in stun_matches[:5]:
-                findings.append(f"[webrtc-stun-turn] {js_url} — STUN/TURN endpoint: {sm}")
+                run.findings.append(f"[webrtc-stun-turn] {js_url} — STUN/TURN endpoint: {sm}")
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -127,22 +118,19 @@ async def phase_193_WEBRTC(
     for ep in list(stun_endpoints)[:20]:
         try:
             if ep.startswith("stun"):
-                findings.append(f"[webrtc-stun-candidate] {ep} — STUN endpoint (verify manually)")
+                run.findings.append(
+                    f"[webrtc-stun-candidate] {ep} — STUN endpoint (verify manually)"
+                )
             else:
                 req = urllib.request.Request(
                     ep, method="GET", headers={"User-Agent": "Mozilla/5.0", **webrtc_extra_headers}
                 )
                 status, headers, body = await _async_urlopen(webrtc_urlopen, req, timeout=8)
                 if status < 400 or body:
-                    findings.append(f"[webrtc-stun-accessible] {ep} — HTTP {status} (CWE-200)")
+                    run.findings.append(f"[webrtc-stun-accessible] {ep} — HTTP {status} (CWE-200)")
         except asyncio.CancelledError:
             raise
         except Exception:
             continue
 
-    if not findings:
-        findings.append("[webrtc] No WebRTC internal IP leak vectors detected (expected)")
-    out = ensure(_out)
-    out.write_text("\n".join(findings) + ("\n" if findings else ""))
-    log("ok", f"193-WEBRTC: {len(findings)} findings -> {out}")
-    return {"193-WEBRTC": str(out), "count": len(findings)}
+    return run.done()

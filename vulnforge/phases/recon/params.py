@@ -1,26 +1,26 @@
 """Phase 07: parameter discovery."""
 
-from vulnforge.phases.helpers import (
+import json
+import subprocess
+from pathlib import Path
+from typing import Any, Dict, List, Tuple
+
+from vulnforge.phases.helpers import PhaseSet
+from vulnforge.process import (
     _PIPELINE_CFG,
-    Any,
-    Dict,
-    List,
-    Path,
-    PhaseSet,
-    Tools,
-    Tuple,
+    _maybe_timeout,
+    run_parallel,
+)
+from vulnforge.tools import Tools
+from vulnforge.utils import (
     _dedupe_by_host_path,
     _extra_headers_dict,
-    _maybe_timeout,
     count_nonblank,
     ensure,
-    json,
     log,
     merge_unique,
     read_jsonl,
     read_lines,
-    run_parallel,
-    subprocess,
 )
 
 

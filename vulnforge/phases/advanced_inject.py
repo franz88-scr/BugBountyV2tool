@@ -1,32 +1,36 @@
 """Advanced injection phases: OAuth device, DOM XSS, API race, WAF bypass, Swagger abuse, MFA bypass, CAPTCHA bypass, SSRF partial, Brotli oracle."""
 
+import asyncio
+import json
+import re
+import shlex
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
 from vulnforge.phases.helpers import (
-    _PIPELINE_CFG,
     _SKIP_PARAMS,
-    Any,
-    Dict,
-    List,
-    Optional,
-    Path,
     PhaseSet,
-    Tools,
+    _is_static_url,
+)
+from vulnforge.process import (
+    _PIPELINE_CFG,
+    _run,
+)
+from vulnforge.tools import Tools
+from vulnforge.utils import (
     _async_urlopen,
     _async_urlopen_no_redirect,
     _extra_headers_dict,
     _get_urlopener,
-    _is_static_url,
-    _run,
     _throttle_rate,
-    asyncio,
     count_nonblank,
     ensure,
-    json,
     log,
-    re,
     read_lines,
-    shlex,
-    time,
-    urllib,
 )
 
 

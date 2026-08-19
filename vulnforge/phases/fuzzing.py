@@ -1,39 +1,41 @@
 """Fuzzing phases: endpoint fuzzing, WAF detection/bypass, WebSocket fuzzing."""
 
+import asyncio
+import contextlib
+import os
+import urllib.error
+import urllib.parse
+import urllib.request
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Set, Tuple
+
 from vulnforge.phases.helpers import (
+    MAX_RECV,
+    PhaseSet,
+    _rate_limit_args,
+)
+from vulnforge.process import (
     _PIPELINE_CFG,
     _USE_PROXYCHAINS,
-    MAX_RECV,
-    Any,
-    Dict,
-    List,
-    Optional,
-    Path,
-    PhaseSet,
-    Set,
-    Tools,
-    Tuple,
+    _run,
+    run_parallel,
+)
+from vulnforge.tools import Tools
+from vulnforge.utils import (
     _async_urlopen,
     _dedupe_by_host_path,
     _extra_headers_dict,
     _extra_http_args,
     _extract_urls_from_ffuf_json,
     _get_urlopener,
-    _rate_limit_args,
-    _run,
     _safe_name,
     _throttle_rate,
-    asyncio,
-    contextlib,
     count_nonblank,
     ensure,
     log,
     merge_unique,
-    os,
     read_lines,
-    run_parallel,
     safe_suffix,
-    urllib,
 )
 
 

@@ -1,37 +1,37 @@
 """Authentication and session management phases."""
 
-from vulnforge.phases.helpers import (
+import asyncio
+import base64
+import json
+import math
+import re
+import shlex
+import urllib.error
+import urllib.parse
+import urllib.request
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Set, Tuple
+
+from vulnforge.phases.helpers import PhaseSet
+from vulnforge.process import (
     _PIPELINE_CFG,
-    Any,
-    Dict,
-    List,
-    Optional,
-    Path,
-    PhaseSet,
-    Set,
-    Tools,
-    Tuple,
+    _run,
+)
+from vulnforge.tools import Tools
+from vulnforge.utils import (
     _async_urlopen,
     _async_urlopen_no_redirect,
     _dedupe_by_host_path,
     _extra_headers_dict,
     _get_urlopener,
     _load_live_hosts,
-    _run,
     _safe_name,
     _throttle_rate,
-    asyncio,
-    base64,
     count_nonblank,
     ensure,
-    json,
     log,
-    math,
     parse_set_cookie_headers,
-    re,
     read_lines,
-    shlex,
-    urllib,
 )
 
 _AUTH_BYPASS_HEADERS = [

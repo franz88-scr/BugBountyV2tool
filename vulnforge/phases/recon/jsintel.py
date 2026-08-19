@@ -1,27 +1,28 @@
 """Phase 06 and shared JS secret patterns: JS intelligence analysis."""
 
+import re
+import shlex
+from pathlib import Path
+from typing import Any, Dict, List, Set, Tuple
+
 from vulnforge.phases.helpers import (
+    PhaseSet,
+    _rate_limit_args,
+)
+from vulnforge.process import (
     _PIPELINE_CFG,
     _USE_PROXYCHAINS,
-    Any,
-    Dict,
-    List,
-    Path,
-    PhaseSet,
-    Set,
-    Tools,
-    Tuple,
-    _extra_http_args,
     _maybe_timeout,
-    _rate_limit_args,
+    run_parallel,
+)
+from vulnforge.tools import Tools
+from vulnforge.utils import (
+    _extra_http_args,
     count_nonblank,
     ensure,
     log,
     merge_unique,
-    re,
     read_lines,
-    run_parallel,
-    shlex,
 )
 
 _JS_SECRET_PATTERNS: List[Tuple[str, str]] = [

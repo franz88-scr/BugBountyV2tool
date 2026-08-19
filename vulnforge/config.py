@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass, field
+import sys
+from dataclasses import dataclass, field, fields
 from typing import Any, Dict, List, Set
 
 from vulnforge.exceptions import ConfigError as ConfigError
@@ -732,9 +733,9 @@ class PipelineConfig:
     # ── Sampling (max artifacts per phase) ───────────────────────────
     sample_mode: str = "normal"
     sample_urls_fuzz: int = 200
-    sample_urls_params: int = 15
+    sample_urls_params: int = 50
     sample_urls_arjun_waf: int = 5
-    sample_hosts_ssl: int = 3
+    sample_hosts_ssl: int = 10
     sample_hosts_origin: int = 10
     sample_endpoints_l: int = 20
     sample_urls_xss_blind: int = 20
@@ -1048,3 +1049,81 @@ class PipelineConfig:
             raise ConfigError(
                 f"vuln_proxy must start with http://, https://, socks4://, socks4a://, socks5://, or socks5h://, got {self.vuln_proxy!r}"
             )
+
+        # Apply sampling mode + safe-mode halving to every sample_* int field.
+        for _f in fields(self):
+            if not _f.name.startswith("sample_"):
+                continue
+            _val = getattr(self, _f.name)
+            if not isinstance(_val, int):
+                continue
+            if self.sample_mode == "minimal":
+                _val = 1
+            elif self.sample_mode == "all":
+                _val = sys.maxsize
+            elif self.safe_mode:
+                _val = max(1, _val // 2)
+            setattr(self, _f.name, _val)
+
+
+SAMPLE_DEFAULTS: Dict[str, int] = {
+    _f.name: _f.default
+    for _f in fields(PipelineConfig)
+    if _f.name.startswith("sample_") and isinstance(_f.default, int)
+}
+
+SAMPLE_SPEED_CAPS: Dict[str, int] = {
+    "sample_urls_fuzz": 50,
+    "sample_urls_params": 10,
+    "sample_urls_nosqli": 5,
+    "sample_urls_cmdi": 5,
+    "sample_urls_xxe": 3,
+    "sample_urls_crlf": 5,
+    "sample_urls_redirect": 5,
+    "sample_urls_ldap": 5,
+    "sample_urls_depcheck": 5,
+    "sample_urls_upload": 3,
+    "sample_urls_xss_blind": 5,
+    "sample_urls_ssti": 2,
+    "sample_hosts_ssl": 2,
+    "sample_hosts_origin": 3,
+    "sample_hosts_cloud": 2,
+    "sample_hosts_git": 2,
+    "sample_hosts_graphql": 2,
+    "sample_hosts_waf": 2,
+    "sample_hosts_jwt": 5,
+    "sample_hosts_jwtadv": 5,
+    "sample_hosts_cached": 3,
+    "sample_hosts_clickjack": 5,
+    "sample_hosts_ratelimit": 3,
+    "sample_hosts_smuggle": 3,
+    "sample_hosts_websocket": 3,
+    "sample_hosts_h2smuggle": 3,
+    "sample_hosts_frameworks": 5,
+    "sample_urls_domxss": 5,
+    "sample_endpoints_race": 3,
+    "sample_endpoints_cors": 3,
+    "sample_endpoints_corsadv": 3,
+    "sample_endpoints_sspp": 3,
+    "sample_endpoints_l": 5,
+    "sample_endpoints_post": 2,
+    "sample_endpoints_oauth": 3,
+    "sample_endpoints_pwreset": 3,
+    "sample_endpoints_deserial": 3,
+    "sample_hosts_iisaspnet": 3,
+    "sample_hosts_tomcat": 3,
+    "sample_hosts_nodejs": 3,
+    "sample_hosts_laravel": 3,
+    "sample_hosts_django": 3,
+    "sample_hosts_symfony": 3,
+    "sample_hosts_cicd": 3,
+    "sample_hosts_docker": 3,
+    "sample_hosts_k8s": 3,
+    "sample_hosts_terraform": 3,
+    "sample_hosts_envdeep": 3,
+    "sample_hosts_gqlabuse": 3,
+    "sample_urls_apiversion": 5,
+    "sample_hosts_lbdetect": 3,
+    "sample_hosts_vhost": 3,
+    "sample_urls_ratelimitbypass": 5,
+}

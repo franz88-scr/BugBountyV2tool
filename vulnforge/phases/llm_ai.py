@@ -1,24 +1,23 @@
 """LLM/AI security testing phases — prompt injection, leakage, RAG poisoning, tool calling abuse."""
 
-from vulnforge.phases.helpers import (
-    Any,
-    Dict,
-    List,
-    Optional,
-    Path,
-    PhaseSet,
-    Set,
-    Tools,
+import json
+import urllib.error
+import urllib.parse
+import urllib.request
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Set
+
+from vulnforge.phases.helpers import PhaseSet
+from vulnforge.tools import Tools
+from vulnforge.utils import (
     _async_urlopen,
     _get_urlopener,
     _load_live_hosts,
     _throttle_rate,
     count_nonblank,
     ensure,
-    json,
     log,
     read_lines,
-    urllib,
 )
 
 _LLM_ENDPOINT_PATTERNS = [

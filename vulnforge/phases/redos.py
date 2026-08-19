@@ -1,22 +1,23 @@
 """ReDoS vulnerability detection phase."""
 
-from vulnforge.phases.helpers import (
-    Any,
-    Dict,
-    List,
-    Path,
-    PhaseSet,
-    Tools,
+import asyncio
+import os
+import urllib.error
+import urllib.parse
+import urllib.request
+from pathlib import Path
+from typing import Any, Dict, List
+
+from vulnforge.phases.helpers import PhaseSet
+from vulnforge.tools import Tools
+from vulnforge.utils import (
     _async_urlopen,
     _extra_headers_dict,
     _get_urlopener,
-    asyncio,
     count_nonblank,
     ensure,
     log,
-    os,
     read_lines,
-    urllib,
 )
 
 _REDOS_PAYLOADS = [

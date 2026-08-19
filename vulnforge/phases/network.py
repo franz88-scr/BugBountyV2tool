@@ -1,39 +1,42 @@
 """Network and infrastructure discovery phases: RFI, WebDAV, SNMP, banners, phpinfo, error leakage, wildcard DNS, DNS rebinding."""
 
+import asyncio
+import os
+import random
+import re
+import socket
 import string
+import subprocess
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from pathlib import Path
+from typing import Any, Dict, List
 
+from vulnforge.phases.harness import phase_begin
 from vulnforge.phases.helpers import (
-    _ENV_LOCK,
-    _PIPELINE_CFG,
     _PROXY_CLEAR_VARS,
     _SKIP_PARAMS,
     MAX_RECV,
-    Any,
-    Dict,
-    List,
-    Path,
     PhaseSet,
-    Tools,
+    _is_static_url,
+)
+from vulnforge.process import (
+    _ENV_LOCK,
+    _PIPELINE_CFG,
+)
+from vulnforge.tools import Tools
+from vulnforge.utils import (
     _async_urlopen,
     _async_urlopen_no_redirect,
     _extra_headers_dict,
     _get_no_redirect_urlopener,
     _get_urlopener,
-    _is_static_url,
     _load_live_hosts,
     _throttle_rate,
-    asyncio,
-    count_nonblank,
-    ensure,
     log,
-    os,
-    random,
-    re,
     read_lines,
-    socket,
-    subprocess,
-    time,
-    urllib,
 )
 
 # ── Local helper functions ─────────────────────────────────────────
@@ -99,21 +102,16 @@ async def phase_112_RFI(
     prev: Dict[str, Any],
     force: bool = False,
 ) -> Dict[str, Any]:
-    if skip & {"112-RFI"}:
+    run = phase_begin("112-RFI", outdir, skip, force, "rfi_findings.txt")
+    if run is None:
         return {}
-    _out = outdir / "rfi_findings.txt"
-    if _out.exists() and not force:
-        return {"112-RFI": str(_out), "count": count_nonblank(_out)}
-    log("info", "Phase 112-RFI: Remote file inclusion")
     oast_domain = prev.get("oast_domain", "") if isinstance(prev, dict) else ""
-    findings: List[str] = []
     _rfi_urlopen = _get_urlopener()
     _rfi_extra_headers = _extra_headers_dict()
     urls_file = outdir / "urls_all.txt"
     all_urls = read_lines(urls_file) if urls_file.exists() else []
     if not all_urls:
-        log("warn", "112-RFI: no URLs; skipping")
-        return {"112-RFI": str(_out), "count": 0}
+        return run.no_targets("no URLs")
     rfi_params = {
         "file",
         "include",
@@ -144,8 +142,7 @@ async def phase_112_RFI(
         u for u in all_urls if "=" in u and any(p + "=" in u.lower() for p in rfi_params)
     ][:sample]
     if not rfi_candidates:
-        log("warn", "112-RFI: no candidate URLs with RFI parameters; skipping")
-        return {"112-RFI": str(_out), "count": 0}
+        return run.no_targets("no candidate URLs with RFI parameters")
     for url in rfi_candidates:
         await _throttle_rate()
         try:
@@ -182,7 +179,7 @@ async def phase_112_RFI(
                                 hints.append("include_possible")
                             if hints or status not in (404, 403):
                                 hint_str = ",".join(hints) if hints else f"http_{status}"
-                                findings.append(
+                                run.findings.append(
                                     f"[rfi-candidate] {url.split('?')[0]} param={pname} "
                                     f"payload={payload[:80]} response_hint={hint_str}"
                                 )
@@ -194,12 +191,7 @@ async def phase_112_RFI(
                         break
         except Exception:
             continue
-    if not findings:
-        findings.append("[rfi] No RFI candidates detected")
-    out = ensure(_out)
-    out.write_text("\n".join(findings) + ("\n" if findings else ""))
-    log("ok", f"112-RFI: {len(findings)} findings → {out}")
-    return {"112-RFI": str(out), "count": len(findings)}
+    return run.done()
 
 
 async def phase_113_WEBDAV(
@@ -209,19 +201,14 @@ async def phase_113_WEBDAV(
     skip: PhaseSet,
     force: bool = False,
 ) -> Dict[str, Any]:
-    if skip & {"113-WEBDAV"}:
+    run = phase_begin("113-WEBDAV", outdir, skip, force, "webdav_enumeration.txt")
+    if run is None:
         return {}
-    _out = outdir / "webdav_enumeration.txt"
-    if _out.exists() and not force:
-        return {"113-WEBDAV": str(_out), "count": count_nonblank(_out)}
-    log("info", "Phase 113-WEBDAV: WebDAV enumeration")
-    findings: List[str] = []
     _wd_urlopen = _get_urlopener()
     hosts_file = outdir / "hosts.txt"
     hosts = read_lines(hosts_file) if hosts_file.exists() else []
     if not hosts:
-        log("warn", "113-WEBDAV: no hosts; skipping")
-        return {"113-WEBDAV": str(_out), "count": 0}
+        return run.no_targets("no hosts")
     webdav_methods = {"PUT", "DELETE", "MKCOL", "COPY", "MOVE", "PROPFIND", "LOCK", "UNLOCK"}
     sample = getattr(_PIPELINE_CFG, "sample_hosts_webdav", 10)
     for host in hosts[:sample]:
@@ -244,7 +231,7 @@ async def phase_113_WEBDAV(
                 enabled = allowed_methods & webdav_methods
                 if enabled or dav_header:
                     methods_str = ", ".join(sorted(enabled)) if enabled else dav_header
-                    findings.append(f"[webdav-enabled] {host_clean} methods={methods_str}")
+                    run.findings.append(f"[webdav-enabled] {host_clean} methods={methods_str}")
                     webdav_xml = (
                         '<?xml version="1.0"?><D:propfind xmlns:D="DAV:"><D:allprop/></D:propfind>'
                     )
@@ -268,7 +255,7 @@ async def phase_113_WEBDAV(
                             if not paths:
                                 paths = re.findall(r"<href>([^<]+)</href>", body, re.I)
                             for p in paths[:20]:
-                                findings.append(f"[webdav-enum] {host_clean} path={p[:200]}")
+                                run.findings.append(f"[webdav-enum] {host_clean} path={p[:200]}")
                     except Exception:
                         pass
                     if "PUT" in enabled:
@@ -285,7 +272,9 @@ async def phase_113_WEBDAV(
                                 req_opener, put_req, timeout=10
                             )
                             if ps in (200, 201, 204):
-                                findings.append(f"[webdav-writable] {host_clean} path={test_path}")
+                                run.findings.append(
+                                    f"[webdav-writable] {host_clean} path={test_path}"
+                                )
                                 del_req = urllib.request.Request(
                                     base + test_path,
                                     method="DELETE",
@@ -302,12 +291,7 @@ async def phase_113_WEBDAV(
                 break
             except Exception:
                 continue
-    if not findings:
-        findings.append("[webdav] No WebDAV services found")
-    out = ensure(_out)
-    out.write_text("\n".join(findings) + ("\n" if findings else ""))
-    log("ok", f"113-WEBDAV: {len(findings)} findings → {out}")
-    return {"113-WEBDAV": str(out), "count": len(findings)}
+    return run.done()
 
 
 async def phase_114_SNMP(
@@ -317,18 +301,13 @@ async def phase_114_SNMP(
     skip: PhaseSet,
     force: bool = False,
 ) -> Dict[str, Any]:
-    if skip & {"114-SNMP"}:
+    run = phase_begin("114-SNMP", outdir, skip, force, "snmp_findings.txt")
+    if run is None:
         return {}
-    _out = outdir / "snmp_findings.txt"
-    if _out.exists() and not force:
-        return {"114-SNMP": str(_out), "count": count_nonblank(_out)}
-    log("info", "Phase 114-SNMP: SNMP community string brute-force")
-    findings: List[str] = []
     hosts_file = outdir / "hosts.txt"
     hosts = read_lines(hosts_file) if hosts_file.exists() else []
     if not hosts:
-        log("warn", "114-SNMP: no hosts; skipping")
-        return {"114-SNMP": str(_out), "count": 0}
+        return run.no_targets("no hosts")
     community_strings = [
         "public",
         "private",
@@ -403,7 +382,7 @@ async def phase_114_SNMP(
                         or "valid" in output.lower()
                         or "discovered" in output.lower()
                     ):
-                        findings.append(f"[snmp-community] {host_clean} community={community}")
+                        run.findings.append(f"[snmp-community] {host_clean} community={community}")
                         enum_result = await asyncio.to_thread(
                             subprocess.run,
                             [
@@ -428,7 +407,7 @@ async def phase_114_SNMP(
                         lines = [line.strip() for line in enum_output.splitlines() if line.strip()]
                         info = "; ".join(lines[:10])[:300]
                         if info:
-                            findings.append(f"[snmp-enum] {host_clean} info={info}")
+                            run.findings.append(f"[snmp-enum] {host_clean} info={info}")
                         break
                 except subprocess.TimeoutExpired:
                     continue
@@ -463,12 +442,14 @@ async def phase_114_SNMP(
                     if data and len(data) > 20:
                         # SNMP response is ASN.1/BER — check if it looks like a real SNMP response
                         if data[0] == 0x30:  # ASN.1 SEQUENCE tag
-                            findings.append(f"[snmp-community] {host_clean} community={community}")
-                            findings.append(
+                            run.findings.append(
+                                f"[snmp-community] {host_clean} community={community}"
+                            )
+                            run.findings.append(
                                 f"[snmp-enum] {host_clean} info=snmp response received (community valid)"
                             )
                         else:
-                            findings.append(
+                            run.findings.append(
                                 f"[snmp-tested] {host_clean} community={community} (non-SNMP response)"
                             )
                         break
@@ -489,12 +470,7 @@ async def phase_114_SNMP(
                     os.environ[v] = val
                 else:
                     os.environ.pop(v, None)
-    if not findings:
-        findings.append("[snmp] No SNMP community strings discovered")
-    out = ensure(_out)
-    out.write_text("\n".join(findings) + ("\n" if findings else ""))
-    log("ok", f"114-SNMP: {len(findings)} findings → {out}")
-    return {"114-SNMP": str(out), "count": len(findings)}
+    return run.done()
 
 
 async def phase_115_BANNER(
@@ -505,12 +481,9 @@ async def phase_115_BANNER(
     prev: Dict[str, Any],
     force: bool = False,
 ) -> Dict[str, Any]:
-    if skip & {"115-BANNER"}:
+    run = phase_begin("115-BANNER", outdir, skip, force, "banners.txt")
+    if run is None:
         return {}
-    _out = outdir / "banners.txt"
-    if _out.exists() and not force:
-        return {"115-BANNER": str(_out), "count": count_nonblank(_out)}
-    log("info", "Phase 115-BANNER: SSH/FTP banner grabbing")
 
     # Collect hosts from ports.txt or hosts.txt
     hosts_ports: Dict[str, set] = {}  # host -> set of ports
@@ -534,14 +507,12 @@ async def phase_115_BANNER(
             hosts_ports.setdefault(h, set())
 
     if not hosts_ports:
-        log("warn", "115-BANNER: no hosts found; skipping")
-        return {"115-BANNER": str(_out), "count": 0}
+        return run.no_targets("no hosts found")
 
     service_ports = [22, 21, 23, 3389]
     sample_size = min(len(hosts_ports), _PIPELINE_CFG.sample_hosts_banner)
     sampled_hosts = list(hosts_ports.items())[:sample_size]
 
-    findings: List[str] = []
     loop = asyncio.get_event_loop()
     banner_results = await asyncio.gather(
         *[
@@ -559,16 +530,11 @@ async def phase_115_BANNER(
             if banner:
                 svc_name = {22: "SSH", 21: "FTP", 23: "Telnet", 3389: "RDP"}.get(port, str(port))
                 version = _extract_service_version(banner)
-                findings.append(
+                run.findings.append(
                     f"[banner] {host}:{port} service={svc_name} version={version} banner={banner[:120]}"
                 )
 
-    if not findings:
-        findings.append("[banner] No banners retrieved (expected)")
-    out = ensure(_out)
-    out.write_text("\n".join(findings) + ("\n" if findings else ""))
-    log("ok", f"115-BANNER: {len(findings)} banners → {out}")
-    return {"115-BANNER": str(out), "count": len(findings)}
+    return run.done()
 
 
 # ────────────────── Phase 116-PHPINFO: phpinfo() Disclosure ─────────────────
@@ -595,19 +561,14 @@ async def phase_116_PHPINFO(
     prev: Dict[str, Any],
     force: bool = False,
 ) -> Dict[str, Any]:
-    if skip & {"116-PHPINFO"}:
+    run = phase_begin("116-PHPINFO", outdir, skip, force, "phpinfo_disclosure.txt")
+    if run is None:
         return {}
-    _out = outdir / "phpinfo_disclosure.txt"
-    if _out.exists() and not force:
-        return {"116-PHPINFO": str(_out), "count": count_nonblank(_out)}
-    log("info", "Phase 116-PHPINFO: phpinfo() disclosure detection")
     all_hosts = _load_live_hosts(outdir)
     if not all_hosts:
-        log("warn", "116-PHPINFO: no live hosts; skipping")
-        return {"116-PHPINFO": str(_out), "count": 0}
+        return run.no_targets("no live hosts")
     _urlopen = _get_urlopener()
     _extra_headers = _extra_headers_dict()
-    findings: List[str] = []
     targets = [f"https://{h}" if not h.startswith("http") else h for h in all_hosts][
         : _PIPELINE_CFG.sample_hosts_phpinfo
     ]
@@ -662,13 +623,8 @@ async def phase_116_PHPINFO(
 
     probe_results = await asyncio.gather(*[_probe_phpinfo(t) for t in targets])
     for pr in probe_results:
-        findings.extend(pr)
-    if not findings:
-        findings.append("[phpinfo] No phpinfo() disclosures found (expected)")
-    out = ensure(_out)
-    out.write_text("\n".join(findings) + ("\n" if findings else ""))
-    log("ok", f"116-PHPINFO: {len(findings)} findings → {out}")
-    return {"116-PHPINFO": str(out), "count": len(findings)}
+        run.findings.extend(pr)
+    return run.done()
 
 
 # ────────────────── Phase 117-SRVSTATUS: Server Status Exposure ─────────────
@@ -713,19 +669,14 @@ async def phase_117_SRVSTATUS(
     prev: Dict[str, Any],
     force: bool = False,
 ) -> Dict[str, Any]:
-    if skip & {"117-SRVSTATUS"}:
+    run = phase_begin("117-SRVSTATUS", outdir, skip, force, "server_status_exposed.txt")
+    if run is None:
         return {}
-    _out = outdir / "server_status_exposed.txt"
-    if _out.exists() and not force:
-        return {"117-SRVSTATUS": str(_out), "count": count_nonblank(_out)}
-    log("info", "Phase 117-SRVSTATUS: server status page exposure detection")
     all_hosts = _load_live_hosts(outdir)
     if not all_hosts:
-        log("warn", "117-SRVSTATUS: no live hosts; skipping")
-        return {"117-SRVSTATUS": str(_out), "count": 0}
+        return run.no_targets("no live hosts")
     _urlopen = _get_urlopener()
     _extra_headers = _extra_headers_dict()
-    findings: List[str] = []
     targets = [f"https://{h}" if not h.startswith("http") else h for h in all_hosts][
         : _PIPELINE_CFG.sample_hosts_srvstatus
     ]
@@ -756,13 +707,8 @@ async def phase_117_SRVSTATUS(
 
     probe_results = await asyncio.gather(*[_probe_status(t) for t in targets])
     for pr in probe_results:
-        findings.extend(pr)
-    if not findings:
-        findings.append("[status-exposed] No server status pages exposed (expected)")
-    out = ensure(_out)
-    out.write_text("\n".join(findings) + ("\n" if findings else ""))
-    log("ok", f"117-SRVSTATUS: {len(findings)} findings → {out}")
-    return {"117-SRVSTATUS": str(out), "count": len(findings)}
+        run.findings.extend(pr)
+    return run.done()
 
 
 _ERRORLEAK_PAYLOADS = [
@@ -845,26 +791,20 @@ async def phase_118_ERRORLEAK(
     prev: Dict[str, Any],
     force: bool = False,
 ) -> Dict[str, Any]:
-    if skip & {"118-ERRORLEAK"}:
+    run = phase_begin("118-ERRORLEAK", outdir, skip, force, "error_leakage.txt")
+    if run is None:
         return {}
-    _out = outdir / "error_leakage.txt"
-    if _out.exists() and not force:
-        return {"118-ERRORLEAK": str(_out), "count": count_nonblank(_out)}
-    log("info", "Phase 118-ERRORLEAK: error page information leakage detection")
     urls_file = outdir / "urls_all.txt"
     all_urls = read_lines(urls_file) if urls_file.exists() else []
     if not all_urls:
-        log("warn", "118-ERRORLEAK: no URLs; skipping")
-        return {"118-ERRORLEAK": str(_out), "count": 0}
+        return run.no_targets("no URLs")
     _urlopen = _get_urlopener()
     _extra_headers = _extra_headers_dict()
-    findings: List[str] = []
     param_urls = [u for u in all_urls if "=" in u and not _is_static_url(u)][
         : _PIPELINE_CFG.sample_urls_errorleak
     ]
     if not param_urls:
-        log("warn", "118-ERRORLEAK: no parameter-bearing URLs; skipping")
-        return {"118-ERRORLEAK": str(_out), "count": 0}
+        return run.no_targets("no parameter-bearing URLs")
 
     async def _probe_leak(url: str) -> List[str]:
         results: List[str] = []
@@ -914,13 +854,8 @@ async def phase_118_ERRORLEAK(
 
     probe_results = await asyncio.gather(*[_probe_leak(u) for u in param_urls])
     for pr in probe_results:
-        findings.extend(pr)
-    if not findings:
-        findings.append("[error-leak] No error information leakage detected (expected)")
-    out = ensure(_out)
-    out.write_text("\n".join(findings) + ("\n" if findings else ""))
-    log("ok", f"118-ERRORLEAK: {len(findings)} findings → {out}")
-    return {"118-ERRORLEAK": str(out), "count": len(findings)}
+        run.findings.extend(pr)
+    return run.done()
 
 
 async def phase_119_WILDCARDDNS(
@@ -932,13 +867,9 @@ async def phase_119_WILDCARDDNS(
     prev: Dict[str, Any],
     force: bool = False,
 ) -> Dict[str, Any]:
-    if skip & {"119-WILDCARDDNS"}:
+    run = phase_begin("119-WILDCARDDNS", outdir, skip, force, "wildcard_dns.txt")
+    if run is None:
         return {}
-    _out = outdir / "wildcard_dns.txt"
-    if _out.exists() and not force:
-        return {"119-WILDCARDDNS": str(_out), "count": count_nonblank(_out)}
-    log("info", "Phase 119-WILDCARDDNS: wildcard DNS detection")
-    findings: List[str] = []
     count = max(5, min(10, _PIPELINE_CFG.sample_hosts_wildcarddns))
     random_subs = _generate_random_subdomains(domain, count)
     loop = asyncio.get_event_loop()
@@ -951,20 +882,17 @@ async def phase_119_WILDCARDDNS(
             "warn",
             f"119-WILDCARDDNS: wildcard DNS detected for {domain} — {resolved_count}/{count} random subdomains resolved",
         )
-        findings.append(
+        run.findings.append(
             f"[wildcard-detected] {domain} resolves_to={sample_ips} count={resolved_count}"
         )
         for sub, ips in zip(random_subs, results):
             if ips:
-                findings.append(f"  {sub} -> {','.join(ips)}")
+                run.findings.append(f"  {sub} -> {','.join(ips)}")
     else:
-        findings.append(
-            f"[no-wildcard] {domain} — only {resolved_count}/{count} random subdomains resolved (expected)"
+        log(
+            "info", f"119-WILDCARDDNS: no wildcard for {domain} ({resolved_count}/{count} resolved)"
         )
-    out = ensure(_out)
-    out.write_text("\n".join(findings) + ("\n" if findings else ""))
-    log("ok", f"119-WILDCARDDNS: {len(findings)} findings → {out}")
-    return {"119-WILDCARDDNS": str(out), "count": len(findings)}
+    return run.done()
 
 
 # ────────────────── Phase 120-DNSREBIND: DNS Rebinding Detection ─────────────
@@ -1003,30 +931,23 @@ async def phase_120_DNSREBIND(
     prev: Dict[str, Any],
     force: bool = False,
 ) -> Dict[str, Any]:
-    if skip & {"120-DNSREBIND"}:
+    run = phase_begin("120-DNSREBIND", outdir, skip, force, "dns_rebinding.txt")
+    if run is None:
         return {}
-    _out = outdir / "dns_rebinding.txt"
-    if _out.exists() and not force:
-        return {"120-DNSREBIND": str(_out), "count": count_nonblank(_out)}
-    log("info", "Phase 120-DNSREBIND: DNS rebinding detection")
-    findings: List[str] = []
     loop = asyncio.get_event_loop()
     # First DNS query
     first_ips = await loop.run_in_executor(None, _resolve_host, domain)
     if not first_ips:
-        findings.append(f"[dns-rebind] {domain} — could not resolve; skipping")
-        out = ensure(_out)
-        out.write_text("\n".join(findings) + ("\n" if findings else ""))
-        log("ok", f"120-DNSREBIND: {len(findings)} findings → {out}")
-        return {"120-DNSREBIND": str(out), "count": len(findings)}
+        run.findings.append(f"[dns-rebind] {domain} — could not resolve; skipping")
+        return run.done()
 
     # Check for private IPs
     private_ips = [ip for ip in first_ips if _is_private_ip(ip)]
     if private_ips:
         for ip in private_ips:
-            findings.append(f"[dns-private-ip] {domain} ip={ip}")
+            run.findings.append(f"[dns-private-ip] {domain} ip={ip}")
     else:
-        findings.append(
+        run.findings.append(
             f"[dns-rebind] {domain} resolves to public IP(s): {','.join(first_ips[:5])}"
         )
 
@@ -1037,12 +958,7 @@ async def phase_120_DNSREBIND(
         first_private = any(_is_private_ip(ip) for ip in first_ips)
         second_private = any(_is_private_ip(ip) for ip in second_ips)
         if first_private != second_private:
-            findings.append(
+            run.findings.append(
                 f"[dns-rebind-suspect] {domain} first_ip={','.join(first_ips)} second_ip={','.join(second_ips)}"
             )
-    if not findings:
-        findings.append(f"[dns-rebind] {domain} — no DNS rebinding indicators detected (expected)")
-    out = ensure(_out)
-    out.write_text("\n".join(findings) + ("\n" if findings else ""))
-    log("ok", f"120-DNSREBIND: {len(findings)} findings → {out}")
-    return {"120-DNSREBIND": str(out), "count": len(findings)}
+    return run.done()

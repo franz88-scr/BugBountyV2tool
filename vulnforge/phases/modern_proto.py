@@ -1,19 +1,18 @@
 """Modern protocol security phases — HTTP/2 rapid reset, HTTP/3/QUIC, WebTransport."""
 
-from vulnforge.phases.helpers import (
-    Any,
-    Dict,
-    List,
-    Path,
-    PhaseSet,
-    Tools,
+import asyncio
+import socket
+from pathlib import Path
+from typing import Any, Dict, List
+
+from vulnforge.phases.helpers import PhaseSet
+from vulnforge.tools import Tools
+from vulnforge.utils import (
     _load_live_hosts,
-    asyncio,
     count_nonblank,
     ensure,
     log,
     read_lines,
-    socket,
 )
 
 

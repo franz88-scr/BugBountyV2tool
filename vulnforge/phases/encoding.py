@@ -1,27 +1,30 @@
 """Encoding and bypass phases: SSI, JSON injection, null byte, double encoding, unicode, postMessage XSS, JSONP."""
 
+import json
+import re
+import urllib.error
+import urllib.parse
+import urllib.request
+from pathlib import Path
+from typing import Any, Dict, List
+
 from vulnforge.phases.helpers import (
-    _PIPELINE_CFG,
     _SKIP_PARAMS,
-    Any,
-    Dict,
-    List,
-    Path,
     PhaseSet,
-    Tools,
+    _is_static_url,
+)
+from vulnforge.process import _PIPELINE_CFG
+from vulnforge.tools import Tools
+from vulnforge.utils import (
     _async_urlopen,
     _async_urlopen_no_redirect,
     _extra_headers_dict,
     _get_urlopener,
-    _is_static_url,
     _throttle_rate,
     count_nonblank,
     ensure,
-    json,
     log,
-    re,
     read_lines,
-    urllib,
 )
 
 

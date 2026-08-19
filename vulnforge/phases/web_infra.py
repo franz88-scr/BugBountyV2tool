@@ -1,34 +1,35 @@
 """Web infrastructure, CDN, CSP, file upload, and host injection phases."""
 
 import asyncio
+import base64
+import socket
+import urllib.error
+import urllib.parse
+import urllib.request
+from pathlib import Path
+from typing import Any, Dict, List, Set
 
 from vulnforge.phases.client_side import _CSP_BYPASS_CDNS
 from vulnforge.phases.helpers import (
-    _PIPELINE_CFG,
     _SKIP_PARAMS,
-    Any,
-    Dict,
-    List,
-    Path,
     PhaseSet,
-    Set,
-    Tools,
+    _is_static_url,
+)
+from vulnforge.process import _PIPELINE_CFG
+from vulnforge.tools import Tools
+from vulnforge.utils import (
     _async_urlopen,
     _async_urlopen_no_redirect,
     _extra_headers_dict,
     _get_no_redirect_urlopener,
     _get_urlopener,
-    _is_static_url,
     _is_valid_hostname,
     _load_live_hosts,
     _throttle_rate,
-    base64,
     count_nonblank,
     ensure,
     log,
     read_lines,
-    socket,
-    urllib,
 )
 
 

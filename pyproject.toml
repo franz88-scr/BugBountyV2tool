@@ -7,7 +7,7 @@ name = "vulnforge"
 version = "3.1.0"
 description = "A stdlib Python orchestrator for chained vulnerability discovery tooling."
 readme = "README.md"
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 license = { text = "MIT" }
 authors = [{ name = "VulnForge contributors" }]
 keywords = ["vulnerability", "security", "bug-bounty", "automation", "reconnaissance"]
@@ -95,5 +95,5 @@ warn_unused_configs = true
 disallow_untyped_defs = false
 check_untyped_defs = true
 ignore_missing_imports = true
-exclude = ["tests/", "phases/"]
+exclude = ["tests/"]
 

@@ -1,26 +1,26 @@
 """Modern web vulnerability phases: Service Worker abuse, WASM security, JWT-to-Self XSS."""
 
+import asyncio
+import base64
 import json
 import re
+import urllib.error
+import urllib.parse
+import urllib.request
+from pathlib import Path
+from typing import Any, Dict, List
 
-from vulnforge.phases.helpers import (
-    _PIPELINE_CFG,
-    Any,
-    Dict,
-    List,
-    Path,
-    PhaseSet,
-    Tools,
+from vulnforge.phases.helpers import PhaseSet
+from vulnforge.process import _PIPELINE_CFG
+from vulnforge.tools import Tools
+from vulnforge.utils import (
     _async_urlopen,
     _extra_headers_dict,
     _get_urlopener,
-    asyncio,
-    base64,
     count_nonblank,
     ensure,
     log,
     read_lines,
-    urllib,
 )
 
 _JWT_RE = re.compile(r"eyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+")

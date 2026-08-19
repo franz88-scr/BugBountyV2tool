@@ -1,22 +1,23 @@
 """CMS deep-dive phases: Magento, SharePoint, Confluence, CI/CD deep, Tomcat deep."""
 
-from vulnforge.phases.helpers import (
-    Any,
-    Dict,
-    List,
-    Path,
-    PhaseSet,
-    Tools,
+import base64
+import socket
+import urllib.error
+import urllib.parse
+import urllib.request
+from pathlib import Path
+from typing import Any, Dict, List
+
+from vulnforge.phases.helpers import PhaseSet
+from vulnforge.tools import Tools
+from vulnforge.utils import (
     _async_urlopen_no_redirect,
     _extra_headers_dict,
     _get_urlopener,
     _load_live_hosts,
-    base64,
     count_nonblank,
     ensure,
     log,
-    socket,
-    urllib,
 )
 
 

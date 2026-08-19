@@ -185,3 +185,55 @@ class TestParseSetCookieHeaders:
         headers["Content-Type"] = "text/html"
         result = parse_set_cookie_headers(headers)
         assert result == []
+
+
+class TestPhase195MIMESNIFF:
+    def _run(self, monkeypatch, tmp_path, urlopen_fn):
+        import asyncio
+
+        from vulnforge.phases.cookie_security import phase_195_MIMESNIFF
+        from vulnforge.tools import Tools
+
+        monkeypatch.setattr("vulnforge.phases.cookie_security._async_urlopen", urlopen_fn)
+        (tmp_path / "host_targets.txt").write_text("example.com\n")
+        tools = Tools()
+        return asyncio.run(
+            phase_195_MIMESNIFF(
+                outdir=tmp_path, t=tools, only=set(), skip=set(), prev={}, force=True
+            )
+        )
+
+    def test_html_type_with_json_body_flagged(self, monkeypatch, tmp_path):
+        async def fake_urlopen(opener, req, timeout=10):
+            headers = HTTPMessage()
+            headers["Content-Type"] = "text/html"
+            headers["X-Content-Type-Options"] = "nosniff"
+            return 200, headers, b'{"hello": "world"}'
+
+        self._run(monkeypatch, tmp_path, fake_urlopen)
+        text = (tmp_path / "mime_sniff.txt").read_text()
+        assert "mime-conflicting-type" in text
+        assert "body looks like JSON" in text
+
+    def test_json_type_with_html_body_flagged(self, monkeypatch, tmp_path):
+        async def fake_urlopen(opener, req, timeout=10):
+            headers = HTTPMessage()
+            headers["Content-Type"] = "application/json"
+            headers["X-Content-Type-Options"] = "nosniff"
+            return 200, headers, b"<html><head></head><body>hi</body></html>"
+
+        self._run(monkeypatch, tmp_path, fake_urlopen)
+        text = (tmp_path / "mime_sniff.txt").read_text()
+        assert "mime-conflicting-type" in text
+        assert "body looks like HTML" in text
+
+    def test_matching_type_not_flagged(self, monkeypatch, tmp_path):
+        async def fake_urlopen(opener, req, timeout=10):
+            headers = HTTPMessage()
+            headers["Content-Type"] = "text/html"
+            headers["X-Content-Type-Options"] = "nosniff"
+            return 200, headers, b"<html><head></head><body>ok</body></html>"
+
+        self._run(monkeypatch, tmp_path, fake_urlopen)
+        text = (tmp_path / "mime_sniff.txt").read_text()
+        assert "mime-conflicting-type" not in text

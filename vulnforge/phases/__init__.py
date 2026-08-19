@@ -1323,6 +1323,10 @@ STAGES: List[List[str]] = [
 ]
 
 
+NUM_PHASES = len(PIPELINE)
+NUM_STAGES = len(STAGES)
+
+
 _RECON_LEVELS = {
     "1": {
         "name": "Basic reconnaissance",
@@ -1353,7 +1357,11 @@ _RECON_LEVELS = {
     },
     "full": {
         "name": "Full audit",
-        "desc": "All 185 phases — recon + injection + auth/access + client-side + infrastructure + CMS + cloud + AI/LLM + business logic + SSO + supply chain + modern protocols",
+        "desc": (
+            f"All {NUM_PHASES} phases — recon + injection + auth/access + client-side + "
+            "infrastructure + CMS + cloud + AI/LLM + business logic + SSO + supply chain + "
+            "modern protocols"
+        ),
         "phases": VALID_PHASES,
     },
 }

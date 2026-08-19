@@ -7,7 +7,7 @@
 213 phases · 45 DAG stages · 40+ tools · zero core Python dependencies
 
 [![MIT License](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![Python 3.9+](https://img.shields.io/badge/Python-3.9%2B-blue.svg)](https://www.python.org)
+[![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-blue.svg)](https://www.python.org)
 [![Docker](https://img.shields.io/badge/Docker-ready-2496ED.svg?logo=docker&logoColor=white)](Dockerfile)
 [![Tests](https://img.shields.io/badge/tests-435%2B%20passing-brightgreen.svg)](#development)
 [![Version](https://img.shields.io/badge/version-3.1.0-blue.svg)](CHANGELOG.md)

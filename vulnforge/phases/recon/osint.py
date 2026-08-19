@@ -1,34 +1,35 @@
 """Phases 84-89: OSINT (WHOIS, ASN, dorking, Shodan, employee harvest, passive DNS)."""
 
+import asyncio
+import json
+import os
+import re
+import urllib.error
+import urllib.parse
+import urllib.request
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Dict, List, Set, Tuple
+
 from vulnforge.phases.helpers import (
     MAX_RECV,
-    Any,
-    Dict,
-    List,
-    Path,
     PhaseSet,
-    Set,
-    Tools,
-    Tuple,
+)
+from vulnforge.process import _run
+from vulnforge.tools import Tools
+from vulnforge.utils import (
     _async_urlopen,
     _extra_headers_dict,
     _get_urlopener,
     _is_under_domain,
     _is_valid_hostname,
     _mmh3_hash,
-    _run,
     _throttle_rate,
-    asyncio,
     count_nonblank,
-    datetime,
     ensure,
-    json,
     log,
     merge_unique,
-    os,
-    re,
     read_lines,
-    urllib,
 )
 
 

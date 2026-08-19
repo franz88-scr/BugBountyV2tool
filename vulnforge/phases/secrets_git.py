@@ -1,38 +1,39 @@
 """Secrets, git exposure, and secret rotation phases."""
 
-from vulnforge.phases.helpers import (
+import asyncio
+import hashlib
+import json
+import math
+import os
+import re
+import shlex
+import urllib.error
+import urllib.parse
+import urllib.request
+from pathlib import Path
+from typing import Any, Dict, List, Set, Tuple
+
+from vulnforge.phases.helpers import PhaseSet
+from vulnforge.phases.recon import _JS_SECRET_PATTERNS, _SOURCE_MAP_RE
+from vulnforge.process import (
     _PIPELINE_CFG,
-    Any,
-    Dict,
-    List,
-    Path,
-    PhaseSet,
-    Set,
-    Tools,
-    Tuple,
+    _run,
+    run_parallel,
+)
+from vulnforge.tools import Tools
+from vulnforge.utils import (
     _async_urlopen,
     _extra_headers_dict,
     _get_no_redirect_urlopener,
     _get_urlopener,
-    _run,
     _safe_name,
-    asyncio,
     count_nonblank,
     ensure,
-    hashlib,
-    json,
     log,
-    math,
     merge_unique,
-    os,
-    re,
     read_lines,
-    run_parallel,
     safe_suffix,
-    shlex,
-    urllib,
 )
-from vulnforge.phases.recon import _JS_SECRET_PATTERNS, _SOURCE_MAP_RE
 
 
 async def phase_15_SECRETS(

@@ -1,32 +1,33 @@
 """Phases 01 and 03: subdomain enumeration and permutation."""
 
-from vulnforge.phases.helpers import (
+import asyncio
+import contextlib
+import json
+import os
+import shlex
+import urllib.error
+import urllib.parse
+import urllib.request
+from pathlib import Path
+from typing import Any, Dict, List, Set, Tuple
+
+from vulnforge.phases.helpers import PhaseSet
+from vulnforge.process import (
     _PIPELINE_CFG,
-    Any,
-    Dict,
-    List,
-    Path,
-    PhaseSet,
-    Set,
-    Tools,
-    Tuple,
+    _maybe_timeout,
+    run_parallel,
+)
+from vulnforge.tools import Tools
+from vulnforge.utils import (
     _get_urlopener,
     _is_under_domain,
     _is_valid_hostname,
-    _maybe_timeout,
-    asyncio,
-    contextlib,
     count_nonblank,
     ensure,
-    json,
     log,
     merge_unique,
     merge_unique_incremental,
-    os,
     read_lines,
-    run_parallel,
-    shlex,
-    urllib,
 )
 
 

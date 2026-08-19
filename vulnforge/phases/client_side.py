@@ -1,33 +1,36 @@
 """Client-side vulnerability phases: cache poisoning, LFI, open redirect, clickjacking, CRLF, CORS, file upload, CSP bypass, stored XSS."""
 
+import asyncio
+import base64
+import os
+import shlex
+import urllib.error
+import urllib.parse
+import urllib.request
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Set
+
 from vulnforge.phases.helpers import (
-    _PIPELINE_CFG,
     _SKIP_PARAMS,
-    _USE_PROXYCHAINS,
-    Any,
-    Dict,
-    List,
-    Optional,
-    Path,
     PhaseSet,
-    Set,
-    Tools,
+    _is_static_url,
+)
+from vulnforge.process import (
+    _PIPELINE_CFG,
+    _USE_PROXYCHAINS,
+    _run,
+)
+from vulnforge.tools import Tools
+from vulnforge.utils import (
     _async_urlopen,
     _async_urlopen_no_redirect,
     _extra_headers_dict,
     _get_urlopener,
-    _is_static_url,
-    _run,
     _throttle_rate,
-    asyncio,
-    base64,
     count_nonblank,
     ensure,
     log,
-    os,
     read_lines,
-    shlex,
-    urllib,
 )
 
 _CACHE_POISON_HEADERS = [

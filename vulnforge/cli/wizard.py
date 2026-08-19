@@ -1431,8 +1431,14 @@ class InteractiveWizard:
                 log("warn", f"Invalid count value '{v}', defaulting to 10")
                 return 10
 
-        ns.sample_urls_fuzz = _resolve_count(str(cfg.get("sample_urls_fuzz", "5")))
-        ns.sample_urls_params = _resolve_count(str(cfg.get("sample_urls_params", "50")))
+        from vulnforge.config import SAMPLE_DEFAULTS
+
+        ns.sample_urls_fuzz = _resolve_count(
+            str(cfg.get("sample_urls_fuzz", SAMPLE_DEFAULTS["sample_urls_fuzz"]))
+        )
+        ns.sample_urls_params = _resolve_count(
+            str(cfg.get("sample_urls_params", SAMPLE_DEFAULTS["sample_urls_params"]))
+        )
         ns.exclude_tags = ""
         ns.proxy_timeout_multiplier = 1.5
         ns.incremental = False
@@ -1460,160 +1466,15 @@ class InteractiveWizard:
 
 
 def _set_sample_defaults(ns: argparse.Namespace, speed: bool) -> None:
-    """Set all sample_* namespace attributes to their default values."""
-    ns.sample_urls_xss_blind = 20
-    ns.sample_urls_ssti = 5
-    ns.sample_urls_nosqli = 30
-    ns.sample_endpoints_race = 10
-    ns.sample_hosts_jwt = 20
-    ns.sample_urls_xxe = 10
-    ns.sample_urls_cmdi = 30
-    ns.sample_endpoints_sspp = 10
-    ns.sample_hosts_cached = 10
-    ns.sample_urls_depcheck = 30
-    ns.sample_urls_redirect = 30
-    ns.sample_hosts_clickjack = 20
-    ns.sample_urls_crlf = 20
-    ns.sample_hosts_ratelimit = 10
-    ns.sample_endpoints_corsadv = 10
-    ns.sample_hosts_jwtadv = 20
-    ns.sample_urls_upload = 10
-    ns.sample_hosts_smuggle = 10
-    ns.sample_endpoints_oauth = 10
-    ns.sample_endpoints_pwreset = 10
-    ns.sample_hosts_websocket = 10
-    ns.sample_hosts_h2smuggle = 10
-    ns.sample_hosts_frameworks = 20
-    ns.sample_urls_domxss = 30
-    ns.sample_urls_ldap = 20
-    ns.sample_endpoints_deserial = 10
-    ns.sample_hosts_ssl = 10
-    ns.sample_hosts_origin = 10
-    ns.sample_endpoints_cors = 10
-    ns.sample_endpoints_l = 20
-    ns.sample_endpoints_post = 5
-    ns.sample_hosts_iisaspnet = 10
-    ns.sample_hosts_tomcat = 10
-    ns.sample_hosts_nodejs = 10
-    ns.sample_hosts_laravel = 10
-    ns.sample_hosts_django = 10
-    ns.sample_hosts_symfony = 10
-    ns.sample_hosts_cicd = 10
-    ns.sample_hosts_docker = 10
-    ns.sample_hosts_k8s = 10
-    ns.sample_hosts_terraform = 10
-    ns.sample_hosts_envdeep = 10
-    ns.sample_hosts_gqlabuse = 10
-    ns.sample_urls_apiversion = 20
-    ns.sample_hosts_lbdetect = 15
-    ns.sample_hosts_vhost = 10
-    ns.sample_urls_ratelimitbypass = 20
-    ns.sample_urls_csrf = 20
-    ns.sample_hosts_sessionfix = 10
-    ns.sample_endpoints_saml = 10
-    ns.sample_users_spray = 20
-    ns.sample_hosts_cookie = 20
-    ns.sample_urls_posttest = 30
-    ns.sample_urls_methodoverride = 20
-    ns.sample_hosts_forcedbrowse = 20
-    ns.sample_urls_casebypass = 20
-    ns.sample_urls_apipage = 20
-    ns.sample_urls_tabnab = 30
-    ns.sample_urls_apikeyleak = 30
-    ns.sample_urls_redirabuse = 20
-    ns.sample_urls_logtrigger = 20
-    ns.sample_urls_xssstored = 10
-    ns.sample_hosts_hostabuse = 10
-    ns.sample_urls_authbypassadv = 20
-    ns.sample_urls_ssi = 20
-    ns.sample_urls_jsoninject = 20
-    ns.sample_urls_nullbyte = 20
-    ns.sample_urls_doubleencod = 20
-    ns.sample_urls_unicode = 20
-    ns.sample_hosts_postmsg = 15
-    ns.sample_hosts_jsonp = 20
-    ns.sample_hosts_sri = 20
-    ns.sample_hosts_mixedcontent = 20
-    ns.sample_hosts_hstspreload = 20
-    ns.sample_hosts_thirdpartyjs = 15
-    ns.sample_hosts_browserstorage = 15
-    ns.sample_urls_rfi = 20
-    ns.sample_hosts_webdav = 10
-    ns.sample_hosts_snmp = 10
-    ns.sample_hosts_banner = 15
-    ns.sample_hosts_phpinfo = 15
-    ns.sample_hosts_srvstatus = 15
-    ns.sample_urls_errorleak = 20
-    ns.sample_hosts_wildcarddns = 10
-    ns.sample_hosts_dnsrebind = 10
-    ns.sample_hosts_cloud = 5
-    ns.sample_hosts_git = 5
-    ns.sample_hosts_graphql = 5
-    ns.sample_hosts_waf = 5
-    ns.sample_endpoints_ratelimit = 5
-    ns.sample_hosts_emailfinder = 10
-    ns.sample_urls_metagoofil = 50
-    ns.sample_hosts_porchpirate = 10
-    ns.sample_urls_dorkhunter = 20
-    ns.sample_hosts_crtsh = 10
-    ns.sample_hosts_githubsub = 10
-    ns.sample_hosts_tlsx = 10
-    ns.sample_hosts_analyticsrels = 10
-    ns.sample_hosts_favirecon = 10
-    ns.sample_urls_jsluice = 20
-    ns.sample_urls_shortscan = 20
-    ns.sample_hosts_grpcurl = 10
+    """Set all sample_* namespace attributes to their dataclass defaults."""
+    from dataclasses import fields as dc_fields
+
+    from vulnforge.config import SAMPLE_SPEED_CAPS, PipelineConfig
+
+    for f in dc_fields(PipelineConfig):
+        if f.name.startswith("sample_") and isinstance(f.default, int) and not hasattr(ns, f.name):
+            setattr(ns, f.name, f.default)
     if speed:
-        ns.sample_urls_fuzz = min(ns.sample_urls_fuzz, 50)
-        ns.sample_urls_params = min(ns.sample_urls_params, 10)
-        ns.sample_urls_nosqli = min(ns.sample_urls_nosqli, 5)
-        ns.sample_urls_cmdi = min(ns.sample_urls_cmdi, 5)
-        ns.sample_urls_xxe = min(ns.sample_urls_xxe, 3)
-        ns.sample_urls_crlf = min(ns.sample_urls_crlf, 5)
-        ns.sample_urls_redirect = min(ns.sample_urls_redirect, 5)
-        ns.sample_urls_ldap = min(ns.sample_urls_ldap, 5)
-        ns.sample_urls_depcheck = min(ns.sample_urls_depcheck, 5)
-        ns.sample_urls_upload = min(ns.sample_urls_upload, 3)
-        ns.sample_urls_xss_blind = min(ns.sample_urls_xss_blind, 5)
-        ns.sample_urls_ssti = min(ns.sample_urls_ssti, 2)
-        ns.sample_hosts_ssl = min(ns.sample_hosts_ssl, 2)
-        ns.sample_hosts_origin = min(ns.sample_hosts_origin, 3)
-        ns.sample_hosts_cloud = min(ns.sample_hosts_cloud, 2)
-        ns.sample_hosts_git = min(ns.sample_hosts_git, 2)
-        ns.sample_hosts_graphql = min(ns.sample_hosts_graphql, 2)
-        ns.sample_hosts_waf = min(ns.sample_hosts_waf, 2)
-        ns.sample_hosts_jwt = min(ns.sample_hosts_jwt, 5)
-        ns.sample_hosts_jwtadv = min(ns.sample_hosts_jwtadv, 5)
-        ns.sample_hosts_cached = min(ns.sample_hosts_cached, 3)
-        ns.sample_hosts_clickjack = min(ns.sample_hosts_clickjack, 5)
-        ns.sample_hosts_ratelimit = min(ns.sample_hosts_ratelimit, 3)
-        ns.sample_hosts_smuggle = min(ns.sample_hosts_smuggle, 3)
-        ns.sample_hosts_websocket = min(ns.sample_hosts_websocket, 3)
-        ns.sample_hosts_h2smuggle = min(ns.sample_hosts_h2smuggle, 3)
-        ns.sample_hosts_frameworks = min(ns.sample_hosts_frameworks, 5)
-        ns.sample_urls_domxss = min(ns.sample_urls_domxss, 5)
-        ns.sample_endpoints_race = min(ns.sample_endpoints_race, 3)
-        ns.sample_endpoints_cors = min(ns.sample_endpoints_cors, 3)
-        ns.sample_endpoints_corsadv = min(ns.sample_endpoints_corsadv, 3)
-        ns.sample_endpoints_sspp = min(ns.sample_endpoints_sspp, 3)
-        ns.sample_endpoints_l = min(ns.sample_endpoints_l, 5)
-        ns.sample_endpoints_post = min(ns.sample_endpoints_post, 2)
-        ns.sample_endpoints_oauth = min(ns.sample_endpoints_oauth, 3)
-        ns.sample_endpoints_pwreset = min(ns.sample_endpoints_pwreset, 3)
-        ns.sample_endpoints_deserial = min(ns.sample_endpoints_deserial, 3)
-        ns.sample_hosts_iisaspnet = min(ns.sample_hosts_iisaspnet, 3)
-        ns.sample_hosts_tomcat = min(ns.sample_hosts_tomcat, 3)
-        ns.sample_hosts_nodejs = min(ns.sample_hosts_nodejs, 3)
-        ns.sample_hosts_laravel = min(ns.sample_hosts_laravel, 3)
-        ns.sample_hosts_django = min(ns.sample_hosts_django, 3)
-        ns.sample_hosts_symfony = min(ns.sample_hosts_symfony, 3)
-        ns.sample_hosts_cicd = min(ns.sample_hosts_cicd, 3)
-        ns.sample_hosts_docker = min(ns.sample_hosts_docker, 3)
-        ns.sample_hosts_k8s = min(ns.sample_hosts_k8s, 3)
-        ns.sample_hosts_terraform = min(ns.sample_hosts_terraform, 3)
-        ns.sample_hosts_envdeep = min(ns.sample_hosts_envdeep, 3)
-        ns.sample_hosts_gqlabuse = min(ns.sample_hosts_gqlabuse, 3)
-        ns.sample_urls_apiversion = min(ns.sample_urls_apiversion, 5)
-        ns.sample_hosts_lbdetect = min(ns.sample_hosts_lbdetect, 3)
-        ns.sample_hosts_vhost = min(ns.sample_hosts_vhost, 3)
-        ns.sample_urls_ratelimitbypass = min(ns.sample_urls_ratelimitbypass, 5)
+        for name, cap in SAMPLE_SPEED_CAPS.items():
+            if hasattr(ns, name) and isinstance(getattr(ns, name), int):
+                setattr(ns, name, min(getattr(ns, name), cap))

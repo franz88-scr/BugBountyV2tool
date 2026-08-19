@@ -1,34 +1,35 @@
 """Email security, SMTP, logging, workflow, and miscellaneous phases."""
 
+import asyncio
+import base64
+import hashlib
+import json
+import os
+import re
+import socket
+import urllib.error
+import urllib.parse
+import urllib.request
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Set
+
 from vulnforge.phases.helpers import (
-    _PIPELINE_CFG,
-    Any,
-    Dict,
-    List,
-    Optional,
-    Path,
     PhaseSet,
-    Set,
-    Tools,
+    _is_static_url,
+    _run_cmd_clear_proxy,
+)
+from vulnforge.process import _PIPELINE_CFG
+from vulnforge.tools import Tools
+from vulnforge.utils import (
     _async_urlopen,
     _extra_headers_dict,
     _get_urlopener,
-    _is_static_url,
-    _run_cmd_clear_proxy,
     _throttle_rate,
-    asyncio,
-    base64,
     count_nonblank,
-    datetime,
     ensure,
-    hashlib,
-    json,
     log,
-    os,
-    re,
     read_lines,
-    socket,
-    urllib,
 )
 
 

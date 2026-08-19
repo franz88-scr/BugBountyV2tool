@@ -1,23 +1,25 @@
 """Extended OSINT and discovery phases: email finder, metagoofil, porch pirate, dork hunter, crt.sh, GitHub subs, TLS, analytics, favicon, jsluice, shortscan, grpcurl."""
 
-from vulnforge.phases.helpers import (
-    Any,
-    Dict,
-    Path,
-    PhaseSet,
-    Tools,
+import asyncio
+import json
+import os
+import re
+import urllib.error
+import urllib.parse
+import urllib.request
+from pathlib import Path
+from typing import Any, Dict
+
+from vulnforge.phases.helpers import PhaseSet
+from vulnforge.process import _run_limited
+from vulnforge.tools import Tools
+from vulnforge.utils import (
     _async_urlopen,
     _get_urlopener,
     _throttle_rate,
-    asyncio,
     ensure,
-    json,
     log,
-    os,
-    re,
-    urllib,
 )
-from vulnforge.process import _run_limited
 
 
 async def phase_137_EMAILFINDER(

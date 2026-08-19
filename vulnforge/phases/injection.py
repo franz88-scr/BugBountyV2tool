@@ -1,39 +1,41 @@
 """Injection phases: XSS/SSRF/SQLMap, DOM XSS, SSTI."""
 
+import asyncio
+import base64
+import json
+import os
+import shlex
+import urllib.error
+import urllib.parse
+import urllib.request
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Set, Tuple
+
+from vulnforge.config import _SAFE_HOST
 from vulnforge.phases.helpers import (
+    _SKIP_PARAMS,
+    PhaseSet,
+    _dedupe_by_normalized_url,
+    _is_static_url,
+)
+from vulnforge.process import (
     _ENV_LOCK,
     _PIPELINE_CFG,
-    _SAFE_HOST,
-    _SKIP_PARAMS,
-    Any,
-    Dict,
-    List,
-    Optional,
-    Path,
-    PhaseSet,
-    Set,
-    Tools,
-    Tuple,
+    _run,
+    run_parallel,
+)
+from vulnforge.tools import Tools
+from vulnforge.utils import (
     _async_urlopen,
     _dedupe_by_host_params,
-    _dedupe_by_normalized_url,
     _extra_headers_dict,
     _get_urlopener,
-    _is_static_url,
-    _run,
     _throttle_rate,
-    asyncio,
-    base64,
     count_nonblank,
     ensure,
-    json,
     log,
     merge_unique,
-    os,
     read_lines,
-    run_parallel,
-    shlex,
-    urllib,
 )
 
 

@@ -1,33 +1,37 @@
 """Origin, cloud, and bucket phases."""
 
+import asyncio
+import json
+import os
+import random
+import re
+import shlex
+import urllib.error
+import urllib.parse
+import urllib.request
+from pathlib import Path
+from typing import Any, Dict, List, Set
+
 from vulnforge.phases.helpers import (
-    _PIPELINE_CFG,
-    Any,
-    Dict,
-    List,
-    Path,
     PhaseSet,
-    Set,
-    Tools,
+    _run_cmd_clear_proxy,
+)
+from vulnforge.process import (
+    _PIPELINE_CFG,
+    _run,
+)
+from vulnforge.tools import Tools
+from vulnforge.utils import (
     _async_urlopen,
     _extra_headers_dict,
     _get_urlopener,
     _is_valid_hostname,
     _mmh3_hash,
-    _run,
-    _run_cmd_clear_proxy,
     _throttle_rate,
-    asyncio,
     count_nonblank,
     ensure,
-    json,
     log,
-    os,
-    random,
-    re,
     read_lines,
-    shlex,
-    urllib,
 )
 
 

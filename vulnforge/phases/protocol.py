@@ -1,13 +1,15 @@
 """Protocol-level phases: HTTP/2 cache digestion, web cache poisoning extended."""
 
-from vulnforge.phases.helpers import (
-    _PIPELINE_CFG,
-    Any,
-    Dict,
-    List,
-    Path,
-    PhaseSet,
-    Tools,
+import urllib.error
+import urllib.parse
+import urllib.request
+from pathlib import Path
+from typing import Any, Dict, List
+
+from vulnforge.phases.helpers import PhaseSet
+from vulnforge.process import _PIPELINE_CFG
+from vulnforge.tools import Tools
+from vulnforge.utils import (
     _async_urlopen,
     _extra_headers_dict,
     _get_urlopener,
@@ -15,7 +17,6 @@ from vulnforge.phases.helpers import (
     ensure,
     log,
     read_lines,
-    urllib,
 )
 
 

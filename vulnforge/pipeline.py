@@ -436,15 +436,11 @@ async def run_pipeline(args: argparse.Namespace) -> int:
     # so that vulnforge/phases/ (which did `from process import _PIPELINE_CFG`) sees the changes.
     import dataclasses
 
-    def _ss(val: int) -> int:
-        """Apply sample size mode: minimal=1, normal=default, all=sys.maxsize, safe_mode halves."""
-        mode = getattr(args, "sample_mode", "normal")
-        if mode == "minimal":
-            return 1
-        if mode == "all":
-            return sys.maxsize
-        return max(1, val // 2) if _safe_mode else val
-
+    _sample_kwargs: Dict[str, Any] = {
+        _f.name: getattr(args, _f.name, _f.default)
+        for _f in dataclasses.fields(PipelineConfig)
+        if _f.name.startswith("sample_") and isinstance(_f.default, int)
+    }
     _new_cfg = PipelineConfig(
         safe_mode=_safe_mode,
         dos_mode=dos_mode,
@@ -453,15 +449,6 @@ async def run_pipeline(args: argparse.Namespace) -> int:
         sqlmap_risk=getattr(args, "sqlmap_risk", 1),
         delay=getattr(args, "delay", 0.0),
         rate_limit=rate_limit,
-        sample_urls_fuzz=_ss(getattr(args, "sample_urls_fuzz", 200)),
-        sample_urls_params=_ss(getattr(args, "sample_urls_params", 50)),
-        sample_hosts_ssl=_ss(getattr(args, "sample_hosts_ssl", 10)),
-        sample_hosts_origin=_ss(getattr(args, "sample_hosts_origin", 10)),
-        sample_endpoints_l=_ss(getattr(args, "sample_endpoints_l", 20)),
-        sample_urls_xss_blind=_ss(getattr(args, "sample_urls_xss_blind", 20)),
-        sample_urls_ssti=_ss(getattr(args, "sample_urls_ssti", 5)),
-        sample_endpoints_post=_ss(getattr(args, "sample_endpoints_post", 5)),
-        sample_endpoints_cors=_ss(getattr(args, "sample_endpoints_cors", 10)),
         nuclei_exclude_tags=(
             (getattr(args, "exclude_tags", "") + ",dos,brute-force,deep").strip(",")
             if _safe_mode and not getattr(args, "exclude_tags", "")
@@ -470,95 +457,10 @@ async def run_pipeline(args: argparse.Namespace) -> int:
         proxy=proxy,
         vuln_proxy=vuln_proxy,
         proxy_timeout_multiplier=proxy_timeout_mult,
-        sample_urls_nosqli=_ss(getattr(args, "sample_urls_nosqli", 30)),
-        sample_endpoints_race=_ss(getattr(args, "sample_endpoints_race", 10)),
-        sample_hosts_jwt=_ss(getattr(args, "sample_hosts_jwt", 20)),
-        sample_urls_xxe=_ss(getattr(args, "sample_urls_xxe", 10)),
-        sample_urls_cmdi=_ss(getattr(args, "sample_urls_cmdi", 30)),
-        sample_endpoints_sspp=_ss(getattr(args, "sample_endpoints_sspp", 10)),
-        sample_hosts_cached=_ss(getattr(args, "sample_hosts_cached", 10)),
-        sample_urls_depcheck=_ss(getattr(args, "sample_urls_depcheck", 30)),
-        sample_urls_redirect=_ss(getattr(args, "sample_urls_redirect", 30)),
-        sample_hosts_clickjack=_ss(getattr(args, "sample_hosts_clickjack", 20)),
-        sample_urls_crlf=_ss(getattr(args, "sample_urls_crlf", 20)),
-        sample_hosts_ratelimit=_ss(getattr(args, "sample_hosts_ratelimit", 10)),
-        sample_endpoints_corsadv=_ss(getattr(args, "sample_endpoints_corsadv", 10)),
-        sample_hosts_jwtadv=_ss(getattr(args, "sample_hosts_jwtadv", 20)),
-        sample_urls_upload=_ss(getattr(args, "sample_urls_upload", 10)),
-        sample_hosts_smuggle=_ss(getattr(args, "sample_hosts_smuggle", 10)),
-        sample_hosts_h2smuggle=_ss(getattr(args, "sample_hosts_h2smuggle", 10)),
-        sample_hosts_frameworks=_ss(getattr(args, "sample_hosts_frameworks", 20)),
-        sample_urls_domxss=_ss(getattr(args, "sample_urls_domxss", 30)),
-        sample_urls_ldap=_ss(getattr(args, "sample_urls_ldap", 20)),
-        sample_endpoints_deserial=_ss(getattr(args, "sample_endpoints_deserial", 10)),
-        sample_endpoints_oauth=_ss(getattr(args, "sample_endpoints_oauth", 10)),
-        sample_endpoints_pwreset=_ss(getattr(args, "sample_endpoints_pwreset", 10)),
-        sample_hosts_websocket=_ss(getattr(args, "sample_hosts_websocket", 10)),
-        sample_urls_lfi=_ss(getattr(args, "sample_urls_lfi", 30)),
-        sample_urls_idor=_ss(getattr(args, "sample_urls_idor", 50)),
-        sample_urls_apisec=_ss(getattr(args, "sample_urls_apisec", 50)),
-        sample_hosts_cloud=_ss(getattr(args, "sample_hosts_cloud", 5)),
-        sample_hosts_git=_ss(getattr(args, "sample_hosts_git", 5)),
-        sample_hosts_graphql=_ss(getattr(args, "sample_hosts_graphql", 5)),
-        sample_hosts_waf=_ss(getattr(args, "sample_hosts_waf", 5)),
-        sample_urls_arjun_waf=_ss(getattr(args, "sample_urls_arjun_waf", 5)),
-        sample_urls_csrf=_ss(getattr(args, "sample_urls_csrf", 20)),
-        sample_hosts_sessionfix=_ss(getattr(args, "sample_hosts_sessionfix", 10)),
-        sample_endpoints_saml=_ss(getattr(args, "sample_endpoints_saml", 10)),
-        sample_users_spray=_ss(getattr(args, "sample_users_spray", 20)),
-        sample_hosts_cookie=_ss(getattr(args, "sample_hosts_cookie", 20)),
-        sample_urls_posttest=_ss(getattr(args, "sample_urls_posttest", 30)),
-        sample_urls_methodoverride=_ss(getattr(args, "sample_urls_methodoverride", 20)),
-        sample_hosts_forcedbrowse=_ss(getattr(args, "sample_hosts_forcedbrowse", 20)),
-        sample_urls_casebypass=_ss(getattr(args, "sample_urls_casebypass", 20)),
-        sample_urls_apipage=_ss(getattr(args, "sample_urls_apipage", 20)),
-        sample_urls_tabnab=_ss(getattr(args, "sample_urls_tabnab", 30)),
-        sample_urls_apikeyleak=_ss(getattr(args, "sample_urls_apikeyleak", 30)),
-        sample_urls_redirabuse=_ss(getattr(args, "sample_urls_redirabuse", 20)),
-        sample_urls_logtrigger=_ss(getattr(args, "sample_urls_logtrigger", 20)),
-        sample_urls_xssstored=_ss(getattr(args, "sample_urls_xssstored", 10)),
-        sample_hosts_hostabuse=_ss(getattr(args, "sample_hosts_hostabuse", 10)),
-        sample_urls_authbypassadv=_ss(getattr(args, "sample_urls_authbypassadv", 20)),
-        sample_urls_ssi=_ss(getattr(args, "sample_urls_ssi", 20)),
-        sample_urls_jsoninject=_ss(getattr(args, "sample_urls_jsoninject", 20)),
-        sample_urls_nullbyte=_ss(getattr(args, "sample_urls_nullbyte", 20)),
-        sample_urls_doubleencod=_ss(getattr(args, "sample_urls_doubleencod", 20)),
-        sample_urls_unicode=_ss(getattr(args, "sample_urls_unicode", 20)),
-        sample_hosts_postmsg=_ss(getattr(args, "sample_hosts_postmsg", 15)),
-        sample_hosts_jsonp=_ss(getattr(args, "sample_hosts_jsonp", 20)),
-        sample_hosts_sri=_ss(getattr(args, "sample_hosts_sri", 20)),
-        sample_hosts_mixedcontent=_ss(getattr(args, "sample_hosts_mixedcontent", 20)),
-        sample_hosts_hstspreload=_ss(getattr(args, "sample_hosts_hstspreload", 20)),
-        sample_hosts_thirdpartyjs=_ss(getattr(args, "sample_hosts_thirdpartyjs", 15)),
-        sample_hosts_browserstorage=_ss(getattr(args, "sample_hosts_browserstorage", 15)),
-        sample_urls_rfi=_ss(getattr(args, "sample_urls_rfi", 20)),
-        sample_hosts_webdav=_ss(getattr(args, "sample_hosts_webdav", 10)),
-        sample_hosts_snmp=_ss(getattr(args, "sample_hosts_snmp", 10)),
-        sample_hosts_banner=_ss(getattr(args, "sample_hosts_banner", 15)),
-        sample_hosts_phpinfo=_ss(getattr(args, "sample_hosts_phpinfo", 15)),
-        sample_hosts_srvstatus=_ss(getattr(args, "sample_hosts_srvstatus", 15)),
-        sample_urls_errorleak=_ss(getattr(args, "sample_urls_errorleak", 20)),
-        sample_hosts_wildcarddns=_ss(getattr(args, "sample_hosts_wildcarddns", 10)),
-        sample_hosts_dnsrebind=_ss(getattr(args, "sample_hosts_dnsrebind", 10)),
-        sample_hosts_iisaspnet=_ss(getattr(args, "sample_hosts_iisaspnet", 10)),
-        sample_hosts_tomcat=_ss(getattr(args, "sample_hosts_tomcat", 10)),
-        sample_hosts_nodejs=_ss(getattr(args, "sample_hosts_nodejs", 10)),
-        sample_hosts_laravel=_ss(getattr(args, "sample_hosts_laravel", 10)),
-        sample_hosts_django=_ss(getattr(args, "sample_hosts_django", 10)),
-        sample_hosts_symfony=_ss(getattr(args, "sample_hosts_symfony", 10)),
-        sample_hosts_cicd=_ss(getattr(args, "sample_hosts_cicd", 10)),
-        sample_hosts_docker=_ss(getattr(args, "sample_hosts_docker", 10)),
-        sample_hosts_k8s=_ss(getattr(args, "sample_hosts_k8s", 10)),
-        sample_hosts_terraform=_ss(getattr(args, "sample_hosts_terraform", 10)),
-        sample_hosts_envdeep=_ss(getattr(args, "sample_hosts_envdeep", 10)),
-        sample_hosts_gqlabuse=_ss(getattr(args, "sample_hosts_gqlabuse", 10)),
-        sample_urls_apiversion=_ss(getattr(args, "sample_urls_apiversion", 20)),
-        sample_hosts_lbdetect=_ss(getattr(args, "sample_hosts_lbdetect", 15)),
-        sample_hosts_vhost=_ss(getattr(args, "sample_hosts_vhost", 10)),
-        sample_urls_ratelimitbypass=_ss(getattr(args, "sample_urls_ratelimitbypass", 20)),
         cookie_b=getattr(args, "cookie_b", ""),
         idor_session_a=getattr(args, "cookie_a", ""),
         idor_session_b=getattr(args, "idor_session_b", ""),
+        **_sample_kwargs,
     )
     # Copy every attribute to the existing object so all importers see the update
     for _f in dataclasses.fields(_new_cfg):
@@ -817,8 +719,6 @@ async def run_pipeline(args: argparse.Namespace) -> int:
                 _phase_result = await fn(**call)  # type: ignore[operator]
             except asyncio.CancelledError:
                 log("warn", f"phase {name} cancelled")
-                raise
-            except asyncio.CancelledError:
                 raise
             except Exception as e:
                 log("err", f"phase {name} crashed: {e}")

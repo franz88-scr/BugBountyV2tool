@@ -1,28 +1,29 @@
 """CMS and framework-specific phases: IIS/ASP.NET, Tomcat, Node.js, Laravel, Django, Symfony, env deep, GraphQL abuse."""
 
-from vulnforge.phases.helpers import (
-    _PIPELINE_CFG,
-    Any,
-    Dict,
-    List,
-    Path,
-    PhaseSet,
-    Tools,
+import base64
+import json
+import re
+import socket
+import urllib.error
+import urllib.parse
+import urllib.request
+from pathlib import Path
+from typing import Any, Dict, List
+
+from vulnforge.phases.helpers import PhaseSet
+from vulnforge.process import _PIPELINE_CFG
+from vulnforge.tools import Tools
+from vulnforge.utils import (
     _async_urlopen,
     _async_urlopen_no_redirect,
     _extra_headers_dict,
     _get_urlopener,
     _load_live_hosts,
     _throttle_rate,
-    base64,
     count_nonblank,
     ensure,
-    json,
     log,
-    re,
     read_lines,
-    socket,
-    urllib,
 )
 
 

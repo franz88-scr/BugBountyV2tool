@@ -1,37 +1,38 @@
 """Vulnerability scanning phases: nuclei, TLS/CMS fingerprinting, OOB, dependency CVE."""
 
-from vulnforge.phases.helpers import (
+import asyncio
+import json
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import urllib.error
+import urllib.parse
+import urllib.request
+from pathlib import Path
+from typing import Any, Dict, List, Set, Tuple
+
+from vulnforge.interactsh import Interactsh
+from vulnforge.phases.helpers import PhaseSet
+from vulnforge.process import (
     _PIPELINE_CFG,
-    Any,
-    Dict,
-    Interactsh,
-    List,
-    Path,
-    PhaseSet,
-    Set,
-    Tools,
-    Tuple,
+    _run,
+    run_parallel,
+)
+from vulnforge.tools import Tools
+from vulnforge.utils import (
     _async_urlopen,
     _extra_http_args,
     _get_urlopener,
-    _run,
     _safe_name,
     _write_target_tokens,
-    asyncio,
     count_nonblank,
     ensure,
-    json,
     log,
     merge_unique,
-    os,
-    re,
     read_lines,
-    run_parallel,
     safe_suffix,
-    shlex,
-    shutil,
-    subprocess,
-    urllib,
 )
 
 

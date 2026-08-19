@@ -1,32 +1,35 @@
 """Smuggling, race condition, and WebSocket phases."""
 
+import asyncio
+import os
+import re
+import shlex
+import urllib.error
+import urllib.parse
+import urllib.request
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
 from vulnforge.phases.helpers import (
+    MAX_RECV,
+    PhaseSet,
+    _is_static_url,
+)
+from vulnforge.process import (
     _PIPELINE_CFG,
     _USE_PROXYCHAINS,
-    MAX_RECV,
-    Any,
-    Dict,
-    List,
-    Optional,
-    Path,
-    PhaseSet,
-    Tools,
-    Tuple,
+    _run,
+)
+from vulnforge.tools import Tools
+from vulnforge.utils import (
     _async_urlopen,
     _extra_headers_dict,
     _get_urlopener,
-    _is_static_url,
-    _run,
     _throttle_rate,
-    asyncio,
     count_nonblank,
     ensure,
     log,
-    os,
-    re,
     read_lines,
-    shlex,
-    urllib,
 )
 
 

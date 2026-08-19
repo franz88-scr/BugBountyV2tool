@@ -1,15 +1,13 @@
 """Phase 00: scope validation."""
 
-from vulnforge.phases.helpers import (
-    Any,
-    Dict,
-    List,
-    Optional,
-    Path,
-    PhaseSet,
-    Tools,
+import fnmatch
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+from vulnforge.phases.helpers import PhaseSet
+from vulnforge.tools import Tools
+from vulnforge.utils import (
     count_nonblank,
-    fnmatch,
     log,
     read_lines,
 )

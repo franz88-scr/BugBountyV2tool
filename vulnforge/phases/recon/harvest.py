@@ -1,37 +1,39 @@
 """Phases 05 and 05b: URL harvesting and API spec discovery."""
 
+import asyncio
+import json
+import shlex
+import urllib.error
+import urllib.parse
+import urllib.request
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Set, Tuple
+
 from vulnforge.phases.helpers import (
+    PhaseSet,
+    _rate_limit_args,
+)
+from vulnforge.process import (
     _PIPELINE_CFG,
     _USE_PROXYCHAINS,
-    Any,
-    Dict,
-    List,
-    Optional,
-    Path,
-    PhaseSet,
-    Set,
-    Tools,
-    Tuple,
+    _maybe_timeout,
+    _run,
+    run_parallel,
+)
+from vulnforge.tools import Tools
+from vulnforge.utils import (
     _async_urlopen,
     _extra_headers_dict,
     _extra_http_args,
     _get_urlopener,
     _is_under_domain,
     _is_valid_hostname,
-    _maybe_timeout,
-    _rate_limit_args,
-    _run,
     _throttle_rate,
-    asyncio,
     count_nonblank,
     ensure,
-    json,
     log,
     merge_unique,
     read_lines,
-    run_parallel,
-    shlex,
-    urllib,
 )
 
 

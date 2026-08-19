@@ -46,7 +46,7 @@ class TestPipelineConfig:
     def test_sample_limits(self):
         cfg = PipelineConfig()
         assert cfg.sample_urls_fuzz == 200
-        assert cfg.sample_hosts_ssl == 3
+        assert cfg.sample_hosts_ssl == 10
         assert cfg.sample_hosts_origin == 10
 
     def test_all_sample_fields_positive(self):

@@ -1,13 +1,18 @@
 """Cloud and DevOps phases: CI/CD, Docker, Kubernetes, Terraform, API versioning, load balancer detection, vhost, rate limit bypass."""
 
-from vulnforge.phases.helpers import (
-    _PIPELINE_CFG,
-    Any,
-    Dict,
-    List,
-    Path,
-    PhaseSet,
-    Tools,
+import json
+import re
+import socket
+import urllib.error
+import urllib.parse
+import urllib.request
+from pathlib import Path
+from typing import Any, Dict, List
+
+from vulnforge.phases.helpers import PhaseSet
+from vulnforge.process import _PIPELINE_CFG
+from vulnforge.tools import Tools
+from vulnforge.utils import (
     _async_urlopen,
     _extra_headers_dict,
     _get_urlopener,
@@ -15,12 +20,8 @@ from vulnforge.phases.helpers import (
     _throttle_rate,
     count_nonblank,
     ensure,
-    json,
     log,
-    re,
     read_lines,
-    socket,
-    urllib,
 )
 
 

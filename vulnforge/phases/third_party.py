@@ -1,25 +1,24 @@
 """Third-party and browser-related phases: SRI, mixed content, HSTS preload, third-party JS, browser storage."""
 
-from vulnforge.phases.helpers import (
-    _PIPELINE_CFG,
-    Any,
-    Dict,
-    List,
-    Path,
-    PhaseSet,
-    Tools,
+import json
+import re
+import urllib.error
+import urllib.parse
+import urllib.request
+from pathlib import Path
+from typing import Any, Dict
+
+from vulnforge.phases.harness import phase_begin
+from vulnforge.phases.helpers import PhaseSet
+from vulnforge.process import _PIPELINE_CFG
+from vulnforge.tools import Tools
+from vulnforge.utils import (
     _async_urlopen,
     _extra_headers_dict,
     _get_urlopener,
     _load_live_hosts,
     _throttle_rate,
-    count_nonblank,
-    ensure,
-    json,
-    log,
-    re,
     read_lines,
-    urllib,
 )
 
 
@@ -31,17 +30,12 @@ async def phase_107_SRI(
     prev: Dict[str, Any],
     force: bool = False,
 ) -> Dict[str, Any]:
-    if skip & {"107-SRI"}:
+    run = phase_begin("107-SRI", outdir, skip, force, "sri_findings.txt")
+    if run is None:
         return {}
-    _out = outdir / "sri_findings.txt"
-    if _out.exists() and not force:
-        return {"107-SRI": str(_out), "count": count_nonblank(_out)}
-    log("info", "Phase 107-SRI: subresource integrity check")
     all_hosts = _load_live_hosts(outdir)
     if not all_hosts:
-        log("warn", "107-SRI: no hosts; skipping")
-        return {"107-SRI": str(_out), "count": 0}
-    findings: List[str] = []
+        return run.no_targets("no hosts")
     _urlopen = _get_urlopener()
     _extra_h = _extra_headers_dict()
     _script_src_re = re.compile(r'<script[^>]*src=["\']([^"\']+)["\']', re.I)
@@ -82,9 +76,9 @@ async def phase_107_SRI(
                 snippet = body[snippet_start : start + len(src) + 50]
                 has_integrity = bool(_integrity_re.search(snippet))
                 if has_integrity:
-                    findings.append(f"[sri-present] {host} external_src={src}")
+                    run.findings.append(f"[sri-present] {host} external_src={src}")
                 else:
-                    findings.append(f"[sri-missing] {host} external_src={src}")
+                    run.findings.append(f"[sri-missing] {host} external_src={src}")
             for href in link_hrefs:
                 href_parsed = urllib.parse.urlparse(href)
                 if not href_parsed.netloc:
@@ -101,17 +95,12 @@ async def phase_107_SRI(
                 snippet = body[snippet_start : start + len(href) + 50]
                 has_integrity = bool(_integrity_re.search(snippet))
                 if has_integrity:
-                    findings.append(f"[sri-present] {host} external_src={href}")
+                    run.findings.append(f"[sri-present] {host} external_src={href}")
                 else:
-                    findings.append(f"[sri-missing] {host} external_src={href}")
+                    run.findings.append(f"[sri-missing] {host} external_src={href}")
         except Exception:
             continue
-    if not findings:
-        findings.append("[sri] No external resources detected or no SRI issues found")
-    out = ensure(_out)
-    out.write_text("\n".join(findings) + ("\n" if findings else ""))
-    log("ok", f"107-SRI: {len(findings)} findings → {out}")
-    return {"107-SRI": str(out), "count": len(findings)}
+    return run.done()
 
 
 async def phase_108_MIXEDCONTENT(
@@ -122,19 +111,14 @@ async def phase_108_MIXEDCONTENT(
     prev: Dict[str, Any],
     force: bool = False,
 ) -> Dict[str, Any]:
-    if skip & {"108-MIXEDCONTENT"}:
+    run = phase_begin("108-MIXEDCONTENT", outdir, skip, force, "mixed_content.txt")
+    if run is None:
         return {}
-    _out = outdir / "mixed_content.txt"
-    if _out.exists() and not force:
-        return {"108-MIXEDCONTENT": str(_out), "count": count_nonblank(_out)}
-    log("info", "Phase 108-MIXEDCONTENT: Mixed content detection")
-    findings: List[str] = []
     _mc_urlopen = _get_urlopener()
     _mc_extra_headers = _extra_headers_dict()
     hosts = _load_live_hosts(outdir)
     if not hosts:
-        log("warn", "108-MIXEDCONTENT: no hosts; skipping")
-        return {"108-MIXEDCONTENT": str(_out), "count": 0}
+        return run.no_targets("no hosts")
     sample = getattr(_PIPELINE_CFG, "sample_hosts_mixedcontent", 20)
     for host in hosts[:sample]:
         if "://" in host:
@@ -170,20 +154,17 @@ async def phase_108_MIXEDCONTENT(
                 ]
                 for pat in active_patterns:
                     for m in re.finditer(pat, body, re.I):
-                        findings.append(f"[mixed-active] {host_clean} resource=http://{m.group(1)}")
+                        run.findings.append(
+                            f"[mixed-active] {host_clean} resource=http://{m.group(1)}"
+                        )
                 for pat in passive_patterns:
                     for m in re.finditer(pat, body, re.I):
-                        findings.append(
+                        run.findings.append(
                             f"[mixed-passive] {host_clean} resource=http://{m.group(1)}"
                         )
             except Exception:
                 continue
-    if not findings:
-        findings.append("[mixedcontent] No mixed content found")
-    out = ensure(_out)
-    out.write_text("\n".join(findings) + ("\n" if findings else ""))
-    log("ok", f"108-MIXEDCONTENT: {len(findings)} findings → {out}")
-    return {"108-MIXEDCONTENT": str(out), "count": len(findings)}
+    return run.done()
 
 
 async def phase_109_HSTSPRELOAD(
@@ -194,19 +175,14 @@ async def phase_109_HSTSPRELOAD(
     prev: Dict[str, Any],
     force: bool = False,
 ) -> Dict[str, Any]:
-    if skip & {"109-HSTSPRELOAD"}:
+    run = phase_begin("109-HSTSPRELOAD", outdir, skip, force, "hsts_preload.txt")
+    if run is None:
         return {}
-    _out = outdir / "hsts_preload.txt"
-    if _out.exists() and not force:
-        return {"109-HSTSPRELOAD": str(_out), "count": count_nonblank(_out)}
-    log("info", "Phase 109-HSTSPRELOAD: HSTS preload list check")
-    findings: List[str] = []
     _hp_urlopen = _get_urlopener()
     _hp_extra_headers = _extra_headers_dict()
     hosts = _load_live_hosts(outdir)
     if not hosts:
-        log("warn", "109-HSTSPRELOAD: no hosts; skipping")
-        return {"109-HSTSPRELOAD": str(_out), "count": 0}
+        return run.no_targets("no hosts")
     sample = getattr(_PIPELINE_CFG, "sample_hosts_hstspreload", 20)
     for host in hosts[:sample]:
         if "://" in host:
@@ -226,7 +202,7 @@ async def phase_109_HSTSPRELOAD(
                     continue
                 hsts = headers.get("Strict-Transport-Security", "")
                 if not hsts:
-                    findings.append(f"[hsts-missing] {host_clean}")
+                    run.findings.append(f"[hsts-missing] {host_clean}")
                 else:
                     max_age_m = re.search(r"max-age=(\d+)", hsts, re.I)
                     max_age = int(max_age_m.group(1)) if max_age_m else 0
@@ -241,22 +217,17 @@ async def phase_109_HSTSPRELOAD(
                             if ps == 200:
                                 preload_data = json.loads(pb.decode("utf-8", errors="ignore"))
                                 if preload_data.get("status") == "preloaded":
-                                    findings.append(f"[hsts-preloaded] {host_clean}")
+                                    run.findings.append(f"[hsts-preloaded] {host_clean}")
                         except Exception:
                             pass
                     elif max_age < 31536000 or not has_include:
-                        findings.append(
+                        run.findings.append(
                             f"[hsts-insufficient] {host_clean} max-age={max_age} includeSubDomains={str(has_include).lower()}"
                         )
                 break
             except Exception:
                 continue
-    if not findings:
-        findings.append("[hsts] No HSTS issues found")
-    out = ensure(_out)
-    out.write_text("\n".join(findings) + ("\n" if findings else ""))
-    log("ok", f"109-HSTSPRELOAD: {len(findings)} findings → {out}")
-    return {"109-HSTSPRELOAD": str(out), "count": len(findings)}
+    return run.done()
 
 
 async def phase_110_THIRDPARTYJS(
@@ -267,19 +238,14 @@ async def phase_110_THIRDPARTYJS(
     prev: Dict[str, Any],
     force: bool = False,
 ) -> Dict[str, Any]:
-    if skip & {"110-THIRDPARTYJS"}:
+    run = phase_begin("110-THIRDPARTYJS", outdir, skip, force, "third_party_js.txt")
+    if run is None:
         return {}
-    _out = outdir / "third_party_js.txt"
-    if _out.exists() and not force:
-        return {"110-THIRDPARTYJS": str(_out), "count": count_nonblank(_out)}
-    log("info", "Phase 110-THIRDPARTYJS: Third-party JavaScript risk analysis")
-    findings: List[str] = []
     _tj_urlopen = _get_urlopener()
     _tj_extra_headers = _extra_headers_dict()
     hosts = _load_live_hosts(outdir)
     if not hosts:
-        log("warn", "110-THIRDPARTYJS: no hosts; skipping")
-        return {"110-THIRDPARTYJS": str(_out), "count": 0}
+        return run.no_targets("no hosts")
     tracker_map = {
         "googletagmanager.com": "Google Tag Manager",
         "google-analytics.com": "Google Analytics",
@@ -333,21 +299,16 @@ async def phase_110_THIRDPARTYJS(
                             if tdom in src_host:
                                 tracker_name = tname
                                 break
-                        findings.append(
+                        run.findings.append(
                             f"[third-party-js] {host_clean} src={src} tracker={tracker_name}"
                         )
                         has_sri = bool(re.search(r"\bintegrity\s*=", stag, re.I))
                         if not has_sri:
-                            findings.append(f"[third-party-nosri] {host_clean} src={src}")
+                            run.findings.append(f"[third-party-nosri] {host_clean} src={src}")
                 break
             except Exception:
                 continue
-    if not findings:
-        findings.append("[thirdpartyjs] No third-party JS issues found")
-    out = ensure(_out)
-    out.write_text("\n".join(findings) + ("\n" if findings else ""))
-    log("ok", f"110-THIRDPARTYJS: {len(findings)} findings → {out}")
-    return {"110-THIRDPARTYJS": str(out), "count": len(findings)}
+    return run.done()
 
 
 async def phase_111_BROWSERSTORAGE(
@@ -358,20 +319,15 @@ async def phase_111_BROWSERSTORAGE(
     prev: Dict[str, Any],
     force: bool = False,
 ) -> Dict[str, Any]:
-    if skip & {"111-BROWSERSTORAGE"}:
+    run = phase_begin("111-BROWSERSTORAGE", outdir, skip, force, "browser_storage_audit.txt")
+    if run is None:
         return {}
-    _out = outdir / "browser_storage_audit.txt"
-    if _out.exists() and not force:
-        return {"111-BROWSERSTORAGE": str(_out), "count": count_nonblank(_out)}
-    log("info", "Phase 111-BROWSERSTORAGE: Browser storage audit")
-    findings: List[str] = []
     _bs_urlopen = _get_urlopener()
     _bs_extra_headers = _extra_headers_dict()
     js_urls_file = outdir / "urls_js.txt"
     js_urls = read_lines(js_urls_file) if js_urls_file.exists() else []
     if not js_urls:
-        log("warn", "111-BROWSERSTORAGE: no JS URLs; skipping")
-        return {"111-BROWSERSTORAGE": str(_out), "count": 0}
+        return run.no_targets("no JS URLs")
     sensitive_patterns = [
         "token",
         "password",
@@ -413,9 +369,11 @@ async def phase_111_BROWSERSTORAGE(
                 key_lower = key.lower()
                 for sp in sensitive_patterns:
                     if sp in key_lower:
-                        findings.append(f"[browser-storage-sensitive] {js_url} pattern={sp}")
+                        run.findings.append(f"[browser-storage-sensitive] {js_url} pattern={sp}")
                         break
-                findings.append(f"[browser-storage] {js_url} storage_type={storage_type} key={key}")
+                run.findings.append(
+                    f"[browser-storage] {js_url} storage_type={storage_type} key={key}"
+                )
             indexeddb_matches = re.findall(
                 r'indexedDB\.open\s*\(\s*["\']([^"\']+)["\']', body, re.I
             )
@@ -423,14 +381,11 @@ async def phase_111_BROWSERSTORAGE(
                 db_lower = db_name.lower()
                 for sp in sensitive_patterns:
                     if sp in db_lower:
-                        findings.append(f"[browser-storage-sensitive] {js_url} pattern={sp}")
+                        run.findings.append(f"[browser-storage-sensitive] {js_url} pattern={sp}")
                         break
-                findings.append(f"[browser-storage] {js_url} storage_type=IndexedDB key={db_name}")
+                run.findings.append(
+                    f"[browser-storage] {js_url} storage_type=IndexedDB key={db_name}"
+                )
         except Exception:
             continue
-    if not findings:
-        findings.append("[browserstorage] No browser storage issues found")
-    out = ensure(_out)
-    out.write_text("\n".join(findings) + ("\n" if findings else ""))
-    log("ok", f"111-BROWSERSTORAGE: {len(findings)} findings → {out}")
-    return {"111-BROWSERSTORAGE": str(out), "count": len(findings)}
+    return run.done()

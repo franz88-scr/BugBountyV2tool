@@ -1,38 +1,41 @@
 """Phases 04 and 04b: port scanning, HTTP probing, takeover detection and validation."""
 
+import asyncio
+import shlex
+import urllib.error
+import urllib.parse
+import urllib.request
+from pathlib import Path
+from typing import Any, Dict, List, Set, Tuple
+
 from vulnforge.phases.helpers import (
-    _PIPELINE_CFG,
-    Any,
-    Dict,
-    List,
-    Path,
     PhaseSet,
-    Set,
-    Tools,
-    Tuple,
+    _rate_limit_args,
+)
+from vulnforge.process import (
+    _PIPELINE_CFG,
+    _maybe_timeout,
+    _update_nuclei_templates,
+    run_parallel,
+)
+from vulnforge.tools import Tools
+from vulnforge.utils import (
     _async_urlopen,
     _dedupe_by_host_path,
     _existing_artifacts,
     _extra_headers_dict,
     _extra_http_args,
     _get_urlopener,
-    _maybe_timeout,
     _parse_httpx_tech,
-    _rate_limit_args,
     _safe_name,
     _throttle_rate,
-    _update_nuclei_templates,
     _write_target_tokens,
-    asyncio,
     count_nonblank,
     ensure,
     log,
     merge_unique,
     read_lines,
-    run_parallel,
     safe_suffix,
-    shlex,
-    urllib,
 )
 
 

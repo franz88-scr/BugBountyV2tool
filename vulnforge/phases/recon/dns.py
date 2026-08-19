@@ -1,26 +1,25 @@
 """Phase 02: DNS resolution with parallel fallback chain."""
 
+import asyncio
+import os
+import socket
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Set
+
 from vulnforge.phases.helpers import (
-    Any,
-    Dict,
-    List,
-    Optional,
-    Path,
     PhaseSet,
-    Set,
-    Tools,
     _ensure_resolver_file,
+)
+from vulnforge.process import _run
+from vulnforge.tools import Tools
+from vulnforge.utils import (
     _is_valid_hostname,
     _merge_dnsx_output,
-    _run,
-    asyncio,
     count_nonblank,
     iter_lines,
     log,
     merge_unique_str,
-    os,
     read_lines,
-    socket,
 )
 
 

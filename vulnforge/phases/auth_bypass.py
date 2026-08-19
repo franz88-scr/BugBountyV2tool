@@ -1,28 +1,29 @@
 """Authentication bypass phases: CSRF, session fixation, SAML, password spray, forced browsing, etc."""
 
-from vulnforge.phases.helpers import (
-    _PIPELINE_CFG,
-    Any,
-    Dict,
-    List,
-    Path,
-    PhaseSet,
-    Tools,
+import asyncio
+import json
+import re
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from pathlib import Path
+from typing import Any, Dict, List
+
+from vulnforge.phases.helpers import PhaseSet
+from vulnforge.process import _PIPELINE_CFG
+from vulnforge.tools import Tools
+from vulnforge.utils import (
     _async_urlopen,
     _async_urlopen_no_redirect,
     _extra_headers_dict,
     _get_urlopener,
     _throttle_rate,
-    asyncio,
     count_nonblank,
     ensure,
-    json,
     log,
     parse_set_cookie_headers,
-    re,
     read_lines,
-    time,
-    urllib,
 )
 
 

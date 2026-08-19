@@ -1,23 +1,23 @@
 """SSO & Federation security testing phases — OIDC, SAML, cross-tenant attacks."""
 
-from vulnforge.phases.helpers import (
-    Any,
-    Dict,
-    List,
-    Path,
-    PhaseSet,
-    Set,
-    Tools,
+import json
+import urllib.error
+import urllib.parse
+import urllib.request
+from pathlib import Path
+from typing import Any, Dict, List, Set
+
+from vulnforge.phases.helpers import PhaseSet
+from vulnforge.tools import Tools
+from vulnforge.utils import (
     _async_urlopen,
     _get_urlopener,
     _load_live_hosts,
     _throttle_rate,
     count_nonblank,
     ensure,
-    json,
     log,
     read_lines,
-    urllib,
 )
 
 _SSO_ENDPOINT_PATTERNS = [

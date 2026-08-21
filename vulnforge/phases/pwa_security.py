@@ -55,7 +55,7 @@ async def phase_196_PUSHAPI(
     _out = outdir / "push_api.txt"
     if _out.exists() and not force:
         return {"196-PUSHAPI": str(_out), "count": count_nonblank(_out)}
-    log("info", "Phase 196-PUSHAPI: Web Push API security testing")
+    log("INFO", "Phase 196-PUSHAPI: Web Push API security testing")
     findings: List[str] = []
     push_urlopen = _get_urlopener()
     push_extra_headers = _extra_headers_dict()
@@ -65,7 +65,7 @@ async def phase_196_PUSHAPI(
         hosts_file = outdir / "hosts.txt"
     targets = [f"https://{h}" if not h.startswith("http") else h for h in read_lines(hosts_file)]
     if not targets:
-        log("warn", "196-PUSHAPI: no HTTP targets; skipping")
+        log("WARNING", "196-PUSHAPI: no HTTP targets; skipping")
         return {"196-PUSHAPI": str(_out), "count": 0}
 
     urls_file = outdir / "urls_all.txt"
@@ -77,11 +77,14 @@ async def phase_196_PUSHAPI(
 
     # 1. Look for push subscription endpoints
     push_endpoints: Set[str] = set()
+    discovered_push: Set[str] = set()
     for u in all_urls:
         low_u = u.lower()
         for pat in _PUSH_ENDPOINT_PATTERNS:
             if pat in low_u:
-                push_endpoints.add(u.split("?")[0])
+                ep = u.split("?")[0]
+                push_endpoints.add(ep)
+                discovered_push.add(ep)
                 break
     if not push_endpoints:
         for host in targets[:5]:
@@ -98,9 +101,14 @@ async def phase_196_PUSHAPI(
             findings.append(f"[push-endpoint] {ep} — HTTP {status}")
             # Check if endpoint requires auth
             if status == 200:
-                if "unauthorized" not in body_text.lower() and "login" not in body_text.lower():
+                if ep in discovered_push:
+                    if "unauthorized" not in body_text.lower() and "login" not in body_text.lower():
+                        findings.append(
+                            f"[push-no-auth] {ep} — push subscription endpoint accessible without auth (CWE-200)"
+                        )
+                elif "www-authenticate" in str(headers).lower():
                     findings.append(
-                        f"[push-no-auth] {ep} — push subscription endpoint accessible without auth (CWE-200)"
+                        f"[push-auth-required] {ep} — HTTP 200 with WWW-Authenticate (auth enforced)"
                     )
         except urllib.error.HTTPError as e:
             if e.code == 401 or e.code == 403:
@@ -146,11 +154,14 @@ async def phase_196_PUSHAPI(
 
     # 3. Check unsubscribe endpoints without auth
     unsub_endpoints: Set[str] = set()
+    discovered_unsub: Set[str] = set()
     for u in all_urls:
         low_u = u.lower()
         for pat in _PUSH_UNSUBSCRIBE_PATTERNS:
             if pat in low_u:
-                unsub_endpoints.add(u.split("?")[0])
+                ep = u.split("?")[0]
+                unsub_endpoints.add(ep)
+                discovered_unsub.add(ep)
                 break
     if not unsub_endpoints:
         for host in targets[:3]:
@@ -166,7 +177,7 @@ async def phase_196_PUSHAPI(
                 headers={"User-Agent": "Mozilla/5.0", **push_extra_headers},
             )
             status, _, _ = await _async_urlopen(push_urlopen, req, timeout=10)
-            if status in (200, 204):
+            if status in (200, 204) and ep in discovered_unsub:
                 findings.append(
                     f"[push-unsubscribe-no-auth] {ep} — unsubscribe works without auth (HTTP {status}) (CWE-200)"
                 )
@@ -182,5 +193,5 @@ async def phase_196_PUSHAPI(
         findings.append("[push-api] No Web Push API security issues detected (expected)")
     out = ensure(_out)
     out.write_text("\n".join(findings) + ("\n" if findings else ""))
-    log("ok", f"196-PUSHAPI: {len(findings)} findings -> {out}")
+    log("OK", f"196-PUSHAPI: {len(findings)} findings -> {out}")
     return {"196-PUSHAPI": str(out), "count": len(findings)}

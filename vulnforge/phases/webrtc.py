@@ -1,7 +1,9 @@
 """WebRTC security: internal IP leak detection."""
 
 import asyncio
+import os
 import re
+import socket
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -15,6 +17,7 @@ from vulnforge.utils import (
     _async_urlopen,
     _extra_headers_dict,
     _get_urlopener,
+    log,
     read_lines,
 )
 
@@ -35,6 +38,29 @@ _WEBRTC_JS_PATTERNS = [
     "simplewebrtc",
 ]
 _STUN_PORTS = [3478, 3479, 19302, 19303, 49152]
+_STUN_MAGIC_COOKIE = b"\x21\x12\xa4\x42"
+
+
+def _stun_binding_request() -> bytes:
+    return b"\x00\x01\x00\x00" + _STUN_MAGIC_COOKIE + os.urandom(12)
+
+
+def _stun_binding_response_ok(data: bytes) -> bool:
+    return len(data) >= 20 and data[:2] == b"\x01\x01" and data[4:8] == _STUN_MAGIC_COOKIE
+
+
+def _stun_binding_ok(host: str, port: int, timeout: float = 2.0) -> bool:
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.settimeout(timeout)
+        try:
+            sock.sendto(_stun_binding_request(), (host, port))
+            data, _ = sock.recvfrom(2048)
+            return _stun_binding_response_ok(data)
+        finally:
+            sock.close()
+    except Exception:
+        return False
 
 
 async def phase_193_WEBRTC(
@@ -106,31 +132,24 @@ async def phase_193_WEBRTC(
         except Exception:
             continue
 
-    # 3. Probe STUN/TURN endpoints via HTTP-based detection
-    stun_endpoints = set()
+    # 3. Probe STUN endpoints via UDP STUN binding request
+    stun_candidates = []
     for host in targets[:10]:
         parsed_host = urllib.parse.urlparse(host).netloc.split(":")[0]
         for port in _STUN_PORTS:
-            stun_endpoints.add(f"stun:{parsed_host}:{port}")
-            stun_endpoints.add(f"stun:{parsed_host}:{port}?transport=udp")
-        stun_endpoints.add(f"https://{parsed_host}/stun")
-        stun_endpoints.add(f"https://{parsed_host}:3478/stun")
-    for ep in list(stun_endpoints)[:20]:
+            stun_candidates.append((parsed_host, port))
+    verified = 0
+    for host, port in stun_candidates[:20]:
         try:
-            if ep.startswith("stun"):
-                run.findings.append(
-                    f"[webrtc-stun-candidate] {ep} — STUN endpoint (verify manually)"
-                )
-            else:
-                req = urllib.request.Request(
-                    ep, method="GET", headers={"User-Agent": "Mozilla/5.0", **webrtc_extra_headers}
-                )
-                status, headers, body = await _async_urlopen(webrtc_urlopen, req, timeout=8)
-                if status < 400 or body:
-                    run.findings.append(f"[webrtc-stun-accessible] {ep} — HTTP {status} (CWE-200)")
-        except asyncio.CancelledError:
-            raise
+            ok = await asyncio.to_thread(_stun_binding_ok, host, port)
         except Exception:
-            continue
+            ok = False
+        if ok:
+            verified += 1
+            run.findings.append(
+                f"[webrtc-stun-candidate] stun:{host}:{port} — STUN binding response received"
+            )
+    if not verified:
+        log("INFO", "193-WEBRTC: no reachable STUN endpoints on standard ports")
 
     return run.done()

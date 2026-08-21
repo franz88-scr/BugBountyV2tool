@@ -100,7 +100,7 @@ async def _triage_batch(batch: List[Dict[str, str]], domain: str) -> List[Dict[s
 
     response = await provider.complete(prompt, max_tokens=4096, temperature=0.2)
     if not response or not response.strip():
-        log("warn", "warn: AI triage got an empty LLM response — findings will be marked info")
+        log("WARNING", "warn: AI triage got an empty LLM response — findings will be marked info")
 
     result = parse_json_response(response)
 
@@ -176,21 +176,21 @@ async def run_triage(
     Returns dict with keys: findings, summary, stats, severity_counts
     Also writes ai_triage.json, ai_fps.json, ai_summary.txt to outdir.
     """
-    log("info", "AI Triage: loading findings...")
+    log("INFO", "AI Triage: loading findings...")
     findings = _load_all_findings(outdir)
 
     if not findings:
-        log("info", "info: no findings to triage")
+        log("INFO", "info: no findings to triage")
         return {"findings": [], "summary": "", "stats": {}, "severity_counts": {}}
 
-    log("info", f"AI Triage: {len(findings)} findings loaded, chunking for analysis...")
+    log("INFO", f"AI Triage: {len(findings)} findings loaded, chunking for analysis...")
 
     # Process in batches
     chunks = _chunk_findings(findings)
     all_triaged: List[Dict[str, Any]] = []
 
     for i, chunk in enumerate(chunks):
-        log("info", f"AI Triage: processing batch {i + 1}/{len(chunks)} ({len(chunk)} findings)...")
+        log("INFO", f"AI Triage: processing batch {i + 1}/{len(chunks)} ({len(chunk)} findings)...")
         triaged = await _triage_batch(chunk, domain)
         all_triaged.extend(triaged)
 
@@ -226,10 +226,10 @@ async def run_triage(
         "high_confidence_findings": len(all_triaged) - fp_count,
     }
 
-    log("info", f"AI Triage: severity distribution: {severity_counts}")
+    log("INFO", f"AI Triage: severity distribution: {severity_counts}")
 
     # Generate executive summary
-    log("info", "AI Triage: generating executive summary...")
+    log("INFO", "AI Triage: generating executive summary...")
     summary = await _generate_summary(domain, duration, all_triaged)
 
     # Write outputs
@@ -249,8 +249,8 @@ async def run_triage(
     out_summary = ensure(outdir / "ai_summary.txt")
     out_summary.write_text(summary)
 
-    log("ok", f"ok: AI triage complete — {stats['total']} findings, {fp_count} likely FPs")
-    log("info", "  Written: ai_triage.json, ai_fps.json, ai_summary.txt")
+    log("OK", f"ok: AI triage complete — {stats['total']} findings, {fp_count} likely FPs")
+    log("INFO", "  Written: ai_triage.json, ai_fps.json, ai_summary.txt")
 
     return {
         "findings": all_triaged,

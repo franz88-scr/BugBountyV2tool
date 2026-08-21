@@ -7,7 +7,6 @@ import math
 import os
 import re
 import shlex
-import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
@@ -35,6 +34,28 @@ from vulnforge.utils import (
     safe_suffix,
 )
 
+_EXTRA_SECRET_PATTERNS: List[Tuple[str, str]] = [
+    ("openai-key", r"sk-[A-Za-z0-9]{20,}"),
+    ("telegram-bot", r"\b[0-9]{8,10}:[A-Za-z0-9_-]{30,}\b"),
+    ("twilio-sid", r"\bAC[0-9a-f]{32}\b"),
+    ("private-key", r"-----BEGIN (?:RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----"),
+    (
+        "discord-bot",
+        r"(?i)(?:discord|token)[a-z_]*[\"']?\s*[:=]\s*[\"']([A-Za-z0-9._-]{20,}\.[A-Za-z0-9._-]{20,})[\"']",
+    ),
+]
+
+
+def _git_body_indicative(body: str) -> bool:
+    return "[core]" in body or "repositoryformatversion" in body or "ref: " in body
+
+
+def _git_parse_shas(text: str) -> List[str]:
+    shas: List[str] = []
+    for m in re.finditer(r"\b[0-9a-f]{40}\b", text):
+        shas.append(m.group(0))
+    return shas
+
 
 async def phase_15_SECRETS(
     outdir: Path, t: Tools, only: PhaseSet, skip: PhaseSet, force: bool = False
@@ -44,17 +65,18 @@ async def phase_15_SECRETS(
     _k_out = outdir / "js_secrets_deep.txt"
     if _k_out.exists() and not force:
         return {"15-SECRETS": str(_k_out), "count": count_nonblank(_k_out)}
-    log("info", "Phase 15-SECRETS: deep JS secret scanning (custom regex + entropy + source maps)")
+    log("INFO", "Phase 15-SECRETS: deep JS secret scanning (custom regex + entropy + source maps)")
     _k_extra_headers = _extra_headers_dict()
     _k_urlopen = _get_urlopener()
     js_urls = outdir / "urls_js.txt"
     if not js_urls.exists() or not read_lines(js_urls):
         await asyncio.sleep(3)
     if not js_urls.exists() or not read_lines(js_urls):
-        log("info", "15-SECRETS: no JS URLs; skipping")
+        log("INFO", "15-SECRETS: no JS URLs; skipping")
         return {"15-SECRETS": str(outdir / "js_secrets_deep.txt"), "count": 0}
     findings: List[str] = []
     seen_secrets: Set[str] = set()
+    live_checked: Set[str] = set()
     seen_sourcemaps: Set[str] = set()
     # unfurl URL component extraction from JS URLs (extracts paths, keys, values)
     if t.has("unfurl"):
@@ -100,6 +122,12 @@ async def phase_15_SECRETS(
                 if val not in seen_secrets:
                     seen_secrets.add(val)
                     findings.append(f"[{name}] {val}  ({js_url})")
+        for name, pattern in _EXTRA_SECRET_PATTERNS:
+            for m in re.finditer(pattern, body):
+                val = m.group()
+                if val not in seen_secrets:
+                    seen_secrets.add(val)
+                    findings.append(f"[{name}] {val}  ({js_url})")
         # Shannon-entropy scan for high-entropy strings (likely API keys /
         # secrets not caught by regex). Look for base64-ish strings of 32+ chars.
         for m in re.finditer(r"[\"']([A-Za-z0-9+/=_-]{32,})[\"']", body):
@@ -122,12 +150,11 @@ async def phase_15_SECRETS(
             if name in ("github-tok", "aws-key", "stripe-live"):
                 for m in re.finditer(pattern, body):
                     val = m.group()
-                    if val in seen_secrets:
+                    if val in live_checked:
                         continue
+                    live_checked.add(val)
                     if name == "github-tok" and val.startswith("gh"):
                         try:
-                            import urllib.request as _ur
-
                             gh_req = urllib.request.Request(
                                 "https://api.github.com/user",
                                 headers={
@@ -136,8 +163,10 @@ async def phase_15_SECRETS(
                                 },
                             )
                             try:
-                                gh_resp = _ur.urlopen(gh_req, timeout=5)
-                                if gh_resp.status == 200:
+                                gh_status, _, _ = await _async_urlopen(
+                                    _k_urlopen, gh_req, timeout=5
+                                )
+                                if gh_status == 200:
                                     findings.append(
                                         f"[github-key-live] {val[:16]}... — active GitHub token ({js_url})"
                                     )
@@ -157,15 +186,16 @@ async def phase_15_SECRETS(
                         headers={"User-Agent": "Mozilla/5.0"},
                     )
                     try:
-                        fb_resp = _ur.urlopen(fb_req, timeout=5)
-                        fb_data = fb_resp.read().decode("utf-8", errors="ignore")
-                        if fb_data and fb_data != "null":
+                        fb_status, _, fb_body_bytes = await _async_urlopen(
+                            _k_urlopen, fb_req, timeout=5
+                        )
+                        fb_data = fb_body_bytes.decode("utf-8", errors="ignore")
+                        if fb_status == 200 and fb_data and fb_data != "null":
                             findings.append(
                                 f"[firebase-open] {fb_url}/.json — database is publicly readable!"
                             )
                             findings.append(f"  data: {fb_data[:200]}")
-                    except urllib.error.HTTPError as fb_err:
-                        if fb_err.code == 401:
+                        elif fb_status == 401:
                             findings.append(
                                 f"[firebase-restricted] {fb_url}/.json — requires auth (401)"
                             )
@@ -286,7 +316,7 @@ async def phase_15_SECRETS(
         entry.unlink(missing_ok=True)
     for entry in outdir.glob("trufflehog_*.txt"):
         entry.unlink(missing_ok=True)
-    log("ok", f"15-SECRETS: {len(findings)} deep JS findings → {out}")
+    log("OK", f"15-SECRETS: {len(findings)} deep JS findings → {out}")
     # Push found credentials into the shared credential queue for downstream phases
     cred_patterns = re.compile(
         r"(?i)(api[_-]?key|secret|token|password|jwt|bearer|auth)", re.IGNORECASE
@@ -315,6 +345,8 @@ _GIT_COMMON_REFS = [
     "refs/heads/main",
     "refs/heads/dev",
     "refs/heads/develop",
+    "packed-refs",
+    "info/refs",
 ]
 
 
@@ -332,7 +364,7 @@ async def phase_19_GIT(
     _n_out = outdir / "git_exposure.txt"
     if _n_out.exists() and not force:
         return {"19-GIT": str(_n_out), "count": count_nonblank(_n_out)}
-    log("info", "Phase 19-GIT: git exposure scanning")
+    log("INFO", "Phase 19-GIT: git exposure scanning")
     findings: List[str] = []
     _n_urlopen = _get_urlopener()
     # Collect targets: HTTP hosts from 04-SCAN or raw resolved hosts
@@ -348,7 +380,7 @@ async def phase_19_GIT(
                 h = f"https://{h}"
             targets.append(h.rstrip("/"))
     if not targets:
-        log("warn", "Phase 19-GIT: no HTTP targets; skipping")
+        log("WARNING", "Phase 19-GIT: no HTTP targets; skipping")
         return {"19-GIT": str(_n_out), "count": 0}
     # Check for exposed .git directories (use no-redirect to avoid false positives)
     _no_redirect_urlopen = _get_no_redirect_urlopener()
@@ -359,15 +391,15 @@ async def phase_19_GIT(
             test_url = f"{url}{git_path}"
             try:
                 req = urllib.request.Request(
-                    test_url, method="HEAD", headers={"User-Agent": "Mozilla/5.0"}
+                    test_url, method="GET", headers={"User-Agent": "Mozilla/5.0"}
                 )
-                git_status, _, _ = await _async_urlopen(_no_redirect_urlopen, req, timeout=10)
-                if git_status == 200:
+                git_status, _, git_body = await _async_urlopen(
+                    _no_redirect_urlopen, req, timeout=10
+                )
+                if git_status == 200 and _git_body_indicative(
+                    git_body.decode("utf-8", errors="ignore")
+                ):
                     results.append(f"[.git-exposed] {test_url} (HTTP {git_status})")
-                    break
-            except urllib.error.HTTPError as e:
-                if e.code in (200, 301, 302):
-                    results.append(f"[.git-exposed] {test_url} (HTTP {e.code})")
                     break
             except Exception:
                 continue
@@ -436,7 +468,40 @@ async def phase_19_GIT(
                     )
                     if truffle_out.exists() and read_lines(truffle_out):
                         results.append(f"[trufflehog] secrets found → {truffle_out}")
+
                 # Git Object Recovery — download loose objects from known refs
+                async def _recover_shas(ref_url: str, ref_text: str) -> None:
+                    shas = _git_parse_shas(ref_text)
+                    if not shas:
+                        return
+                    results.append(f"[git-object-recovered] {ref_url} — SHA: {shas[0]}")
+                    seen: Set[str] = set()
+                    to_try = shas[:]
+                    for _depth in range(4):
+                        next_shas: List[str] = []
+                        for s in to_try:
+                            if s in seen:
+                                continue
+                            seen.add(s)
+                            obj_url = f"{url}/.git/objects/{s[:2]}/{s[2:]}"
+                            try:
+                                obj_req = urllib.request.Request(
+                                    obj_url, headers={"User-Agent": "Mozilla/5.0"}
+                                )
+                                obj_status, _, obj_body = await _async_urlopen(
+                                    _no_redirect_urlopen, obj_req, timeout=10
+                                )
+                                if obj_status == 200:
+                                    results.append(f"[git-object-recovered] {obj_url} — SHA: {s}")
+                                    obj_text = obj_body.decode("utf-8", errors="ignore")
+                                    for pm in re.finditer(r"parent ([0-9a-f]{40})", obj_text):
+                                        parent_sha = pm.group(1)
+                                        if parent_sha not in seen:
+                                            next_shas.append(parent_sha)
+                            except Exception:
+                                continue
+                        to_try = next_shas
+
                 for ref in _GIT_COMMON_REFS:
                     ref_url = f"{url}/.git/{ref}"
                     try:
@@ -447,39 +512,7 @@ async def phase_19_GIT(
                             _no_redirect_urlopen, ref_req, timeout=10
                         )
                         if ref_status == 200:
-                            sha = ref_body.decode("utf-8", errors="ignore").strip()
-                            if re.match(r"^[0-9a-f]{40}$", sha):
-                                results.append(f"[git-object-recovered] {ref_url} — SHA: {sha}")
-                                seen = set()
-                                shas_to_try = [sha]
-                                for depth in range(4):
-                                    next_shas = []
-                                    for s in shas_to_try:
-                                        if s in seen:
-                                            continue
-                                        seen.add(s)
-                                        obj_url = f"{url}/.git/objects/{s[:2]}/{s[2:]}"
-                                        try:
-                                            obj_req = urllib.request.Request(
-                                                obj_url, headers={"User-Agent": "Mozilla/5.0"}
-                                            )
-                                            obj_status, _, obj_body = await _async_urlopen(
-                                                _no_redirect_urlopen, obj_req, timeout=10
-                                            )
-                                            if obj_status == 200:
-                                                results.append(
-                                                    f"[git-object-recovered] {obj_url} — SHA: {s}"
-                                                )
-                                                obj_text = obj_body.decode("utf-8", errors="ignore")
-                                                for pm in re.finditer(
-                                                    r"parent ([0-9a-f]{40})", obj_text
-                                                ):
-                                                    parent_sha = pm.group(1)
-                                                    if parent_sha not in seen:
-                                                        next_shas.append(parent_sha)
-                                        except Exception:
-                                            continue
-                                    shas_to_try = next_shas
+                            await _recover_shas(ref_url, ref_body.decode("utf-8", errors="ignore"))
                     except Exception:
                         continue
         return results
@@ -489,7 +522,7 @@ async def phase_19_GIT(
         findings.extend(gr)
     out = ensure(_n_out)
     out.write_text("\n".join(findings) + ("\n" if findings else ""))
-    log("ok", f"Phase 19-GIT: {len(findings)} git exposure findings → {out}")
+    log("OK", f"Phase 19-GIT: {len(findings)} git exposure findings → {out}")
     return {"19-GIT": str(out), "count": len(findings)}
 
 
@@ -505,7 +538,7 @@ async def phase_79_SECRETDIFF(
     _out = outdir / "secret_rotation.txt"
     if _out.exists() and not force:
         return {"79-SECRETDIFF": str(_out), "count": count_nonblank(_out)}
-    log("info", "Phase 79-SECRETDIFF: cross-scan secret rotation detection")
+    log("INFO", "Phase 79-SECRETDIFF: cross-scan secret rotation detection")
     findings: List[str] = []
     _state_dir = (
         Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "vulnforge" / "secrets"
@@ -524,7 +557,6 @@ async def phase_79_SECRETDIFF(
     for src_file in [
         outdir / "js_secrets.txt",
         outdir / "js_secrets_deep.txt",
-        outdir / "domain_creds.txt",
         outdir / "secrets.txt",
     ]:
         if src_file.exists():
@@ -549,5 +581,5 @@ async def phase_79_SECRETDIFF(
     _secret_state_file.write_text(json.dumps(current_secrets, indent=2))
     out = ensure(_out)
     out.write_text("\n".join(findings) + ("\n" if findings else ""))
-    log("ok", f"79-SECRETDIFF: {len(findings)} secret rotation findings → {out}")
+    log("OK", f"79-SECRETDIFF: {len(findings)} secret rotation findings → {out}")
     return {"79-SECRETDIFF": str(_out), "count": len(findings)}

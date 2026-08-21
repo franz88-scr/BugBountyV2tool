@@ -1,5 +1,7 @@
 """SSO & Federation security testing phases — OIDC, SAML, cross-tenant attacks."""
 
+import asyncio
+import base64
 import json
 import urllib.error
 import urllib.parse
@@ -11,6 +13,7 @@ from vulnforge.phases.helpers import PhaseSet
 from vulnforge.tools import Tools
 from vulnforge.utils import (
     _async_urlopen,
+    _async_urlopen_no_redirect,
     _get_urlopener,
     _load_live_hosts,
     _throttle_rate,
@@ -111,14 +114,14 @@ async def phase_158_SSO(
     _out = outdir / "sso_oidc.txt"
     if _out.exists() and not force:
         return {"158-SSO": str(_out), "count": count_nonblank(_out)}
-    log("info", "Phase 158-SSO: OIDC/OAuth misconfiguration testing")
+    log("INFO", "Phase 158-SSO: OIDC/OAuth misconfiguration testing")
     findings: List[str] = []
     endpoints = await _find_sso_endpoints(outdir)
     if not endpoints:
         findings.append("[info] No SSO endpoints found")
         out = ensure(_out)
         out.write_text("\n".join(findings) + "\n")
-        log("ok", "158-SSO: no SSO endpoints")
+        log("OK", "158-SSO: no SSO endpoints")
         return {"158-SSO": str(_out), "count": 0}
     findings.append(f"[endpoints] Found {len(endpoints)} SSO endpoints")
     for ep in endpoints:
@@ -128,11 +131,59 @@ async def phase_158_SSO(
     oauth_endpoints = [
         u for u in endpoints if any(p in u.lower() for p in ["/authorize", "response_type"])
     ]
+    opener_sso = _get_urlopener()
+    redirect_probes = [
+        ("redirect_uri=https://evil.com", "Open redirect via redirect_uri"),
+        ("redirect_uri=https://target.com.evil.com", "Subdomain confusion"),
+        ("redirect_uri=https://target.com@evil.com", "Credentials in redirect_uri"),
+        ("redirect_uri=https://evil.com/?url=target.com", "Redirect parameter injection"),
+        ("redirect_uri=https://evil.com%2Ftarget.com", "Encoding bypass"),
+    ]
     for ep in oauth_endpoints[:10]:
-        for probe, desc in _OAUTH_MISCONFIG_PROBES[:8]:
+        for probe, desc in redirect_probes:
+            await _throttle_rate()
             sep = "&" if "?" in ep else "?"
             test_url = f"{ep}{sep}{probe}"
-            findings.append(f"  [{desc}] {test_url[:200]}")
+            try:
+                req = urllib.request.Request(test_url, headers={"User-Agent": "Mozilla/5.0"})
+                ost, oheaders, obody = await _async_urlopen_no_redirect(req, timeout=10)
+                loc = str(oheaders.get("Location", "")).lower() if oheaders else ""
+                body_lower = obody.lower()
+                if ost in (301, 302, 303, 307, 308) and "evil.com" in loc:
+                    findings.append(
+                        f"[oauth-open-redirect] {test_url} -> HTTP {ost} Location={loc} ({desc})"
+                    )
+                elif b"invalid_redirect_uri" in body_lower or b"invalid_request" in body_lower:
+                    findings.append(
+                        f"[oauth-rejected] {test_url} -> HTTP {ost} ({desc} rejected by server)"
+                    )
+                else:
+                    findings.append(f"[oauth-probe] {test_url} -> HTTP {ost} ({desc})")
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                continue
+    for ep in oauth_endpoints[:10]:
+        for probe, desc in _OAUTH_MISCONFIG_PROBES[:8]:
+            if "redirect_uri" in probe:
+                continue
+            await _throttle_rate()
+            sep = "&" if "?" in ep else "?"
+            test_url = f"{ep}{sep}{probe}"
+            try:
+                req = urllib.request.Request(test_url, headers={"User-Agent": "Mozilla/5.0"})
+                ost, _, obody = await _async_urlopen(opener_sso, req, timeout=10)
+                body_lower = obody.lower()
+                if b"invalid_request" in body_lower or b"unsupported_response_type" in body_lower:
+                    findings.append(
+                        f"[oauth-rejected] {test_url} -> HTTP {ost} ({desc} rejected by server)"
+                    )
+                else:
+                    findings.append(f"[oauth-probe] {test_url} -> HTTP {ost} ({desc})")
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                continue
     well_known_urls = [u for u in endpoints if ".well-known" in u.lower()]
     for wk in well_known_urls[:5]:
         await _throttle_rate()
@@ -162,7 +213,7 @@ async def phase_158_SSO(
                 )
     out = ensure(_out)
     out.write_text("\n".join(findings) + ("\n" if findings else ""))
-    log("ok", f"158-SSO: {len(findings)} findings → {out}")
+    log("OK", f"158-SSO: {len(findings)} findings → {out}")
     return {"158-SSO": str(_out), "count": len(findings)}
 
 
@@ -179,7 +230,7 @@ async def phase_159_SAMLADV(
     _out = outdir / "sso_saml.txt"
     if _out.exists() and not force:
         return {"159-SAMLADV": str(_out), "count": count_nonblank(_out)}
-    log("info", "Phase 159-SAMLADV: SAML assertion manipulation testing")
+    log("INFO", "Phase 159-SAMLADV: SAML assertion manipulation testing")
     findings: List[str] = []
     endpoints = await _find_sso_endpoints(outdir)
     saml_endpoints = [u for u in endpoints if "saml" in u.lower() or "adfs" in u.lower()]
@@ -189,19 +240,60 @@ async def phase_159_SAMLADV(
         findings.append("[info] No SAML endpoints found")
         out = ensure(_out)
         out.write_text("\n".join(findings) + "\n")
-        log("ok", "159-SAMLADV: no SAML endpoints")
+        log("OK", "159-SAMLADV: no SAML endpoints")
         return {"159-SAMLADV": str(_out), "count": 0}
     findings.append(f"[endpoints] {len(saml_endpoints)} SAML endpoints")
     for ep in saml_endpoints:
         findings.append(f"  {ep}")
     findings.append("")
-    findings.append("--- SAML attack vectors ---")
+    findings.append("--- SAML attack vector probes ---")
+    opener_saml = _get_urlopener()
     for ep in saml_endpoints[:5]:
         for vector, desc in _SAML_ATTACK_VECTORS:
-            findings.append(f"  [{desc}] {ep} → {vector[:150]}…")
+            await _throttle_rate()
+            saml_response = (
+                '<?xml version="1.0" encoding="UTF-8"?>'
+                '<samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol" '
+                'xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion" '
+                'InResponseTo="probe" Destination="' + ep + '" '
+                'IssueInstant="2000-01-01T00:00:00Z">'
+                "<saml:Assertion>" + vector + "</saml:Assertion></samlp:Response>"
+            )
+            b64 = base64.b64encode(saml_response.encode()).decode()
+            form = urllib.parse.urlencode({"SAMLResponse": b64, "RelayState": "probe"})
+            req = urllib.request.Request(
+                ep,
+                data=form.encode(),
+                method="POST",
+                headers={
+                    "Content-Type": "application/x-www-form-urlencoded",
+                    "User-Agent": "Mozilla/5.0",
+                },
+            )
+            try:
+                sst, _, sb = await _async_urlopen(opener_saml, req, timeout=10)
+                body_lower = sb.decode("utf-8", errors="ignore").lower()
+                if any(
+                    m in body_lower
+                    for m in [
+                        "invalid signature",
+                        "signature validation",
+                        "invalid request",
+                        "unsupported",
+                    ]
+                ):
+                    findings.append(
+                        f"[saml-rejected] {ep} {desc} -> HTTP {sst} (assertion rejected)"
+                    )
+                else:
+                    findings.append(f"[saml-probe] {ep} {desc} -> HTTP {sst} (review response)")
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                continue
     out = ensure(_out)
     out.write_text("\n".join(findings) + ("\n" if findings else ""))
-    log("ok", f"159-SAMLADV: {len(findings)} findings → {out}")
+    log("OK", f"159-SAMLADV: {len(findings)} findings → {out}")
     return {"159-SAMLADV": str(_out), "count": len(findings)}
 
 
@@ -218,14 +310,14 @@ async def phase_160_SSOCONF(
     _out = outdir / "sso_token_confusion.txt"
     if _out.exists() and not force:
         return {"160-SSOCONF": str(_out), "count": count_nonblank(_out)}
-    log("info", "Phase 160-SSOCONF: cross-tenant token confusion & IdP spoofing")
+    log("INFO", "Phase 160-SSOCONF: cross-tenant token confusion & IdP spoofing")
     findings: List[str] = []
     endpoints = await _find_sso_endpoints(outdir)
     if not endpoints:
         findings.append("[info] No SSO endpoints found")
         out = ensure(_out)
         out.write_text("\n".join(findings) + "\n")
-        log("ok", "160-SSOCONF: no SSO endpoints")
+        log("OK", "160-SSOCONF: no SSO endpoints")
         return {"160-SSOCONF": str(_out), "count": 0}
     findings.append(f"[endpoints] {len(endpoints)} SSO endpoints")
     token_endpoints = [u for u in endpoints if "/token" in u.lower()]
@@ -246,13 +338,30 @@ async def phase_160_SSOCONF(
             )
     findings.append("")
     findings.append("--- IdP spoofing / login CSRF tests ---")
+    opener_sso3 = _get_urlopener()
     for ep in auth_endpoints[:5]:
         findings.append(f"[auth-endpoint] {ep}")
         for idp_param in ["idp", "provider", "identity_provider", "domain_hint", "login_hint"]:
-            test_hint = f"{idp_param}=evil-idp.com"
+            await _throttle_rate()
             sep = "&" if "?" in ep else "?"
-            findings.append(f"  [idp-spoof] {ep}{sep}{test_hint}")
+            test_url = f"{ep}{sep}{idp_param}=evil-idp.com"
+            try:
+                req = urllib.request.Request(test_url, headers={"User-Agent": "Mozilla/5.0"})
+                ist, iheaders, ibody = await _async_urlopen(opener_sso3, req, timeout=10)
+                loc = str(iheaders.get("Location", "")).lower() if iheaders else ""
+                body_lower = ibody.decode("utf-8", errors="ignore").lower()
+                if "evil-idp.com" in loc or "evil-idp.com" in body_lower:
+                    findings.append(
+                        f"[idp-spoof-candidate] {test_url} -> HTTP {ist} "
+                        f"(idp param honored in response)"
+                    )
+                else:
+                    findings.append(f"[idp-probe] {test_url} -> HTTP {ist}")
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                continue
     out = ensure(_out)
     out.write_text("\n".join(findings) + ("\n" if findings else ""))
-    log("ok", f"160-SSOCONF: {len(findings)} findings → {out}")
+    log("OK", f"160-SSOCONF: {len(findings)} findings → {out}")
     return {"160-SSOCONF": str(_out), "count": len(findings)}

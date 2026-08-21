@@ -458,7 +458,7 @@ async def _run_server(host: str, port: int) -> None:
     _dashboard_loop = asyncio.get_running_loop()
     _setup_event_subscriptions()
     server = await asyncio.start_server(_handle_request, host, port)
-    log("ok", f"ok: dashboard server running at http://{host}:{port}")
+    log("OK", f"ok: dashboard server running at http://{host}:{port}")
     async with server:
         await server.serve_forever()
 
@@ -480,11 +480,11 @@ def start_dashboard_thread(host: str = "127.0.0.1", port: int = 8765) -> None:
         try:
             loop.run_until_complete(_run_server(host, port))
         except Exception as exc:
-            log("err", f"err: dashboard server failed: {exc}")
+            log("ERROR", f"err: dashboard server failed: {exc}")
 
     t = threading.Thread(target=_thread, daemon=True, name="vulnforge-dashboard")
     t.start()
-    log("ok", f"ok: dashboard thread started on {host}:{port}")
+    log("OK", f"ok: dashboard thread started on {host}:{port}")
 
 
 def start_dashboard(host: str = "127.0.0.1", port: int = 8765, open_browser: bool = True) -> None:

@@ -47,7 +47,7 @@ async def phase_08_FUZZ(
     _f_out = outdir / "fuzz.txt"
     if _f_out.exists() and not force:
         return {"08-FUZZ": str(_f_out), "count": count_nonblank(_f_out)}
-    log("info", "Phase 08-FUZZ: fuzzing")
+    log("INFO", "Phase 08-FUZZ: fuzzing")
     _ffuf_dir = outdir / "ffuf"
     _ffuf_dir.mkdir(parents=True, exist_ok=True)
     # Clean stale ffuf files from root outdir (pre-migration leftovers)
@@ -58,13 +58,13 @@ async def phase_08_FUZZ(
     urls = outdir / "urls_all.txt"
     all_urls = read_lines(urls) if urls.exists() else []
     if not all_urls:
-        log("warn", "08-FUZZ: no URLs; skipping")
+        log("WARNING", "08-FUZZ: no URLs; skipping")
         return {"08-FUZZ": str(outdir / "fuzz.txt"), "count": 0}
     # Filter to only target domain URLs — never fuzz external third-party domains
     _target_domain = domain.lower()
     all_urls = [u for u in all_urls if _target_domain in urllib.parse.urlparse(u).netloc.lower()]
     if not all_urls:
-        log("warn", "08-FUZZ: no target-domain URLs after filtering; skipping")
+        log("WARNING", "08-FUZZ: no target-domain URLs after filtering; skipping")
         return {"08-FUZZ": str(outdir / "fuzz.txt"), "count": 0}
     # Dedupe by (host, path) so URLs differing only in query params
     # don't all get fuzzed independently — saves significant time.
@@ -109,7 +109,7 @@ async def phase_08_FUZZ(
         if alt:
             wordlist = str(alt[0])
     if not wordlist or not Path(wordlist).exists():
-        log("warn", f"08-FUZZ: no wordlist found (searched {_seclists_base}), ffuf disabled")
+        log("WARNING", f"08-FUZZ: no wordlist found (searched {_seclists_base}), ffuf disabled")
         wordlist = ""
     if t.has("ffuf") and wordlist:
         for u in sample:
@@ -202,9 +202,9 @@ async def phase_08_FUZZ(
     if jobs:
         for old in _ffuf_dir.glob("ffuf_*.txt"):
             old.unlink(missing_ok=True)
-        log("info", f"08-FUZZ: starting {len(jobs)} ffuf jobs")
+        log("INFO", f"08-FUZZ: starting {len(jobs)} ffuf jobs")
         await run_parallel(jobs, outdir, quiet=True)
-        log("info", f"08-FUZZ: {len(jobs)} ffuf jobs finished")
+        log("INFO", f"08-FUZZ: {len(jobs)} ffuf jobs finished")
         normalized: List[Path] = []
         for ffp in _ffuf_dir.glob("ffuf_*.json"):
             norm = ffp.with_suffix(".txt")
@@ -214,9 +214,9 @@ async def phase_08_FUZZ(
         for p in _ffuf_dir.glob("ffuf_*.json"):
             p.unlink(missing_ok=True)
         if n == 0:
-            log("warn", "08-FUZZ: fuzzers produced no hits")
+            log("WARNING", "08-FUZZ: fuzzers produced no hits")
         return {"08-FUZZ": str(outdir / "fuzz.txt"), "count": n}
-    log("info", "08-FUZZ: ffuf not available or no wordlist; keeping prior fuzz results")
+    log("INFO", "08-FUZZ: ffuf not available or no wordlist; keeping prior fuzz results")
     return {"08-FUZZ": str(outdir / "fuzz.txt"), "count": count_nonblank(_f_out)}
 
 
@@ -255,6 +255,15 @@ _WAF_PROBE_PAYLOADS = [
     "1; DROP TABLE users",
     "admin' --",
 ]
+_ACTIVE_BLOCK_KEYWORDS = (
+    "blocked",
+    "denied",
+    "rejected",
+    "access denied",
+    "request blocked",
+    "attention required",
+)
+_ACTIVE_BLOCK_STATUSES = (403, 406, 429, 503, 501)
 
 
 async def phase_21_WAF(
@@ -271,7 +280,7 @@ async def phase_21_WAF(
     _p_out = outdir / "waf_detection.txt"
     if _p_out.exists() and not force:
         return {"21-WAF": str(_p_out), "count": count_nonblank(_p_out)}
-    log("info", "Phase 21-WAF: WAF detection")
+    log("INFO", "Phase 21-WAF: WAF detection")
     findings: List[str] = []
     _p_urlopen = _get_urlopener()
     # Collect HTTP targets
@@ -287,17 +296,22 @@ async def phase_21_WAF(
                 h = f"https://{h}"
             targets.append(h.rstrip("/"))
     if not targets:
-        log("warn", "Phase 21-WAF: no HTTP targets; skipping")
+        log("WARNING", "Phase 21-WAF: no HTTP targets; skipping")
         return {"21-WAF": str(_p_out), "count": 0}
     # wafw00f integration
     if t.has("wafw00f") or t.has("wafw00f.py"):
         waf_bin = "wafw00f" if t.has("wafw00f") else "wafw00f.py"
         waf_out = outdir / "wafw00f_results.txt"
+        # Use http:// to avoid SSL errors on admin subdomains with cert issues
+        waf_targets = []
+        for tgt in targets:
+            h = tgt.replace("https://", "").replace("http://", "")
+            waf_targets.append(f"http://{h}")
         await _run(
             "wafw00f",
             [
                 waf_bin,
-                *[tgt.replace("https://", "").replace("http://", "") for tgt in targets],
+                *waf_targets,
                 "-o",
                 str(waf_out),
                 "-a",
@@ -310,7 +324,7 @@ async def phase_21_WAF(
                 findings.append(f"[wafw00f] {ln}")
         elif waf_out.exists():
             waf_out.unlink(missing_ok=True)
-            log("warn", "wafw00f: output file is empty (target unreachable or crashed)")
+            log("WARNING", "wafw00f: output file is empty (target unreachable or crashed)")
 
     # Custom passive WAF detection (check response headers and body)
     async def _passive_waf_check(url: str) -> List[str]:
@@ -343,6 +357,17 @@ async def phase_21_WAF(
     # Active WAF detection (send malicious payloads, check block codes)
     async def _active_waf_check(url: str) -> List[str]:
         results: List[str] = []
+        baseline_url = f"{url}?q={urllib.parse.quote('control')}"
+        try:
+            req = urllib.request.Request(
+                baseline_url, method="GET", headers={"User-Agent": "Mozilla/5.0"}
+            )
+            _, _, baseline_body = await _async_urlopen(_p_urlopen, req, timeout=10)
+            baseline = baseline_body.decode("utf-8", errors="ignore").lower()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            baseline = ""
         for payload in _WAF_PROBE_PAYLOADS:
             try:
                 probe_url = f"{url}?q={urllib.parse.quote(payload)}"
@@ -351,15 +376,15 @@ async def phase_21_WAF(
                 )
                 awaf_status, _, awaf_body = await _async_urlopen(_p_urlopen, req, timeout=10)
                 body = awaf_body.decode("utf-8", errors="ignore").lower()
-                if any(kw in body for kw in ("blocked", "denied", "rejected", "waf", "security")):
+                if awaf_status in _ACTIVE_BLOCK_STATUSES:
                     results.append(
-                        f"[active-blocked-content] {url} → waf keyword in response for payload: {payload[:40]}"
+                        f"[active-blocked] {url} → HTTP {awaf_status} with payload: {payload[:40]}"
                     )
                     break
-            except urllib.error.HTTPError as e:
-                if e.code in (403, 406, 429, 503, 501):
+                new_kws = [kw for kw in _ACTIVE_BLOCK_KEYWORDS if kw in body and kw not in baseline]
+                if new_kws:
                     results.append(
-                        f"[active-blocked] {url} → HTTP {e.code} with payload: {payload[:40]}"
+                        f"[active-blocked-content] {url} → WAF keyword ({new_kws[0]}) for payload: {payload[:40]}"
                     )
                     break
             except asyncio.CancelledError:
@@ -378,10 +403,11 @@ async def phase_21_WAF(
         findings.append("[passive] No WAF detected (passive signature analysis)")
     out = ensure(_p_out)
     out.write_text("\n".join(findings) + ("\n" if findings else ""))
-    # Set global WAF state so downstream phases can adjust behavior
-    _PIPELINE_CFG.waf_detected = bool(
-        findings and not any("No WAF detected" in f for f in findings)
-    )
+    # Set global WAF state so downstream phases can adjust behavior.
+    # Only set on consistent signatures (>= 2 corroborating detection lines) so a
+    # single false positive does not degrade sampling of all downstream phases.
+    _detections = [f for f in findings if "No WAF detected" not in f]
+    _PIPELINE_CFG.waf_detected = len(_detections) >= 2
     # Calculate evasion throttle: if WAF detected, add delay and randomize
     if _PIPELINE_CFG.waf_detected:
         _PIPELINE_CFG.waf_evasion_throttle = max(_PIPELINE_CFG.delay, 1.0)
@@ -389,7 +415,7 @@ async def phase_21_WAF(
         findings.append(
             "[waf-evasion] WAF detected — downstream phases should add delay=1.0+ and randomize User-Agent/headers"
         )
-    log("ok", f"Phase 21-WAF: {len(findings)} WAF detection findings → {out}")
+    log("OK", f"Phase 21-WAF: {len(findings)} WAF detection findings → {out}")
     return {"21-WAF": str(out), "count": len(findings)}
 
 
@@ -465,7 +491,7 @@ async def phase_21b_WAFBYPASS(
     _out = outdir / "waf_bypass.txt"
     if _out.exists() and not force:
         return {"21b-WAFBYPASS": str(_out), "count": count_nonblank(_out)}
-    log("info", "Phase 21b-WAFBYPASS: WAF bypass technique testing")
+    log("INFO", "Phase 21b-WAFBYPASS: WAF bypass technique testing")
     findings: List[str] = []
     _wb_urlopen = _get_urlopener()
     _wb_extra_headers = _extra_headers_dict()
@@ -502,13 +528,13 @@ async def phase_21b_WAFBYPASS(
                 h = f"https://{h}"
             targets.append(h.rstrip("/"))
     if not targets:
-        log("warn", "21b-WAFBYPASS: no targets; skipping")
+        log("WARNING", "21b-WAFBYPASS: no targets; skipping")
         return {"21b-WAFBYPASS": str(_out), "count": 0}
 
     if not waf_vendors:
-        log("warn", "21b-WAFBYPASS: no WAF detected; running generic bypass probes only")
+        log("WARNING", "21b-WAFBYPASS: no WAF detected; running generic bypass probes only")
     else:
-        log("info", f"21b-WAFBYPASS: targeting {', '.join(sorted(waf_vendors))} WAF(s)")
+        log("INFO", f"21b-WAFBYPASS: targeting {', '.join(sorted(waf_vendors))} WAF(s)")
 
     async def _has_waf_blocked(url: str, body: str, status: int) -> bool:
         block_kw = {
@@ -570,7 +596,7 @@ async def phase_21b_WAFBYPASS(
             s, _, body_bytes = await _async_urlopen(_wb_urlopen, req, timeout=10)
             body = body_bytes.decode("utf-8", errors="ignore")
             if not await _has_waf_blocked(probe_url, body, s):
-                return f"[waf-bypass] {target} — {desc} — HTTP {s} — payload reached origin"
+                return f"[info] {target} — {desc} — HTTP {s} — payload not blocked (unverified)"
             return f"[waf-blocked] {target} — {desc} — HTTP {s} — blocked by WAF"
         except urllib.error.HTTPError as e:
             if e.code in (403, 406, 429, 503, 501):
@@ -598,7 +624,7 @@ async def phase_21b_WAFBYPASS(
         findings.append("[waf-bypass] No WAF bypass techniques confirmed (expected)")
     out = ensure(_out)
     out.write_text("\n".join(findings) + ("\n" if findings else ""))
-    log("ok", f"21b-WAFBYPASS: {len(findings)} bypass checks → {out}")
+    log("OK", f"21b-WAFBYPASS: {len(findings)} bypass checks → {out}")
     return {"21b-WAFBYPASS": str(out), "count": len(findings)}
 
 
@@ -630,9 +656,9 @@ async def phase_54_WS_FUZZ(
     _out = outdir / "websocket_fuzz.txt"
     if _out.exists() and not force:
         return {"54-WS-FUZZ": str(_out), "count": count_nonblank(_out)}
-    log("info", "Phase 54-WS-FUZZ: WebSocket message fuzzing")
+    log("INFO", "Phase 54-WS-FUZZ: WebSocket message fuzzing")
     if _PIPELINE_CFG.proxy or _USE_PROXYCHAINS:
-        log("warn", "54-WS-FUZZ: raw sockets incompatible with proxy; skipping")
+        log("WARNING", "54-WS-FUZZ: raw sockets incompatible with proxy; skipping")
         return {"54-WS-FUZZ": str(_out), "count": 0}
     findings: List[str] = []
     _ws_extra_headers = _extra_headers_dict()
@@ -791,5 +817,5 @@ async def phase_54_WS_FUZZ(
         findings.append("[ws-fuzz] No interesting WebSocket fuzzing results")
     out = ensure(_out)
     out.write_text("\n".join(findings) + ("\n" if findings else ""))
-    log("ok", f"54-WS-FUZZ: {len(findings)} WS fuzz findings → {out}")
+    log("OK", f"54-WS-FUZZ: {len(findings)} WS fuzz findings → {out}")
     return {"54-WS-FUZZ": str(out), "count": len(findings)}

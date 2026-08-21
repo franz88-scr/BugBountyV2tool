@@ -500,7 +500,7 @@ def generate_compliance_report(
     """
     controls = ALL_CONTROLS.get(framework, [])
     if not controls:
-        log("warn", f"compliance: unknown framework: {framework}")
+        log("WARNING", f"compliance: unknown framework: {framework}")
         return ensure(outdir / f"compliance_{framework.value}.json")
 
     findings = _load_vuln_findings(outdir)
@@ -544,7 +544,7 @@ def generate_compliance_report(
     # Write JSON report
     out_json = ensure(outdir / f"compliance_{framework.value}.json")
     out_json.write_text(json.dumps(report, indent=2, default=str))
-    log("ok", f"compliance: {framework.value} report → {out_json}")
+    log("OK", f"compliance: {framework.value} report → {out_json}")
 
     # Write Markdown report
     md_path = ensure(outdir / f"compliance_{framework.value}.md")
@@ -579,7 +579,7 @@ def generate_compliance_report(
         md_lines.append("")
 
     md_path.write_text("\n".join(md_lines))
-    log("ok", f"compliance: {framework.value} markdown → {md_path}")
+    log("OK", f"compliance: {framework.value} markdown → {md_path}")
 
     return out_json
 

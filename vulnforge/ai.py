@@ -82,10 +82,10 @@ class OpenAIProvider(LLMProvider):
                     msg = choices[0].get("message", {})
                     if isinstance(msg, dict) and msg.get("content"):
                         return str(msg["content"])
-                log("warn", "warn: OpenAI returned empty output, treating as provider failure")
+                log("WARNING", "warn: OpenAI returned empty output, treating as provider failure")
                 return ""
             except Exception as exc:
-                log("err", f"err: OpenAI API call failed: {exc}")
+                log("ERROR", f"err: OpenAI API call failed: {exc}")
                 return ""
 
         loop = asyncio.get_running_loop()
@@ -136,10 +136,10 @@ class AnthropicProvider(LLMProvider):
                     text = content[0].get("text", "")
                     if text:
                         return text  # type: ignore[no-any-return]
-                log("warn", "warn: Anthropic returned empty output, treating as provider failure")
+                log("WARNING", "warn: Anthropic returned empty output, treating as provider failure")
                 return ""
             except Exception as exc:
-                log("err", f"err: Anthropic API call failed: {exc}")
+                log("ERROR", f"err: Anthropic API call failed: {exc}")
                 return ""
 
         loop = asyncio.get_running_loop()
@@ -208,7 +208,7 @@ class OllamaProvider(LLMProvider):
                     body = json.loads(resp.read())
                 return body.get("response", "")  # type: ignore[no-any-return]
             except Exception as exc:
-                log("err", f"err: Ollama API call failed: {exc}")
+                log("ERROR", f"err: Ollama API call failed: {exc}")
                 return ""
 
         loop = asyncio.get_running_loop()
@@ -278,7 +278,7 @@ def configure(
 
     cls = _PROVIDERS.get(provider_name)
     if cls is None:
-        log("warn", f"warn: unknown AI provider '{provider_name}', falling back to dry-run")
+        log("WARNING", f"warn: unknown AI provider '{provider_name}', falling back to dry-run")
         cls = DryRunProvider
         provider_name = "dry-run"
 
@@ -301,7 +301,7 @@ def configure(
     _configured = True
 
     if provider.is_available():
-        log("ok", f"ok: AI provider '{provider_name}' ready")
+        log("OK", f"ok: AI provider '{provider_name}' ready")
     else:
         log(
             "warn",

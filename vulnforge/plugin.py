@@ -124,7 +124,7 @@ def _discover_plugins(directory: Path) -> List[_PluginMeta]:
             mod = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(mod)
         except Exception as exc:
-            log("warn", f"failed to load plugin {py_file.name}: {exc}")
+            log("WARNING", f"failed to load plugin {py_file.name}: {exc}")
             continue
 
         # Validate plugin has expected attributes before registering
@@ -155,7 +155,7 @@ def _discover_plugins(directory: Path) -> List[_PluginMeta]:
                 try:
                     instance = obj()
                 except Exception as exc:
-                    log("warn", f"failed to instantiate plugin {obj.__name__}: {exc}")
+                    log("WARNING", f"failed to instantiate plugin {obj.__name__}: {exc}")
                     continue
                 found.append(_PluginMeta(cls=obj, source_file=py_file, instance=instance))
     return found
@@ -180,7 +180,7 @@ def discover_plugins(directories: Optional[List[Path]] = None) -> List[_PluginMe
     for d in dirs:
         for meta in _discover_plugins(d):
             if meta.instance.name in seen_names:
-                log("warn", f"duplicate plugin name '{meta.instance.name}' from {meta.source_file}")
+                log("WARNING", f"duplicate plugin name '{meta.instance.name}' from {meta.source_file}")
                 continue
             seen_names.add(meta.instance.name)
             result.append(meta)
@@ -208,7 +208,7 @@ def register_plugin_to_pipeline(plugins: List[_PluginMeta]) -> None:
         phase_id = inst.name
 
         if phase_id in VALID_PHASES:
-            log("warn", f"plugin '{phase_id}' conflicts with built-in phase, skipping")
+            log("WARNING", f"plugin '{phase_id}' conflicts with built-in phase, skipping")
             continue
 
         VALID_PHASES.add(phase_id)
@@ -232,7 +232,7 @@ def register_plugin_to_pipeline(plugins: List[_PluginMeta]) -> None:
         # Inject weight
         phases_init._PHASE_WEIGHTS[phase_id] = inst.weight
 
-        log("ok", f"registered plugin '{phase_id}' (stage {inst.stage}, deps={inst.deps})")
+        log("OK", f"registered plugin '{phase_id}' (stage {inst.stage}, deps={inst.deps})")
 
 
 def list_plugins_cli() -> None:

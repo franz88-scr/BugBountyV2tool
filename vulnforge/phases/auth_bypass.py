@@ -40,11 +40,11 @@ async def phase_90_CSRF(
     _out = outdir / "csrf_findings.txt"
     if _out.exists() and not force:
         return {"90-CSRF": str(_out), "count": count_nonblank(_out)}
-    log("info", "Phase 90-CSRF: CSRF token detection and bypass testing")
+    log("INFO", "Phase 90-CSRF: CSRF token detection and bypass testing")
     urls = outdir / "urls_all.txt"
     all_urls = read_lines(urls) if urls.exists() else []
     if not all_urls:
-        log("warn", "90-CSRF: no URLs; skipping")
+        log("WARNING", "90-CSRF: no URLs; skipping")
         return {"90-CSRF": str(_out), "count": 0}
     findings: List[str] = []
     _urlopen = _get_urlopener()
@@ -135,7 +135,7 @@ async def phase_90_CSRF(
         findings.append(f"[csrf] {tested} URLs tested, no CSRF issues found")
     out = ensure(_out)
     out.write_text("\n".join(findings) + ("\n" if findings else ""))
-    log("ok", f"90-CSRF: {len(findings)} findings → {out}")
+    log("OK", f"90-CSRF: {len(findings)} findings → {out}")
     return {"90-CSRF": str(_out), "count": len(findings)}
 
 
@@ -152,11 +152,11 @@ async def phase_91_SESSIONFIX(
     _out = outdir / "session_fixation.txt"
     if _out.exists() and not force:
         return {"91-SESSIONFIX": str(_out), "count": count_nonblank(_out)}
-    log("info", "Phase 91-SESSIONFIX: session fixation testing")
+    log("INFO", "Phase 91-SESSIONFIX: session fixation testing")
     urls = outdir / "urls_all.txt"
     all_urls = read_lines(urls) if urls.exists() else []
     if not all_urls:
-        log("warn", "91-SESSIONFIX: no URLs; skipping")
+        log("WARNING", "91-SESSIONFIX: no URLs; skipping")
         return {"91-SESSIONFIX": str(_out), "count": 0}
     findings: List[str] = []
     _urlopen = _get_urlopener()
@@ -202,9 +202,30 @@ async def phase_91_SESSIONFIX(
             except Exception:
                 pass
             post_cookies = {c.name: c.value for c in cj}
-            if pre_cookies == post_cookies and pre_cookies:
+            # Judge fixation only on a proven successful login: an authenticated
+            # follow-up request must return 2xx/3xx with an auth marker.
+            login_ok = False
+            try:
+                app_req = urllib.request.Request(
+                    url, headers={"User-Agent": "Mozilla/5.0", **_extra_h}
+                )
+                app_resp = opener_cj.open(app_req, timeout=10)
+                app_status = getattr(app_resp, "status", 200)
+                app_body = app_resp.read(100000).decode("utf-8", errors="ignore").lower()
+                login_ok = app_status in (200, 201, 204, 301, 302, 307, 308) and any(
+                    m in app_body for m in ("dashboard", "welcome", "logout", "account", "profile")
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                login_ok = False
+            if not login_ok:
                 findings.append(
-                    f"[session-fixation] {url} — session cookie unchanged after auth attempt"
+                    f"[session-fixation-info] {url} — login attempt did not authenticate; cookie behavior not judged"
+                )
+            elif pre_cookies == post_cookies and pre_cookies:
+                findings.append(
+                    f"[session-fixation] {url} — session cookie unchanged after successful auth"
                 )
             elif pre_cookies and post_cookies:
                 changed = [
@@ -224,7 +245,7 @@ async def phase_91_SESSIONFIX(
         findings.append("[session-fixation] No login endpoints tested")
     out = ensure(_out)
     out.write_text("\n".join(findings) + ("\n" if findings else ""))
-    log("ok", f"91-SESSIONFIX: {len(findings)} findings → {out}")
+    log("OK", f"91-SESSIONFIX: {len(findings)} findings → {out}")
     return {"91-SESSIONFIX": str(_out), "count": len(findings)}
 
 
@@ -241,11 +262,11 @@ async def phase_92_SAML(
     _out = outdir / "saml_findings.txt"
     if _out.exists() and not force:
         return {"92-SAML": str(_out), "count": count_nonblank(_out)}
-    log("info", "Phase 92-SAML: SAML misconfiguration attacks")
+    log("INFO", "Phase 92-SAML: SAML misconfiguration attacks")
     urls = outdir / "urls_all.txt"
     all_urls = read_lines(urls) if urls.exists() else []
     if not all_urls:
-        log("warn", "92-SAML: no URLs; skipping")
+        log("WARNING", "92-SAML: no URLs; skipping")
         return {"92-SAML": str(_out), "count": 0}
     findings: List[str] = []
     _urlopen = _get_urlopener()
@@ -292,7 +313,7 @@ async def phase_92_SAML(
         findings.append("[saml] No SAML endpoints discovered")
     out = ensure(_out)
     out.write_text("\n".join(findings) + ("\n" if findings else ""))
-    log("ok", f"92-SAML: {len(findings)} findings → {out}")
+    log("OK", f"92-SAML: {len(findings)} findings → {out}")
     return {"92-SAML": str(_out), "count": len(findings)}
 
 
@@ -309,11 +330,11 @@ async def phase_93_PWDSPRAY(
     _out = outdir / "password_spray_results.txt"
     if _out.exists() and not force:
         return {"93-PWDSPRAY": str(_out), "count": count_nonblank(_out)}
-    log("info", "Phase 93-PWDSPRAY: password spraying")
+    log("INFO", "Phase 93-PWDSPRAY: password spraying")
     urls = outdir / "urls_all.txt"
     all_urls = read_lines(urls) if urls.exists() else []
     if not all_urls:
-        log("warn", "93-PWDSPRAY: no URLs; skipping")
+        log("WARNING", "93-PWDSPRAY: no URLs; skipping")
         return {"93-PWDSPRAY": str(_out), "count": 0}
     findings: List[str] = []
     _urlopen = _get_urlopener()
@@ -345,7 +366,7 @@ async def phase_93_PWDSPRAY(
         if any(m in u.lower() for m in ("/login", "/signin", "/auth", "/api/login", "/wp-login"))
     ]
     if not login_urls:
-        log("warn", "93-PWDSPRAY: no login endpoints found")
+        log("WARNING", "93-PWDSPRAY: no login endpoints found")
         ensure(_out).write_text("[no login endpoints found]\n")
         return {"93-PWDSPRAY": str(_out), "count": 0}
     for url in login_urls[:3]:
@@ -387,7 +408,7 @@ async def phase_93_PWDSPRAY(
         findings.append("[password-spray] No weak credentials found")
     out = ensure(_out)
     out.write_text("\n".join(findings) + ("\n" if findings else ""))
-    log("ok", f"93-PWDSPRAY: {len(findings)} findings → {out}")
+    log("OK", f"93-PWDSPRAY: {len(findings)} findings → {out}")
     return {"93-PWDSPRAY": str(_out), "count": len(findings)}
 
 
@@ -404,11 +425,11 @@ async def phase_94_COOKIEAUDIT(
     _out = outdir / "cookie_audit.txt"
     if _out.exists() and not force:
         return {"94-COOKIEAUDIT": str(_out), "count": count_nonblank(_out)}
-    log("info", "Phase 94-COOKIEAUDIT: cookie security deep audit")
+    log("INFO", "Phase 94-COOKIEAUDIT: cookie security deep audit")
     urls = outdir / "urls_all.txt"
     all_urls = read_lines(urls) if urls.exists() else []
     if not all_urls:
-        log("warn", "94-COOKIEAUDIT: no URLs; skipping")
+        log("WARNING", "94-COOKIEAUDIT: no URLs; skipping")
         return {"94-COOKIEAUDIT": str(_out), "count": 0}
     findings: List[str] = []
     _urlopen = _get_urlopener()
@@ -453,7 +474,7 @@ async def phase_94_COOKIEAUDIT(
         findings.append("[cookie-audit] No cookie security issues found")
     out = ensure(_out)
     out.write_text("\n".join(findings) + ("\n" if findings else ""))
-    log("ok", f"94-COOKIEAUDIT: {len(findings)} findings → {out}")
+    log("OK", f"94-COOKIEAUDIT: {len(findings)} findings → {out}")
     return {"94-COOKIEAUDIT": str(_out), "count": len(findings)}
 
 
@@ -470,11 +491,11 @@ async def phase_95_POSTTEST(
     _out = outdir / "post_findings.txt"
     if _out.exists() and not force:
         return {"95-POSTTEST": str(_out), "count": count_nonblank(_out)}
-    log("info", "Phase 95-POSTTEST: POST method endpoint testing")
+    log("INFO", "Phase 95-POSTTEST: POST method endpoint testing")
     urls = outdir / "urls_all.txt"
     all_urls = read_lines(urls) if urls.exists() else []
     if not all_urls:
-        log("warn", "95-POSTTEST: no URLs; skipping")
+        log("WARNING", "95-POSTTEST: no URLs; skipping")
         return {"95-POSTTEST": str(_out), "count": 0}
     findings: List[str] = []
     _urlopen = _get_urlopener()
@@ -523,7 +544,7 @@ async def phase_95_POSTTEST(
         findings.append(f"[post-test] {tested} POST tests completed, no hidden functionality found")
     out = ensure(_out)
     out.write_text("\n".join(findings) + ("\n" if findings else ""))
-    log("ok", f"95-POSTTEST: {len(findings)} findings → {out}")
+    log("OK", f"95-POSTTEST: {len(findings)} findings → {out}")
     return {"95-POSTTEST": str(_out), "count": len(findings)}
 
 
@@ -540,11 +561,11 @@ async def phase_96_METHODOVERRIDE(
     _out = outdir / "method_override_bypass.txt"
     if _out.exists() and not force:
         return {"96-METHODOVERRIDE": str(_out), "count": count_nonblank(_out)}
-    log("info", "Phase 96-METHODOVERRIDE: HTTP method override bypass testing")
+    log("INFO", "Phase 96-METHODOVERRIDE: HTTP method override bypass testing")
     urls = outdir / "urls_all.txt"
     all_urls = read_lines(urls) if urls.exists() else []
     if not all_urls:
-        log("warn", "96-METHODOVERRIDE: no URLs; skipping")
+        log("WARNING", "96-METHODOVERRIDE: no URLs; skipping")
         return {"96-METHODOVERRIDE": str(_out), "count": 0}
     findings: List[str] = []
     _urlopen = _get_urlopener()
@@ -556,8 +577,18 @@ async def phase_96_METHODOVERRIDE(
             req = urllib.request.Request(
                 url, method="DELETE", headers={"User-Agent": "Mozilla/5.0", **_extra_h}
             )
-            s, _, _ = await _async_urlopen_no_redirect(_urlopen, req, timeout=10)
+            s, _, _ = await _async_urlopen_no_redirect(req, timeout=10)
             if s in (403, 405):
+                await _throttle_rate()
+                try:
+                    ref_req = urllib.request.Request(
+                        url, method="GET", headers={"User-Agent": "Mozilla/5.0", **_extra_h}
+                    )
+                    ref_s, _, _ = await _async_urlopen_no_redirect(ref_req, timeout=10)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    ref_s = None
                 for hdr in override_headers:
                     await _throttle_rate()
                     try:
@@ -566,10 +597,10 @@ async def phase_96_METHODOVERRIDE(
                             method="GET",
                             headers={"User-Agent": "Mozilla/5.0", hdr: "DELETE", **_extra_h},
                         )
-                        s2, _, _ = await _async_urlopen_no_redirect(_urlopen, req2, timeout=10)
-                        if s2 in (200, 201, 204):
+                        s2, _, _ = await _async_urlopen_no_redirect(req2, timeout=10)
+                        if ref_s is not None and s2 in (200, 201, 204) and s2 != ref_s:
                             findings.append(
-                                f"[method-override] {url} — {hdr}: DELETE bypasses {s} → {s2}"
+                                f"[method-override] {url} — {hdr}: DELETE bypasses {s} → {s2} (GET reference={ref_s})"
                             )
                     except asyncio.CancelledError:
                         raise
@@ -585,10 +616,10 @@ async def phase_96_METHODOVERRIDE(
                     req3 = urllib.request.Request(
                         test_url, headers={"User-Agent": "Mozilla/5.0", **_extra_h}
                     )
-                    s3, _, _ = await _async_urlopen_no_redirect(_urlopen, req3, timeout=10)
-                    if s3 in (200, 201, 204):
+                    s3, _, _ = await _async_urlopen_no_redirect(req3, timeout=10)
+                    if ref_s is not None and s3 in (200, 201, 204) and s3 != ref_s:
                         findings.append(
-                            f"[method-override-param] {url} — _method=DELETE bypasses {s} → {s3}"
+                            f"[method-override-param] {url} — _method=DELETE bypasses {s} → {s3} (GET reference={ref_s})"
                         )
                 except asyncio.CancelledError:
                     raise
@@ -602,7 +633,7 @@ async def phase_96_METHODOVERRIDE(
         findings.append("[method-override] No method override bypasses found")
     out = ensure(_out)
     out.write_text("\n".join(findings) + ("\n" if findings else ""))
-    log("ok", f"96-METHODOVERRIDE: {len(findings)} findings → {out}")
+    log("OK", f"96-METHODOVERRIDE: {len(findings)} findings → {out}")
     return {"96-METHODOVERRIDE": str(_out), "count": len(findings)}
 
 
@@ -619,11 +650,11 @@ async def phase_97_FORCEDBROWSE(
     _out = outdir / "forced_browse.txt"
     if _out.exists() and not force:
         return {"97-FORCEDBROWSE": str(_out), "count": count_nonblank(_out)}
-    log("info", "Phase 97-FORCEDBROWSE: forced browsing / unauthenticated access")
+    log("INFO", "Phase 97-FORCEDBROWSE: forced browsing / unauthenticated access")
     urls = outdir / "urls_all.txt"
     all_urls = read_lines(urls) if urls.exists() else []
     if not all_urls:
-        log("warn", "97-FORCEDBROWSE: no URLs; skipping")
+        log("WARNING", "97-FORCEDBROWSE: no URLs; skipping")
         return {"97-FORCEDBROWSE": str(_out), "count": 0}
     findings: List[str] = []
     _urlopen = _get_urlopener()
@@ -693,7 +724,7 @@ async def phase_97_FORCEDBROWSE(
         findings.append("[forced-browse] No accessible admin paths found")
     out = ensure(_out)
     out.write_text("\n".join(findings) + ("\n" if findings else ""))
-    log("ok", f"97-FORCEDBROWSE: {len(findings)} findings → {out}")
+    log("OK", f"97-FORCEDBROWSE: {len(findings)} findings → {out}")
     return {"97-FORCEDBROWSE": str(_out), "count": len(findings)}
 
 
@@ -710,11 +741,11 @@ async def phase_98_CASEBYPASS(
     _out = outdir / "case_bypass.txt"
     if _out.exists() and not force:
         return {"98-CASEBYPASS": str(_out), "count": count_nonblank(_out)}
-    log("info", "Phase 98-CASEBYPASS: case sensitivity access control bypass")
+    log("INFO", "Phase 98-CASEBYPASS: case sensitivity access control bypass")
     urls = outdir / "urls_all.txt"
     all_urls = read_lines(urls) if urls.exists() else []
     if not all_urls:
-        log("warn", "98-CASEBYPASS: no URLs; skipping")
+        log("WARNING", "98-CASEBYPASS: no URLs; skipping")
         return {"98-CASEBYPASS": str(_out), "count": 0}
     findings: List[str] = []
     _urlopen = _get_urlopener()
@@ -724,7 +755,7 @@ async def phase_98_CASEBYPASS(
         await _throttle_rate()
         try:
             req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0", **_extra_h})
-            status, _, _ = await _async_urlopen_no_redirect(_urlopen, req, timeout=10)
+            status, _, _ = await _async_urlopen_no_redirect(req, timeout=10)
             if status in (403, 401):
                 forbidden_urls.append(url)
         except asyncio.CancelledError:
@@ -749,7 +780,7 @@ async def phase_98_CASEBYPASS(
                 req = urllib.request.Request(
                     test_url, headers={"User-Agent": "Mozilla/5.0", **_extra_h}
                 )
-                status, _, _ = await _async_urlopen_no_redirect(_urlopen, req, timeout=10)
+                status, _, _ = await _async_urlopen_no_redirect(req, timeout=10)
                 if status == 200:
                     findings.append(f"[case-bypass] {url} → {test_url} (HTTP 200)")
             except asyncio.CancelledError:
@@ -764,7 +795,7 @@ async def phase_98_CASEBYPASS(
                 req = urllib.request.Request(
                     test_url, headers={"User-Agent": "Mozilla/5.0", **_extra_h}
                 )
-                status, _, _ = await _async_urlopen_no_redirect(_urlopen, req, timeout=10)
+                status, _, _ = await _async_urlopen_no_redirect(req, timeout=10)
                 if status == 200:
                     findings.append(f"[path-trick] {url} → {test_url} (HTTP 200)")
             except asyncio.CancelledError:
@@ -775,7 +806,7 @@ async def phase_98_CASEBYPASS(
         findings.append("[case-bypass] No case sensitivity bypasses found")
     out = ensure(_out)
     out.write_text("\n".join(findings) + ("\n" if findings else ""))
-    log("ok", f"98-CASEBYPASS: {len(findings)} findings → {out}")
+    log("OK", f"98-CASEBYPASS: {len(findings)} findings → {out}")
     return {"98-CASEBYPASS": str(_out), "count": len(findings)}
 
 
@@ -792,14 +823,14 @@ async def phase_99_APIPAGE(
     _out = outdir / "api_pagination_abuse.txt"
     if _out.exists() and not force:
         return {"99-APIPAGE": str(_out), "count": count_nonblank(_out)}
-    log("info", "Phase 99-APIPAGE: API pagination abuse testing")
+    log("INFO", "Phase 99-APIPAGE: API pagination abuse testing")
     urls = outdir / "urls_all.txt"
     all_urls = read_lines(urls) if urls.exists() else []
     api_file = outdir / "api_specs.txt"
     if api_file.exists():
         all_urls += read_lines(api_file)
     if not all_urls:
-        log("warn", "99-APIPAGE: no URLs; skipping")
+        log("WARNING", "99-APIPAGE: no URLs; skipping")
         return {"99-APIPAGE": str(_out), "count": 0}
     findings: List[str] = []
     _urlopen = _get_urlopener()
@@ -872,7 +903,7 @@ async def phase_99_APIPAGE(
         findings.append("[api-page] No pagination abuse found")
     out = ensure(_out)
     out.write_text("\n".join(findings) + ("\n" if findings else ""))
-    log("ok", f"99-APIPAGE: {len(findings)} findings → {out}")
+    log("OK", f"99-APIPAGE: {len(findings)} findings → {out}")
     return {"99-APIPAGE": str(_out), "count": len(findings)}
 
 
@@ -889,11 +920,11 @@ async def phase_99a_TABNAB(
     _out = outdir / "reverse_tabnabbing.txt"
     if _out.exists() and not force:
         return {"99a-TABNAB": str(_out), "count": count_nonblank(_out)}
-    log("info", "Phase 99a-TABNAB: reverse tabnabbing detection")
+    log("INFO", "Phase 99a-TABNAB: reverse tabnabbing detection")
     urls = outdir / "urls_all.txt"
     all_urls = read_lines(urls) if urls.exists() else []
     if not all_urls:
-        log("warn", "99a-TABNAB: no URLs; skipping")
+        log("WARNING", "99a-TABNAB: no URLs; skipping")
         return {"99a-TABNAB": str(_out), "count": 0}
     findings: List[str] = []
     _urlopen = _get_urlopener()
@@ -931,7 +962,7 @@ async def phase_99a_TABNAB(
         findings.append(f"[tabnab] {tested} pages tested, no reverse tabnabbing found")
     out = ensure(_out)
     out.write_text("\n".join(findings) + ("\n" if findings else ""))
-    log("ok", f"99a-TABNAB: {len(findings)} findings → {out}")
+    log("OK", f"99a-TABNAB: {len(findings)} findings → {out}")
     return {"99a-TABNAB": str(_out), "count": len(findings)}
 
 
@@ -948,11 +979,11 @@ async def phase_99b_APIKEYLEAK(
     _out = outdir / "api_key_leaks.txt"
     if _out.exists() and not force:
         return {"99b-APIKEYLEAK": str(_out), "count": count_nonblank(_out)}
-    log("info", "Phase 99b-APIKEYLEAK: API key leakage detection in responses")
+    log("INFO", "Phase 99b-APIKEYLEAK: API key leakage detection in responses")
     urls = outdir / "urls_all.txt"
     all_urls = read_lines(urls) if urls.exists() else []
     if not all_urls:
-        log("warn", "99b-APIKEYLEAK: no URLs; skipping")
+        log("WARNING", "99b-APIKEYLEAK: no URLs; skipping")
         return {"99b-APIKEYLEAK": str(_out), "count": 0}
     findings: List[str] = []
     _urlopen = _get_urlopener()
@@ -996,7 +1027,7 @@ async def phase_99b_APIKEYLEAK(
         findings.append(f"[apikeyleak] {tested} URLs scanned, no API key leaks found")
     out = ensure(_out)
     out.write_text("\n".join(findings) + ("\n" if findings else ""))
-    log("ok", f"99b-APIKEYLEAK: {len(findings)} findings → {out}")
+    log("OK", f"99b-APIKEYLEAK: {len(findings)} findings → {out}")
     return {"99b-APIKEYLEAK": str(_out), "count": len(findings)}
 
 
@@ -1013,14 +1044,14 @@ async def phase_99c_REDIRABUSE(
     _out = outdir / "redirect_abuse.txt"
     if _out.exists() and not force:
         return {"99c-REDIRABUSE": str(_out), "count": count_nonblank(_out)}
-    log("info", "Phase 99c-REDIRABUSE: open redirect deep testing")
+    log("INFO", "Phase 99c-REDIRABUSE: open redirect deep testing")
     urls = outdir / "urls_all.txt"
     all_urls = read_lines(urls) if urls.exists() else []
     redir_file = outdir / "open_redirect.txt"
     if redir_file.exists():
         all_urls = read_lines(redir_file) + all_urls
     if not all_urls:
-        log("warn", "99c-REDIRABUSE: no URLs; skipping")
+        log("WARNING", "99c-REDIRABUSE: no URLs; skipping")
         return {"99c-REDIRABUSE": str(_out), "count": 0}
     findings: List[str] = []
     _urlopen = _get_urlopener()
@@ -1091,7 +1122,7 @@ async def phase_99c_REDIRABUSE(
                 req = urllib.request.Request(
                     test_url, headers={"User-Agent": "Mozilla/5.0", **_extra_h}
                 )
-                status, resp_h, _ = await _async_urlopen_no_redirect(_urlopen, req, timeout=10)
+                status, resp_h, _ = await _async_urlopen_no_redirect(req, timeout=10)
                 location = ""
                 if hasattr(resp_h, "get"):
                     location = resp_h.get("Location", "")
@@ -1112,7 +1143,7 @@ async def phase_99c_REDIRABUSE(
         findings.append("[redir-abuse] No open redirect abuse found")
     out = ensure(_out)
     out.write_text("\n".join(findings) + ("\n" if findings else ""))
-    log("ok", f"99c-REDIRABUSE: {len(findings)} findings → {out}")
+    log("OK", f"99c-REDIRABUSE: {len(findings)} findings → {out}")
     return {"99c-REDIRABUSE": str(_out), "count": len(findings)}
 
 
@@ -1129,11 +1160,11 @@ async def phase_99d_LOGTRIGGER(
     _out = outdir / "log_injection_trigger.txt"
     if _out.exists() and not force:
         return {"99d-LOGTRIGGER": str(_out), "count": count_nonblank(_out)}
-    log("info", "Phase 99d-LOGTRIGGER: log injection triggering")
+    log("INFO", "Phase 99d-LOGTRIGGER: log injection triggering")
     urls = outdir / "urls_all.txt"
     all_urls = read_lines(urls) if urls.exists() else []
     if not all_urls:
-        log("warn", "99d-LOGTRIGGER: no URLs; skipping")
+        log("WARNING", "99d-LOGTRIGGER: no URLs; skipping")
         return {"99d-LOGTRIGGER": str(_out), "count": 0}
     findings: List[str] = []
     _urlopen = _get_urlopener()
@@ -1185,7 +1216,7 @@ async def phase_99d_LOGTRIGGER(
         findings.append("[log-trigger] No log injection vectors found")
     out = ensure(_out)
     out.write_text("\n".join(findings) + ("\n" if findings else ""))
-    log("ok", f"99d-LOGTRIGGER: {len(findings)} findings → {out}")
+    log("OK", f"99d-LOGTRIGGER: {len(findings)} findings → {out}")
     return {"99d-LOGTRIGGER": str(_out), "count": len(findings)}
 
 
@@ -1202,11 +1233,11 @@ async def phase_99e_XSSSTORED(
     _out = outdir / "stored_xss_verified.txt"
     if _out.exists() and not force:
         return {"99e-XSSSTORED": str(_out), "count": count_nonblank(_out)}
-    log("info", "Phase 99e-XSSSTORED: stored XSS verification")
+    log("INFO", "Phase 99e-XSSSTORED: stored XSS verification")
     urls = outdir / "urls_all.txt"
     all_urls = read_lines(urls) if urls.exists() else []
     if not all_urls:
-        log("warn", "99e-XSSSTORED: no URLs; skipping")
+        log("WARNING", "99e-XSSSTORED: no URLs; skipping")
         return {"99e-XSSSTORED": str(_out), "count": 0}
     findings: List[str] = []
     _urlopen = _get_urlopener()
@@ -1292,7 +1323,7 @@ async def phase_99e_XSSSTORED(
         findings.append("[stored-xss] No stored XSS vectors verified")
     out = ensure(_out)
     out.write_text("\n".join(findings) + ("\n" if findings else ""))
-    log("ok", f"99e-XSSSTORED: {len(findings)} findings → {out}")
+    log("OK", f"99e-XSSSTORED: {len(findings)} findings → {out}")
     return {"99e-XSSSTORED": str(_out), "count": len(findings)}
 
 
@@ -1309,11 +1340,11 @@ async def phase_99f_HOSTABUSE(
     _out = outdir / "host_header_abuse.txt"
     if _out.exists() and not force:
         return {"99f-HOSTABUSE": str(_out), "count": count_nonblank(_out)}
-    log("info", "Phase 99f-HOSTABUSE: host header injection extended")
+    log("INFO", "Phase 99f-HOSTABUSE: host header injection extended")
     urls = outdir / "urls_all.txt"
     all_urls = read_lines(urls) if urls.exists() else []
     if not all_urls:
-        log("warn", "99f-HOSTABUSE: no URLs; skipping")
+        log("WARNING", "99f-HOSTABUSE: no URLs; skipping")
         return {"99f-HOSTABUSE": str(_out), "count": 0}
     findings: List[str] = []
     _urlopen = _get_urlopener()
@@ -1375,7 +1406,7 @@ async def phase_99f_HOSTABUSE(
         findings.append("[host-abuse] No host header injection found")
     out = ensure(_out)
     out.write_text("\n".join(findings) + ("\n" if findings else ""))
-    log("ok", f"99f-HOSTABUSE: {len(findings)} findings → {out}")
+    log("OK", f"99f-HOSTABUSE: {len(findings)} findings → {out}")
     return {"99f-HOSTABUSE": str(_out), "count": len(findings)}
 
 
@@ -1392,11 +1423,11 @@ async def phase_99g_AUTHBYPASSADV(
     _out = outdir / "auth_bypass_advanced.txt"
     if _out.exists() and not force:
         return {"99g-AUTHBYPASSADV": str(_out), "count": count_nonblank(_out)}
-    log("info", "Phase 99g-AUTHBYPASSADV: advanced auth bypass techniques")
+    log("INFO", "Phase 99g-AUTHBYPASSADV: advanced auth bypass techniques")
     urls = outdir / "urls_all.txt"
     all_urls = read_lines(urls) if urls.exists() else []
     if not all_urls:
-        log("warn", "99g-AUTHBYPASSADV: no URLs; skipping")
+        log("WARNING", "99g-AUTHBYPASSADV: no URLs; skipping")
         return {"99g-AUTHBYPASSADV": str(_out), "count": 0}
     findings: List[str] = []
     _urlopen = _get_urlopener()
@@ -1429,6 +1460,18 @@ async def phase_99g_AUTHBYPASSADV(
                     jwt_tokens.append(token)
     for url in auth_urls[: _PIPELINE_CFG.sample_urls_authbypassadv]:
         parsed = urllib.parse.urlparse(url)
+        await _throttle_rate()
+        try:
+            base_req = urllib.request.Request(
+                url, headers={"User-Agent": "Mozilla/5.0", **_extra_h}
+            )
+            base_status, _, base_body = await _async_urlopen_no_redirect(base_req, timeout=10
+            )
+            base_len = len(base_body)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            continue
         bypass_headers = [
             {"X-Original-URL": parsed.path},
             {"X-Rewrite-URL": parsed.path},
@@ -1441,10 +1484,12 @@ async def phase_99g_AUTHBYPASSADV(
             try:
                 merged = {**_extra_h, "User-Agent": "Mozilla/5.0", **hdr_dict}
                 req = urllib.request.Request(url, headers=merged)
-                status, _, _ = await _async_urlopen_no_redirect(_urlopen, req, timeout=10)
-                if status == 200:
+                status, _, body = await _async_urlopen_no_redirect(req, timeout=10)
+                if status == 200 and (
+                    status != base_status or abs(len(body) - base_len) > max(100, base_len * 0.1)
+                ):
                     findings.append(
-                        f"[auth-bypass-header] {url} — {list(hdr_dict.keys())[0]}: {list(hdr_dict.values())[0]} → HTTP 200"
+                        f"[auth-bypass-header] {url} — {list(hdr_dict.keys())[0]}: {list(hdr_dict.values())[0]} → HTTP 200 (baseline={base_status})"
                     )
             except asyncio.CancelledError:
                 raise
@@ -1465,9 +1510,13 @@ async def phase_99g_AUTHBYPASSADV(
                 req = urllib.request.Request(
                     test_url, headers={"User-Agent": "Mozilla/5.0", **_extra_h}
                 )
-                status, _, _ = await _async_urlopen_no_redirect(_urlopen, req, timeout=10)
-                if status == 200:
-                    findings.append(f"[auth-bypass-path] {url} → {test_url} (HTTP 200)")
+                status, _, body = await _async_urlopen_no_redirect(req, timeout=10)
+                if status == 200 and (
+                    status != base_status or abs(len(body) - base_len) > max(100, base_len * 0.1)
+                ):
+                    findings.append(
+                        f"[auth-bypass-path] {url} → {test_url} (HTTP 200, baseline={base_status})"
+                    )
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -1479,14 +1528,14 @@ async def phase_99g_AUTHBYPASSADV(
                     if len(parts) == 3:
                         import base64 as _b64
 
-                        payload = json.loads(_b64.urlsafe_b64decode(parts[1] + "=="))
-                        payload["alg"] = "none"
-                        new_payload = (
-                            _b64.urlsafe_b64encode(json.dumps(payload).encode())
+                        new_header = (
+                            _b64.urlsafe_b64encode(
+                                json.dumps({"alg": "none", "typ": "JWT"}).encode()
+                            )
                             .rstrip(b"=")
                             .decode()
                         )
-                        forged = f"{parts[0]}.{new_payload}."
+                        forged = f"{new_header}.{parts[1]}."
                         forged_headers = {
                             **_extra_h,
                             "Authorization": f"Bearer {forged}",
@@ -1494,10 +1543,10 @@ async def phase_99g_AUTHBYPASSADV(
                         }
                         await _throttle_rate()
                         req = urllib.request.Request(url, headers=forged_headers)
-                        status, _, _ = await _async_urlopen_no_redirect(_urlopen, req, timeout=10)
-                        if status == 200:
+                        status, _, _ = await _async_urlopen_no_redirect(req, timeout=10)
+                        if status == 200 and status != base_status:
                             findings.append(
-                                f"[jwt-none-bypass] {url} — JWT alg=none accepted (HTTP 200)"
+                                f"[jwt-none-bypass] {url} — JWT alg=none accepted (HTTP 200, baseline={base_status})"
                             )
                 except asyncio.CancelledError:
                     raise
@@ -1507,5 +1556,5 @@ async def phase_99g_AUTHBYPASSADV(
         findings.append("[auth-bypass-adv] No advanced auth bypasses found")
     out = ensure(_out)
     out.write_text("\n".join(findings) + ("\n" if findings else ""))
-    log("ok", f"99g-AUTHBYPASSADV: {len(findings)} findings → {out}")
+    log("OK", f"99g-AUTHBYPASSADV: {len(findings)} findings → {out}")
     return {"99g-AUTHBYPASSADV": str(_out), "count": len(findings)}

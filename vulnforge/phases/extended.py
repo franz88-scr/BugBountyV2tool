@@ -17,6 +17,7 @@ from vulnforge.utils import (
     _async_urlopen,
     _extract_host,
     _get_urlopener,
+    _load_live_hosts,
     _throttle_rate,
     ensure,
     log,
@@ -55,7 +56,7 @@ async def phase_137_EMAILFINDER(
                 emails.add(line)
     # Write results
     out.write_text("\n".join(sorted(emails)) + ("\n" if emails else ""))
-    log("ok", f"137-EMAILFINDER: {len(emails)} emails → {out}")
+    log("OK", f"137-EMAILFINDER: {len(emails)} emails → {out}")
     return {"137-EMAILFINDER": str(out), "count": len(emails)}
 
 
@@ -83,7 +84,7 @@ async def phase_138_METAGOOFIL(
     except Exception:
         pass
     out.write_text("\n".join(sorted(meta)) + ("\n" if meta else ""))
-    log("ok", f"138-METAGOOFIL: {len(meta)} documents → {out}")
+    log("OK", f"138-METAGOOFIL: {len(meta)} documents → {out}")
     return {"138-METAGOOFIL": str(out), "count": len(meta)}
 
 
@@ -111,13 +112,10 @@ async def phase_139_PORCHPIRATE(
         "/build.gradle",
         "/build.gradle.kts",
     ]
-    urls_file = Path(outdir) / "hosts.txt"
-    urls = []
-    if urls_file.exists():
-        urls = urls_file.read_text(encoding="utf-8", errors="ignore").splitlines()[:500]
+    hosts = _load_live_hosts(outdir)[:500]
     _p_urlopen = _get_urlopener()
-    for base_url in urls:
-        base = base_url.rstrip("/")
+    for host in hosts:
+        base = f"https://{host}"
         for path in paths_to_check:
             try:
                 url = base + path
@@ -133,7 +131,7 @@ async def phase_139_PORCHPIRATE(
             except Exception:
                 pass
     out.write_text("\n".join(sorted(leaks)) + ("\n" if leaks else ""))
-    log("ok", f"139-PORCHPIRATE: {len(leaks)} leaks → {out}")
+    log("OK", f"139-PORCHPIRATE: {len(leaks)} leaks → {out}")
     return {"139-PORCHPIRATE": str(out), "count": len(leaks)}
 
 
@@ -180,7 +178,7 @@ async def phase_140_DORKHUNTER(
         except Exception:
             pass
     out.write_text("\n".join(sorted(findings)) + ("\n" if findings else ""))
-    log("ok", f"140-DORKHUNTER: {len(findings)} findings → {out}")
+    log("OK", f"140-DORKHUNTER: {len(findings)} findings → {out}")
     return {"140-DORKHUNTER": str(out), "count": len(findings)}
 
 
@@ -214,7 +212,7 @@ async def phase_141_CRTSH(
     except Exception:
         pass
     out.write_text("\n".join(sorted(subs)) + ("\n" if subs else ""))
-    log("ok", f"141-CRTSH: {len(subs)} subdomains → {out}")
+    log("OK", f"141-CRTSH: {len(subs)} subdomains → {out}")
     return {"141-CRTSH": str(out), "count": len(subs)}
 
 
@@ -257,7 +255,7 @@ async def phase_142_GITHUBSUB(
         except Exception:
             pass
     out.write_text("\n".join(sorted(subs)) + ("\n" if subs else ""))
-    log("ok", f"142-GITHUBSUB: {len(subs)} subdomains → {out}")
+    log("OK", f"142-GITHUBSUB: {len(subs)} subdomains → {out}")
     return {"142-GITHUBSUB": str(out), "count": len(subs)}
 
 
@@ -301,7 +299,7 @@ async def phase_143_TLSX(
         except Exception:
             pass
     out.write_text("\n".join(sorted(tls_results)) + ("\n" if tls_results else ""))
-    log("ok", f"143-TLSX: {len(tls_results)} TLS certs → {out}")
+    log("OK", f"143-TLSX: {len(tls_results)} TLS certs → {out}")
     return {"143-TLSX": str(out), "count": len(tls_results)}
 
 
@@ -320,12 +318,10 @@ async def phase_144_ANALYTICSRELS(
     await _throttle_rate()
     out = ensure(Path(outdir) / "144-ANALYTICSRELS.txt")
     relations = set()
-    urls_file = Path(outdir) / "hosts.txt"
-    urls = []
-    if urls_file.exists():
-        urls = urls_file.read_text(encoding="utf-8", errors="ignore").splitlines()[:500]
+    hosts = _load_live_hosts(outdir)[:500]
     _a_urlopen = _get_urlopener()
-    for url in urls:
+    for host in hosts:
+        url = f"https://{host}"
         try:
             req = urllib.request.Request(url, headers={"User-Agent": "vulnforge/2.0"})
             resp = await asyncio.to_thread(_a_urlopen, req, timeout=10)
@@ -339,7 +335,7 @@ async def phase_144_ANALYTICSRELS(
         except Exception:
             pass
     out.write_text("\n".join(sorted(relations)) + ("\n" if relations else ""))
-    log("ok", f"144-ANALYTICSRELS: {len(relations)} relations → {out}")
+    log("OK", f"144-ANALYTICSRELS: {len(relations)} relations → {out}")
     return {"144-ANALYTICSRELS": str(out), "count": len(relations)}
 
 
@@ -352,12 +348,9 @@ async def phase_145_FAVIRECON(
     await _throttle_rate()
     out = ensure(Path(outdir) / "145-FAVIRECON.txt")
     favicons = set()
-    urls_file = Path(outdir) / "hosts.txt"
-    urls = []
-    if urls_file.exists():
-        urls = urls_file.read_text(encoding="utf-8", errors="ignore").splitlines()[:500]
-    for url in urls:
-        base = url.rstrip("/")
+    hosts = _load_live_hosts(outdir)[:500]
+    for host in hosts:
+        base = f"https://{host}"
         _f_urlopen = _get_urlopener()
         for path in ["/favicon.ico", "/favicon.png", "/apple-touch-icon.png"]:
             try:
@@ -371,7 +364,7 @@ async def phase_145_FAVIRECON(
             except Exception:
                 pass
     out.write_text("\n".join(sorted(favicons)) + ("\n" if favicons else ""))
-    log("ok", f"145-FAVIRECON: {len(favicons)} favicons → {out}")
+    log("OK", f"145-FAVIRECON: {len(favicons)} favicons → {out}")
     return {"145-FAVIRECON": str(out), "count": len(favicons)}
 
 
@@ -408,7 +401,7 @@ async def phase_146_JSLUICE(
         except Exception:
             pass
     out.write_text("\n".join(sorted(js_endpoints)) + ("\n" if js_endpoints else ""))
-    log("ok", f"146-JSLUICE: {len(js_endpoints)} endpoints → {out}")
+    log("OK", f"146-JSLUICE: {len(js_endpoints)} endpoints → {out}")
     return {"146-JSLUICE": str(out), "count": len(js_endpoints)}
 
 
@@ -441,7 +434,7 @@ async def phase_147_SHORTSCAN(
         except Exception:
             pass
     out.write_text("\n".join(sorted(shortlinks)) + ("\n" if shortlinks else ""))
-    log("ok", f"147-SHORTSCAN: {len(shortlinks)} shortlinks → {out}")
+    log("OK", f"147-SHORTSCAN: {len(shortlinks)} shortlinks → {out}")
     return {"147-SHORTSCAN": str(out), "count": len(shortlinks)}
 
 
@@ -478,5 +471,5 @@ async def phase_148_GRPCURL(
         except Exception:
             pass
     out.write_text("\n".join(sorted(grpc_results)) + ("\n" if grpc_results else ""))
-    log("ok", f"148-GRPCURL: {len(grpc_results)} gRPC services → {out}")
+    log("OK", f"148-GRPCURL: {len(grpc_results)} gRPC services → {out}")
     return {"148-GRPCURL": str(out), "count": len(grpc_results)}

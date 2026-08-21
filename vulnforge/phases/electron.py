@@ -104,14 +104,14 @@ async def phase_161_ELECTRON(
     _out = outdir / "electron_config.txt"
     if _out.exists() and not force:
         return {"161-ELECTRON": str(_out), "count": count_nonblank(_out)}
-    log("info", "Phase 161-ELECTRON: Electron security configuration audit")
+    log("INFO", "Phase 161-ELECTRON: Electron security configuration audit")
     findings: List[str] = []
     js_files = await _find_js_files(outdir)
     if not js_files:
         findings.append("[info] No JS files found for Electron analysis")
         out = ensure(_out)
         out.write_text("\n".join(findings) + "\n")
-        log("ok", "161-ELECTRON: no JS files")
+        log("OK", "161-ELECTRON: no JS files")
         return {"161-ELECTRON": str(_out), "count": 0}
     findings.append(f"[js-files] Found {len(js_files)} JS/TS files to analyze")
     for f in js_files[:30]:
@@ -137,7 +137,7 @@ async def phase_161_ELECTRON(
             continue
     out = ensure(_out)
     out.write_text("\n".join(findings) + ("\n" if findings else ""))
-    log("ok", f"161-ELECTRON: {len(findings)} findings → {out}")
+    log("OK", f"161-ELECTRON: {len(findings)} findings → {out}")
     return {"161-ELECTRON": str(_out), "count": len(findings)}
 
 
@@ -154,7 +154,7 @@ async def phase_162_ELECTRONRCE(
     _out = outdir / "electron_rce.txt"
     if _out.exists() and not force:
         return {"162-ELECTRONRCE": str(_out), "count": count_nonblank(_out)}
-    log("info", "Phase 162-ELECTRONRCE: Electron RCE probe (openExternal, openPath, etc.)")
+    log("INFO", "Phase 162-ELECTRONRCE: Electron RCE probe (openExternal, openPath, etc.)")
     findings: List[str] = []
     urls = outdir / "urls_all.txt"
     findings.append("[rce-probes] Testing known Electron RCE patterns")
@@ -175,7 +175,7 @@ async def phase_162_ELECTRONRCE(
                 findings.append(f"[potential-sink] {u}")
     out = ensure(_out)
     out.write_text("\n".join(findings) + ("\n" if findings else ""))
-    log("ok", f"162-ELECTRONRCE: {len(findings)} findings → {out}")
+    log("OK", f"162-ELECTRONRCE: {len(findings)} findings → {out}")
     return {"162-ELECTRONRCE": str(_out), "count": len(findings)}
 
 
@@ -192,7 +192,7 @@ async def phase_163_ELECTRONPROTO(
     _out = outdir / "electron_protocol.txt"
     if _out.exists() and not force:
         return {"163-ELECTRONPROTO": str(_out), "count": count_nonblank(_out)}
-    log("info", "Phase 163-ELECTRONPROTO: Electron protocol handler hijack testing")
+    log("INFO", "Phase 163-ELECTRONPROTO: Electron protocol handler hijack testing")
     findings: List[str] = []
     js_files = await _find_js_files(outdir)
     for f in js_files[:20]:
@@ -236,7 +236,7 @@ async def phase_163_ELECTRONPROTO(
         findings.append("[info] No custom protocol handlers found")
     out = ensure(_out)
     out.write_text("\n".join(findings) + ("\n" if findings else ""))
-    log("ok", f"163-ELECTRONPROTO: {len(findings)} findings → {out}")
+    log("OK", f"163-ELECTRONPROTO: {len(findings)} findings → {out}")
     return {"163-ELECTRONPROTO": str(_out), "count": len(findings)}
 
 
@@ -253,7 +253,7 @@ async def phase_164_ELECTRONUPD(
     _out = outdir / "electron_updater.txt"
     if _out.exists() and not force:
         return {"164-ELECTRONUPD": str(_out), "count": count_nonblank(_out)}
-    log("info", "Phase 164-ELECTRONUPD: Electron auto-updater security testing")
+    log("INFO", "Phase 164-ELECTRONUPD: Electron auto-updater security testing")
     findings: List[str] = []
     js_files = await _find_js_files(outdir)
     updater_patterns = [
@@ -294,5 +294,5 @@ async def phase_164_ELECTRONUPD(
     findings.append("  [check] Verify no MITM via update channel")
     out = ensure(_out)
     out.write_text("\n".join(findings) + ("\n" if findings else ""))
-    log("ok", f"164-ELECTRONUPD: {len(findings)} findings → {out}")
+    log("OK", f"164-ELECTRONUPD: {len(findings)} findings → {out}")
     return {"164-ELECTRONUPD": str(_out), "count": len(findings)}

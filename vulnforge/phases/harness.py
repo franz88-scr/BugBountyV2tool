@@ -46,7 +46,7 @@ class PhaseRun:
 
     def no_targets(self, reason: str) -> Dict[str, Any]:
         """Abort a phase because there is nothing to probe."""
-        log("warn", f"{self.name}: {reason}")
+        log("WARNING", f"{self.name}: {reason}")
         return {self.name: str(self.out), "count": 0}
 
     def done(self) -> Dict[str, Any]:
@@ -58,7 +58,7 @@ class PhaseRun:
                 self.out.unlink()
             return {self.name: str(self.out), "count": 0}
         ensure(self.out).write_text("\n".join(self.findings) + "\n")
-        log("ok", f"{self.name}: {len(self.findings)} findings -> {self.out}")
+        log("OK", f"{self.name}: {len(self.findings)} findings -> {self.out}")
         return {self.name: str(self.out), "count": len(self.findings)}
 
 
@@ -79,9 +79,9 @@ def phase_begin(
         return None
     out = outdir / outfile
     if outfile and out.exists() and not force:
-        log("ok", f"Phase {name}: cached ({count_nonblank(out)} findings)")
+        log("OK", f"Phase {name}: cached ({count_nonblank(out)} findings)")
         return PhaseRun(name=name, outdir=outdir, out=out, _cached=True)
-    log("info", f"Phase {name}: running")
+    log("INFO", f"Phase {name}: running")
     return PhaseRun(name=name, outdir=outdir, out=out)
 
 
@@ -99,6 +99,14 @@ def phase_targets(outdir: Path, kind: str = "hosts", https: bool = True) -> List
     if not hosts_file.exists():
         hosts_file = outdir / "hosts.txt"
     lines = read_lines(hosts_file)
+    # Strip httpx tags: "https://example.com [200] [title] [tech]" -> "https://example.com"
+    clean = []
+    for h in lines:
+        h = h.strip()
+        if not h:
+            continue
+        tok = h.split()[0] if h.startswith(("http://", "https://")) else h
+        clean.append(tok)
     if not https:
-        return lines
-    return [f"https://{h}" if not h.startswith("http") else h for h in lines]
+        return clean
+    return [f"https://{h}" if not h.startswith("http") else h for h in clean]

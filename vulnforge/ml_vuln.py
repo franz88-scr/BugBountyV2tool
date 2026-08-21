@@ -668,7 +668,7 @@ class VulnerabilityClassifier:
         out = ensure(outdir / "classified_vulns.json")
         data = [v.to_dict() for v in classified]
         out.write_text(json.dumps(data, indent=2, default=str))
-        log("ok", f"ml_vuln: exported {len(data)} classified vulns → {out}")
+        log("OK", f"ml_vuln: exported {len(data)} classified vulns → {out}")
         return out
 
 

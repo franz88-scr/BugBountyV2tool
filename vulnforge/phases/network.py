@@ -32,10 +32,10 @@ from vulnforge.utils import (
     _async_urlopen_no_redirect,
     _extra_headers_dict,
     _extract_host,
-    _get_no_redirect_urlopener,
     _get_urlopener,
     _load_live_hosts,
     _throttle_rate,
+    ensure,
     log,
     read_lines,
 )
@@ -222,8 +222,7 @@ async def phase_113_WEBDAV(
                 req = urllib.request.Request(
                     base, method="OPTIONS", headers={"User-Agent": "Mozilla/5.0"}
                 )
-                req_opener = _get_no_redirect_urlopener()
-                s, headers, _ = await _async_urlopen_no_redirect(req_opener, req, timeout=10)
+                s, headers, _ = await _async_urlopen_no_redirect(req, timeout=10)
                 if s not in (200, 401, 403):
                     continue
                 allow = headers.get("allow", headers.get("Allow", ""))
@@ -247,8 +246,7 @@ async def phase_113_WEBDAV(
                                 "Depth": "1",
                             },
                         )
-                        ps, _, pb = await _async_urlopen_no_redirect(
-                            req_opener, prop_req, timeout=10
+                        ps, _, pb = await _async_urlopen_no_redirect(prop_req, timeout=10
                         )
                         if ps in (200, 207, 301, 302):
                             body = pb.decode("utf-8", errors="ignore")
@@ -269,8 +267,7 @@ async def phase_113_WEBDAV(
                                 method="PUT",
                                 headers={"User-Agent": "Mozilla/5.0", "Content-Type": "text/plain"},
                             )
-                            ps, _, _ = await _async_urlopen_no_redirect(
-                                req_opener, put_req, timeout=10
+                            ps, _, _ = await _async_urlopen_no_redirect(put_req, timeout=10
                             )
                             if ps in (200, 201, 204):
                                 run.findings.append(
@@ -282,8 +279,7 @@ async def phase_113_WEBDAV(
                                     headers={"User-Agent": "Mozilla/5.0"},
                                 )
                                 try:
-                                    await _async_urlopen_no_redirect(
-                                        req_opener, del_req, timeout=10
+                                    await _async_urlopen_no_redirect(del_req, timeout=10
                                     )
                                 except Exception:
                                     pass
@@ -353,9 +349,45 @@ async def phase_114_SNMP(
         except Exception:
             has_nmap = False
         if has_nmap:
-            for community in community_strings:
-                try:
-                    result = await asyncio.to_thread(
+            comm_file = outdir / ".snmp_communities.txt"
+            ensure(comm_file)
+            comm_file.write_text("\n".join(community_strings) + "\n")
+            try:
+                result = await asyncio.to_thread(
+                    subprocess.run,
+                    [
+                        "nmap",
+                        "-sU",
+                        "-p",
+                        "161",
+                        "--script",
+                        "snmp-brute",
+                        "--script-args",
+                        f"snmp-brute.communitiesdb={comm_file}",
+                        "-Pn",
+                        "--host-timeout",
+                        "30s",
+                        resolved,
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=60,
+                    start_new_session=True,
+                    preexec_fn=_set_child_limits,
+                )
+                output = result.stdout + result.stderr
+                found_comms: List[str] = []
+                for line in output.splitlines():
+                    m = re.match(r"^\s*\|_?\s+(.+?)\s+-\s+valid credentials", line, re.I)
+                    if not m:
+                        continue
+                    tok = m.group(1).strip()
+                    if tok in community_strings and tok not in found_comms:
+                        found_comms.append(tok)
+                if found_comms:
+                    for community in found_comms:
+                        run.findings.append(f"[snmp-community] {host_clean} community={community}")
+                    enum_result = await asyncio.to_thread(
                         subprocess.run,
                         [
                             "nmap",
@@ -363,9 +395,7 @@ async def phase_114_SNMP(
                             "-p",
                             "161",
                             "--script",
-                            "snmp-brute",
-                            "--script-args",
-                            f"snmp-brute.communitiesdb={community}",
+                            "snmp-info",
                             "-Pn",
                             "--host-timeout",
                             "30s",
@@ -377,43 +407,15 @@ async def phase_114_SNMP(
                         start_new_session=True,
                         preexec_fn=_set_child_limits,
                     )
-                    output = result.stdout + result.stderr
-                    if community in output.lower() and (
-                        "open" in output.lower()
-                        or "valid" in output.lower()
-                        or "discovered" in output.lower()
-                    ):
-                        run.findings.append(f"[snmp-community] {host_clean} community={community}")
-                        enum_result = await asyncio.to_thread(
-                            subprocess.run,
-                            [
-                                "nmap",
-                                "-sU",
-                                "-p",
-                                "161",
-                                "--script",
-                                "snmp-info",
-                                "-Pn",
-                                "--host-timeout",
-                                "30s",
-                                resolved,
-                            ],
-                            capture_output=True,
-                            text=True,
-                            timeout=60,
-                            start_new_session=True,
-                            preexec_fn=_set_child_limits,
-                        )
-                        enum_output = enum_result.stdout + enum_result.stderr
-                        lines = [line.strip() for line in enum_output.splitlines() if line.strip()]
-                        info = "; ".join(lines[:10])[:300]
-                        if info:
-                            run.findings.append(f"[snmp-enum] {host_clean} info={info}")
-                        break
-                except subprocess.TimeoutExpired:
-                    continue
-                except Exception:
-                    continue
+                    enum_output = enum_result.stdout + enum_result.stderr
+                    lines = [line.strip() for line in enum_output.splitlines() if line.strip()]
+                    info = "; ".join(lines[:10])[:300]
+                    if info:
+                        run.findings.append(f"[snmp-enum] {host_clean} info={info}")
+            except subprocess.TimeoutExpired:
+                pass
+            except Exception:
+                pass
         else:
             for community in community_strings:
                 sock = None
@@ -780,7 +782,7 @@ _ERRORLEAK_INDICATORS = [
             r"(XML parsing error|XML declaration allowed only at the start|parser error : )"
         ),
     ),
-    ("debug-info", re.compile(r"(DEBUG|TRACE|LOG|DUMP|VAR_DUMP|print_r)\s*[:\(]", re.I)),
+    ("debug-info", re.compile(r"\b(?:debug|trace|log|dump|var_dump|print_r)\b\s*[:\(]", re.I)),
 ]
 
 

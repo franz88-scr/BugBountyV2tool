@@ -305,7 +305,6 @@ async def phase_110_THIRDPARTYJS(
                         has_sri = bool(re.search(r"\bintegrity\s*=", stag, re.I))
                         if not has_sri:
                             run.findings.append(f"[third-party-nosri] {host_clean} src={src}")
-                break
             except Exception:
                 continue
     return run.done()

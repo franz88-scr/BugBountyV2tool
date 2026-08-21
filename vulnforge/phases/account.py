@@ -2,7 +2,6 @@
 
 import asyncio
 import re
-import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
@@ -64,6 +63,17 @@ _TOKEN_PATTERNS = [
 ]
 
 
+def _reset_token_weak(match: str) -> bool:
+    val = match.split("=", 1)[1] if "=" in match else match
+    if val.isdigit() and len(val) < 8:
+        return True
+    return (
+        len(val) >= 4
+        and val.isdigit()
+        and all(int(val[i]) == int(val[i - 1]) + 1 for i in range(1, len(val)))
+    )
+
+
 async def phase_191_ATO(
     outdir: Path,
     t: Tools,
@@ -77,7 +87,7 @@ async def phase_191_ATO(
     _out = outdir / "ato_findings.txt"
     if _out.exists() and not force:
         return {"191-ATO": str(_out), "count": count_nonblank(_out)}
-    log("info", "Phase 191-ATO: account takeover detection")
+    log("INFO", "Phase 191-ATO: account takeover detection")
     findings: List[str] = []
     ato_urlopen = _get_urlopener()
     ato_extra_headers = _extra_headers_dict()
@@ -105,7 +115,7 @@ async def phase_191_ATO(
             for pat in _TOKEN_PATTERNS:
                 matches = re.findall(pat, body_text)
                 for m in matches[:3]:
-                    if m[-1:].isdigit() or len(m) < 12:
+                    if _reset_token_weak(m):
                         findings.append(
                             f"[reset-token-weak] {url} — predictable token pattern: {m} (CWE-287)"
                         )
@@ -130,7 +140,7 @@ async def phase_191_ATO(
             findings.append(f"[email-change-endpoint] {url} — HTTP {status}")
             if "current password" not in body_text and "confirm" not in body_text:
                 findings.append(
-                    f"[email-change-no-verify] {url} — no confirmation required (CWE-287)"
+                    f"[email-change-no-verify-info] {url} — no 'current password'/'confirm' field in GET response; manual verification required"
                 )
         except asyncio.CancelledError:
             raise
@@ -153,7 +163,7 @@ async def phase_191_ATO(
             findings.append(f"[oauth-link-endpoint] {url} — HTTP {status}")
             if "current password" not in body_text and "confirm" not in body_text:
                 findings.append(
-                    f"[oauth-link-no-verify] {url} — no re-authentication for OAuth linking (CWE-287)"
+                    f"[oauth-link-no-verify-info] {url} — no 'current password'/'confirm' field in GET response; manual verification required"
                 )
         except asyncio.CancelledError:
             raise
@@ -182,15 +192,17 @@ async def phase_191_ATO(
                 )
                 status, headers, body = await _async_urlopen(ato_urlopen, req, timeout=10)
                 body_text = body.decode("utf-8", errors="ignore").lower() if body else ""
-                if status == 200 and "invalid" not in body_text and "error" not in body_text:
+                location = headers.get("Location", "")
+                if (
+                    status in (200, 201)
+                    and any(m in body_text for m in ("dashboard", "welcome", "logout", "profile"))
+                ) or (
+                    status in (301, 302, 303, 307, 308)
+                    and location
+                    and "login" not in location.lower()
+                ):
                     findings.append(
-                        f"[default-creds] {url} — {username}:{password} returned HTTP {status} (CWE-287)"
-                    )
-            except urllib.error.HTTPError as e:
-                if e.code == 302:
-                    location = e.headers.get("Location", "")
-                    findings.append(
-                        f"[default-creds-redirect] {url} — {username}:{password} -> {location} (CWE-287)"
+                        f"[default-creds] {url} — {username}:{password} authenticated (HTTP {status})"
                     )
             except asyncio.CancelledError:
                 raise
@@ -201,5 +213,5 @@ async def phase_191_ATO(
         findings.append("[ato] No account takeover vectors detected (expected)")
     out = ensure(_out)
     out.write_text("\n".join(findings) + ("\n" if findings else ""))
-    log("ok", f"191-ATO: {len(findings)} findings -> {out}")
+    log("OK", f"191-ATO: {len(findings)} findings -> {out}")
     return {"191-ATO": str(out), "count": len(findings)}

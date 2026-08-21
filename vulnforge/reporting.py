@@ -95,7 +95,7 @@ def write_html(outdir: Path, domain: str, counts: Dict[str, int], missing: List[
             with p.open("r", encoding="utf-8", errors="ignore") as f:
                 txt = f.read(51200)
             if len(txt) >= 51200:
-                log("warn", f"report.html: {key} truncated at 50KB")
+                log("WARNING", f"report.html: {key} truncated at 50KB")
                 txt = txt[:50_000]
                 txt += f"\n\n{'=' * 60}\n[WARNING: File truncated at 50KB]\nFull content available in: {key}\n{'=' * 60}\n"
             sections.append(f"<h2>{html_escape(key)}</h2><pre>{html_escape(txt)}</pre>")
@@ -278,7 +278,7 @@ def write_sarif(outdir: Path, domain: str, counts: Dict[str, int], state: dict) 
     tmp = out.with_suffix(out.suffix + ".tmp")
     tmp.write_text(json.dumps(sarif, indent=2, default=str), encoding="utf-8")
     os.replace(tmp, out)
-    log("ok", f"sarif report → {out}")
+    log("OK", f"sarif report → {out}")
     return out
 
 
@@ -322,7 +322,7 @@ def write_faraday(outdir: Path, domain: str, counts: Dict[str, int], state: dict
     tmp = out.with_suffix(out.suffix + ".tmp")
     tmp.write_text(json.dumps(faraday, indent=2, default=str), encoding="utf-8")
     os.replace(tmp, out)
-    log("ok", f"faraday report → {out}")
+    log("OK", f"faraday report → {out}")
     return out
 
 
@@ -396,5 +396,5 @@ function filterCards() {{
     tmp = out.with_suffix(out.suffix + ".tmp")
     tmp.write_text(html, encoding="utf-8")
     os.replace(tmp, out)
-    log("ok", f"interactive dashboard → {out}")
+    log("OK", f"interactive dashboard → {out}")
     return out

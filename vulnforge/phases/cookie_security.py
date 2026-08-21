@@ -19,6 +19,99 @@ from vulnforge.utils import (
     read_lines,
 )
 
+_MULTI_PART_SUFFIXES = {
+    "co.uk",
+    "org.uk",
+    "ac.uk",
+    "gov.uk",
+    "me.uk",
+    "net.uk",
+    "com.au",
+    "net.au",
+    "org.au",
+    "edu.au",
+    "gov.au",
+    "co.nz",
+    "org.nz",
+    "net.nz",
+    "co.jp",
+    "ne.jp",
+    "or.jp",
+    "com.br",
+    "net.br",
+    "org.br",
+    "co.in",
+    "net.in",
+    "org.in",
+    "co.za",
+    "org.za",
+    "net.za",
+    "com.cn",
+    "net.cn",
+    "org.cn",
+    "com.tw",
+    "org.tw",
+    "net.tw",
+    "com.hk",
+    "org.hk",
+    "com.sg",
+    "org.sg",
+    "com.my",
+    "org.my",
+    "co.kr",
+    "or.kr",
+    "ne.kr",
+    "com.mx",
+    "org.mx",
+    "com.ar",
+    "org.ar",
+    "net.ar",
+    "co.il",
+    "org.il",
+    "ac.il",
+    "com.pl",
+    "org.pl",
+    "net.pl",
+    "com.tr",
+    "org.tr",
+    "com.eg",
+    "org.eg",
+    "com.ua",
+    "org.ua",
+    "com.pk",
+    "org.pk",
+    "com.sa",
+    "org.sa",
+    "com.ve",
+    "org.ve",
+    "com.ec",
+    "org.ec",
+    "com.pe",
+    "org.pe",
+    "com.uy",
+    "org.uy",
+    "co.th",
+    "ac.th",
+    "co.id",
+    "or.id",
+    "com.vn",
+    "org.vn",
+    "co.ke",
+    "or.ke",
+    "co.ug",
+    "or.ug",
+    "com.ng",
+    "org.ng",
+}
+
+
+def _registrable_domain(hostname: str) -> str:
+    host = hostname.lower().rstrip(".")
+    labels = host.split(".")
+    if len(labels) >= 3 and ".".join(labels[-2:]) in _MULTI_PART_SUFFIXES:
+        return ".".join(labels[-3:])
+    return ".".join(labels[-2:]) if len(labels) >= 2 else host
+
 
 async def phase_194_COOKIETOSS(
     outdir: Path,
@@ -31,7 +124,6 @@ async def phase_194_COOKIETOSS(
     run = phase_begin("194-COOKIETOSS", outdir, skip, force, "cookie_toss.txt")
     if run is None:
         return {}
-    ct_urlopen = _get_urlopener()
     ct_extra_headers = _extra_headers_dict()
 
     targets = phase_targets(outdir, "hosts")
@@ -44,7 +136,7 @@ async def phase_194_COOKIETOSS(
             req = urllib.request.Request(
                 host, method="GET", headers={"User-Agent": "Mozilla/5.0", **ct_extra_headers}
             )
-            status, headers, body = await _async_urlopen_no_redirect(ct_urlopen, req, timeout=10)
+            status, headers, body = await _async_urlopen_no_redirect(req, timeout=10)
             set_cookie_headers = (
                 headers.get_all("Set-Cookie") if hasattr(headers, "get_all") else []
             )
@@ -53,27 +145,24 @@ async def phase_194_COOKIETOSS(
                 set_cookie_headers = [set_cookie_val] if set_cookie_val else []
 
             parsed_hostname = urllib.parse.urlparse(host).netloc.split(":")[0]
-            parent_domain = (
-                ".".join(parsed_hostname.split(".")[-2:])
-                if parsed_hostname.count(".") >= 1
-                else parsed_hostname
-            )
+            parent_domain = _registrable_domain(parsed_hostname)
 
             for sc in set_cookie_headers:
-                if "__Host-" not in sc and "__Secure-" not in sc:
-                    domain_match = re.search(r"domain=([^;]+)", sc, re.IGNORECASE)
-                    if domain_match:
-                        cookie_domain = domain_match.group(1).strip().lower()
-                        if cookie_domain == f".{parent_domain}" or cookie_domain == parent_domain:
-                            results.append(
-                                f"[cookie-toss-candidate] {host} — cookie '{sc[:80]}' uses "
-                                f"parent domain '{cookie_domain}' (CWE-614)"
-                            )
-                    else:
-                        results.append(
-                            f"[cookie-no-prefix] {host} — cookie '{sc[:80]}' lacks "
-                            f"__Host-/__Secure- prefix (CWE-614)"
-                        )
+                if "__Host-" in sc or "__Secure-" in sc:
+                    continue
+                domain_match = re.search(r"domain=([^;]+)", sc, re.IGNORECASE)
+                if not domain_match:
+                    continue
+                cookie_domain = domain_match.group(1).strip().lower().lstrip(".")
+                if cookie_domain == parent_domain and parsed_hostname != parent_domain:
+                    results.append(
+                        f"[cookie-toss-candidate] {host} — cookie '{sc[:80]}' uses "
+                        f"parent domain '{cookie_domain}' (CWE-614)"
+                    )
+                    results.append(
+                        f"[cookie-no-prefix] {host} — cookie '{sc[:80]}' on shared "
+                        f"domain '{cookie_domain}' lacks __Host-/__Secure- prefix (CWE-614)"
+                    )
 
             # Test: craft a cookie for parent domain and observe effect
             test_req = urllib.request.Request(
@@ -85,7 +174,7 @@ async def phase_194_COOKIETOSS(
                     **ct_extra_headers,
                 },
             )
-            _, test_headers, _ = await _async_urlopen_no_redirect(ct_urlopen, test_req, timeout=10)
+            _, test_headers, _ = await _async_urlopen_no_redirect(test_req, timeout=10)
             resp_cookies = (
                 test_headers.get_all("Set-Cookie") if hasattr(test_headers, "get_all") else []
             )

@@ -23,7 +23,7 @@ def _validate_webhook_url(url: str) -> bool:
     except Exception:
         return False
     if parsed.scheme not in ("https",):
-        log("warn", f"webhook URL must use https:// (got {parsed.scheme!r}): {url[:60]}")
+        log("WARNING", f"webhook URL must use https:// (got {parsed.scheme!r}): {url[:60]}")
         return False
     hostname = parsed.hostname
     if not hostname:
@@ -32,7 +32,7 @@ def _validate_webhook_url(url: str) -> bool:
     try:
         ip = ipaddress.ip_address(hostname)
         if ip.is_private or ip.is_loopback or ip.is_reserved or ip.is_link_local:
-            log("warn", f"webhook URL points to private/internal IP ({hostname}): {url[:60]}")
+            log("WARNING", f"webhook URL points to private/internal IP ({hostname}): {url[:60]}")
             return False
     except ValueError:
         # Not a literal IP — resolve and check
@@ -47,10 +47,10 @@ def _validate_webhook_url(url: str) -> bool:
                     or resolved.is_reserved
                     or resolved.is_link_local
                 ):
-                    log("warn", f"webhook hostname resolves to private IP ({resolved}): {url[:60]}")
+                    log("WARNING", f"webhook hostname resolves to private IP ({resolved}): {url[:60]}")
                     return False
         except (socket.gaierror, OSError):
-            log("warn", f"webhook hostname resolution failed: {hostname}")
+            log("WARNING", f"webhook hostname resolution failed: {hostname}")
             return False
     return True
 
@@ -179,7 +179,7 @@ def _send_slack(webhook_url: str, text: str) -> bool:
         finally:
             resp.close()
     except Exception as exc:
-        log("warn", f"Slack notification failed: {exc}")
+        log("WARNING", f"Slack notification failed: {exc}")
         return False
 
 
@@ -203,7 +203,7 @@ def _send_discord(webhook_url: str, text: str) -> bool:
         finally:
             resp.close()
     except Exception as exc:
-        log("warn", f"Discord notification failed: {exc}")
+        log("WARNING", f"Discord notification failed: {exc}")
         return False
 
 
@@ -246,5 +246,5 @@ def _send_telegram(bot_token: str, chat_id: str, text: str) -> bool:
         finally:
             resp.close()
     except Exception as exc:
-        log("warn", f"Telegram notification failed: {exc}")
+        log("WARNING", f"Telegram notification failed: {exc}")
         return False

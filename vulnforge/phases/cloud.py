@@ -38,13 +38,13 @@ async def phase_127_CICD(
     _out = outdir / "cicd_exposure.txt"
     if _out.exists() and not force:
         return {"127-CICD": str(_out), "count": count_nonblank(_out)}
-    log("info", "Phase 127-CICD: CI/CD Pipeline File Exposure")
+    log("INFO", "Phase 127-CICD: CI/CD Pipeline File Exposure")
     findings: List[str] = []
     _urlopen = _get_urlopener()
     _extra_h = _extra_headers_dict()
     hosts = _load_live_hosts(outdir)
     if not hosts:
-        log("warn", "127-CICD: no live hosts; skipping")
+        log("WARNING", "127-CICD: no live hosts; skipping")
         return {"127-CICD": str(_out), "count": 0}
     cicd_paths = [
         "/.gitlab-ci.yml",
@@ -81,7 +81,7 @@ async def phase_127_CICD(
         findings.append("[cicd-file] No findings (expected)")
     out = ensure(_out)
     out.write_text("\n".join(findings) + ("\n" if findings else ""))
-    log("ok", f"127-CICD: {len(findings)} findings \u2192 {out}")
+    log("OK", f"127-CICD: {len(findings)} findings \u2192 {out}")
     return {"127-CICD": str(out), "count": len(findings)}
 
 
@@ -98,13 +98,13 @@ async def phase_128_DOCKER(
     _out = outdir / "docker_registry.txt"
     if _out.exists() and not force:
         return {"128-DOCKER": str(_out), "count": count_nonblank(_out)}
-    log("info", "Phase 128-DOCKER: Docker Registry Exposure")
+    log("INFO", "Phase 128-DOCKER: Docker Registry Exposure")
     findings: List[str] = []
     _urlopen = _get_urlopener()
     _extra_h = _extra_headers_dict()
     hosts = _load_live_hosts(outdir)
     if not hosts:
-        log("warn", "128-DOCKER: no live hosts; skipping")
+        log("WARNING", "128-DOCKER: no live hosts; skipping")
         return {"128-DOCKER": str(_out), "count": 0}
     for host in hosts:
         registry_url = f"https://{host}/v2/"
@@ -143,7 +143,7 @@ async def phase_128_DOCKER(
         findings.append("[docker-registry] No findings (expected)")
     out = ensure(_out)
     out.write_text("\n".join(findings) + ("\n" if findings else ""))
-    log("ok", f"128-DOCKER: {len(findings)} findings \u2192 {out}")
+    log("OK", f"128-DOCKER: {len(findings)} findings \u2192 {out}")
     return {"128-DOCKER": str(out), "count": len(findings)}
 
 
@@ -160,13 +160,13 @@ async def phase_129_K8S(
     _out = outdir / "k8s_exposure.txt"
     if _out.exists() and not force:
         return {"129-K8S": str(_out), "count": count_nonblank(_out)}
-    log("info", "Phase 129-K8S: Kubernetes Exposure")
+    log("INFO", "Phase 129-K8S: Kubernetes Exposure")
     findings: List[str] = []
     _urlopen = _get_urlopener()
     _extra_h = _extra_headers_dict()
     hosts = _load_live_hosts(outdir)
     if not hosts:
-        log("warn", "129-K8S: no live hosts; skipping")
+        log("WARNING", "129-K8S: no live hosts; skipping")
         return {"129-K8S": str(_out), "count": 0}
     api_endpoints = [
         ("/api/v1", "[k8s-api]"),
@@ -225,7 +225,7 @@ async def phase_129_K8S(
         findings.append("[k8s-api] No findings (expected)")
     out = ensure(_out)
     out.write_text("\n".join(findings) + ("\n" if findings else ""))
-    log("ok", f"129-K8S: {len(findings)} findings \u2192 {out}")
+    log("OK", f"129-K8S: {len(findings)} findings \u2192 {out}")
     return {"129-K8S": str(out), "count": len(findings)}
 
 
@@ -242,13 +242,13 @@ async def phase_130_TERRAFORM(
     _out = outdir / "terraform_exposure.txt"
     if _out.exists() and not force:
         return {"130-TERRAFORM": str(_out), "count": count_nonblank(_out)}
-    log("info", "Phase 130-TERRAFORM: Terraform State File Exposure")
+    log("INFO", "Phase 130-TERRAFORM: Terraform State File Exposure")
     findings: List[str] = []
     _urlopen = _get_urlopener()
     _extra_h = _extra_headers_dict()
     hosts = _load_live_hosts(outdir)
     if not hosts:
-        log("warn", "130-TERRAFORM: no live hosts; skipping")
+        log("WARNING", "130-TERRAFORM: no live hosts; skipping")
         return {"130-TERRAFORM": str(_out), "count": 0}
     tf_paths = [
         "/terraform.tfstate",
@@ -294,7 +294,7 @@ async def phase_130_TERRAFORM(
         findings.append("[terraform-state] No findings (expected)")
     out = ensure(_out)
     out.write_text("\n".join(findings) + ("\n" if findings else ""))
-    log("ok", f"130-TERRAFORM: {len(findings)} findings \u2192 {out}")
+    log("OK", f"130-TERRAFORM: {len(findings)} findings \u2192 {out}")
     return {"130-TERRAFORM": str(out), "count": len(findings)}
 
 
@@ -311,7 +311,7 @@ async def phase_133_APIVERSION(
     _out = outdir / "api_version_bypass.txt"
     if _out.exists() and not force:
         return {"133-APIVERSION": str(_out), "count": count_nonblank(_out)}
-    log("info", "Phase 133-APIVERSION: API versioning bypass testing")
+    log("INFO", "Phase 133-APIVERSION: API versioning bypass testing")
     findings: List[str] = []
     _urlopen = _get_urlopener()
     _extra_h = _extra_headers_dict()
@@ -322,7 +322,7 @@ async def phase_133_APIVERSION(
     api_urls = [u.strip() for u in all_urls if u.strip() and "/api/" in u.lower()]
 
     if not api_urls:
-        log("warn", "133-APIVERSION: no /api/ URLs found; skipping")
+        log("WARNING", "133-APIVERSION: no /api/ URLs found; skipping")
         return {"133-APIVERSION": str(_out), "count": 0}
 
     sample = int(getattr(_PIPELINE_CFG, "sample_urls_apiversion", 20))
@@ -419,8 +419,31 @@ async def phase_133_APIVERSION(
 
     out = ensure(_out)
     out.write_text("\n".join(findings) + ("\n" if findings else ""))
-    log("ok", f"133-APIVERSION: {len(findings)} findings → {out}")
+    log("OK", f"133-APIVERSION: {len(findings)} findings → {out}")
     return {"133-APIVERSION": str(out), "count": len(findings)}
+
+
+def _origin_candidate_ips(lines: List[str]) -> List[str]:
+    out: List[str] = []
+    for ln in lines:
+        ln = ln.strip()
+        for prefix in ("origin_candidate=", "non_cloudflare_ip="):
+            if ln.startswith(prefix):
+                val = ln[len(prefix) :].split()[0].strip()
+                if val:
+                    out.append(val)
+                break
+    return out
+
+
+def _lb_origin_confirmed(main_body: str, origin_body: str) -> bool:
+    def _title(body: str) -> str:
+        m = re.search(r"<title[^>]*>([^<]*)</title>", body, re.IGNORECASE | re.DOTALL)
+        return m.group(1).strip() if m else ""
+
+    main_title = _title(main_body)
+    origin_title = _title(origin_body)
+    return bool(main_title) and main_title == origin_title
 
 
 async def phase_134_LBDETECT(
@@ -436,16 +459,15 @@ async def phase_134_LBDETECT(
     _out = outdir / "load_balancer_bypass.txt"
     if _out.exists() and not force:
         return {"134-LBDETECT": str(_out), "count": count_nonblank(_out)}
-    log("info", "Phase 134-LBDETECT: load balancer detection & bypass")
+    log("INFO", "Phase 134-LBDETECT: load balancer detection & bypass")
     findings: List[str] = []
     _urlopen = _get_urlopener()
     _extra_h = _extra_headers_dict()
 
-    hosts_file = outdir / "hosts.txt"
-    hosts = read_lines(hosts_file) if hosts_file.exists() else []
+    hosts = _load_live_hosts(outdir)
 
     if not hosts:
-        log("warn", "134-LBDETECT: no hosts; skipping")
+        log("WARNING", "134-LBDETECT: no hosts; skipping")
         return {"134-LBDETECT": str(_out), "count": 0}
 
     sample = int(getattr(_PIPELINE_CFG, "sample_hosts_lbdetect", 15))
@@ -454,16 +476,16 @@ async def phase_134_LBDETECT(
     lb_signatures = {
         "AWS_ALB": ["x-amzn-trace-id", "x-amzn-requestid", "x-amz-cf-id", "x-forwarded-by"],
         "CloudFront": ["x-amz-cf-id", "x-cache", "via"],
-        "Cloudflare": ["cf-ray", "cf-cache-status", "server"],
-        "F5_BIGIP": ["x-wa-info", "x-bigip", "server"],
-        "HAProxy": ["x-ha-proxy", "x-haproxy", "server"],
-        "Akamai": ["x-akamai-transformed", "x-akamai-request-id", "server"],
+        "Cloudflare": ["cf-ray", "cf-cache-status"],
+        "F5_BIGIP": ["x-wa-info", "x-bigip"],
+        "HAProxy": ["x-ha-proxy", "x-haproxy"],
+        "Akamai": ["x-akamai-transformed", "x-akamai-request-id"],
         "Fastly": ["x-served-by", "x-cache", "x-fastly-request-id"],
         "Envoy": ["x-envoy-upstream-service-time", "x-envoy-decorator-operation"],
     }
 
     origin_file = outdir / "origin.txt"
-    origin_ips = read_lines(origin_file) if origin_file.exists() else []
+    origin_ips = _origin_candidate_ips(read_lines(origin_file) if origin_file.exists() else [])
 
     for host in hosts:
         host = host.strip()
@@ -490,12 +512,7 @@ async def phase_134_LBDETECT(
             if detected_lb:
                 findings.append(f"[lb-detected] {host} type={detected_lb}")
 
-                origin_ip = None
-                for oip in origin_ips:
-                    oip = oip.strip()
-                    if oip:
-                        origin_ip = oip
-                        break
+                origin_ip = origin_ips[0] if origin_ips else None
 
                 if origin_ip:
                     await _throttle_rate()
@@ -508,10 +525,16 @@ async def phase_134_LBDETECT(
                         )
                         _, _, oresp_body = await _async_urlopen(_urlopen, oreq, timeout=12)
                         obody = oresp_body.decode("utf-8", errors="replace")
-                        diff = "YES" if obody.strip() != body.strip() else "NO"
-                        findings.append(f"[lb-bypass] {host} origin={origin_ip} diff={diff}")
+                        if _lb_origin_confirmed(body, obody):
+                            findings.append(
+                                f"[lb-bypass] {host} origin={origin_ip} confirmed=title-match"
+                            )
+                        else:
+                            findings.append(
+                                f"[lb-origin] {host} origin={origin_ip} confirmed=NO (title mismatch)"
+                            )
                     except (urllib.error.URLError, urllib.error.HTTPError, OSError, socket.timeout):
-                        findings.append(f"[lb-bypass] {host} origin={origin_ip} diff=UNREACHABLE")
+                        findings.append(f"[lb-origin] {host} origin={origin_ip} diff=UNREACHABLE")
                     except Exception:
                         pass
 
@@ -540,7 +563,7 @@ async def phase_134_LBDETECT(
 
     out = ensure(_out)
     out.write_text("\n".join(findings) + ("\n" if findings else ""))
-    log("ok", f"134-LBDETECT: {len(findings)} findings → {out}")
+    log("OK", f"134-LBDETECT: {len(findings)} findings → {out}")
     return {"134-LBDETECT": str(out), "count": len(findings)}
 
 
@@ -557,16 +580,15 @@ async def phase_135_VHOST(
     _out = outdir / "vhost_discovery.txt"
     if _out.exists() and not force:
         return {"135-VHOST": str(_out), "count": count_nonblank(_out)}
-    log("info", "Phase 135-VHOST: virtual host enumeration")
+    log("INFO", "Phase 135-VHOST: virtual host enumeration")
     findings: List[str] = []
     _urlopen = _get_urlopener()
     _extra_h = _extra_headers_dict()
 
-    hosts_file = outdir / "hosts.txt"
-    hosts = read_lines(hosts_file) if hosts_file.exists() else []
+    hosts = _load_live_hosts(outdir)
 
     if not hosts:
-        log("warn", "135-VHOST: no hosts; skipping")
+        log("WARNING", "135-VHOST: no hosts; skipping")
         return {"135-VHOST": str(_out), "count": 0}
 
     sample = int(getattr(_PIPELINE_CFG, "sample_hosts_vhost", 10))
@@ -671,7 +693,7 @@ async def phase_135_VHOST(
 
     out = ensure(_out)
     out.write_text("\n".join(findings) + ("\n" if findings else ""))
-    log("ok", f"135-VHOST: {len(findings)} findings → {out}")
+    log("OK", f"135-VHOST: {len(findings)} findings → {out}")
     return {"135-VHOST": str(out), "count": len(findings)}
 
 
@@ -688,7 +710,7 @@ async def phase_136_RATELIMITBYPASS(
     _out = outdir / "rate_limit_bypass.txt"
     if _out.exists() and not force:
         return {"136-RATELIMITBYPASS": str(_out), "count": count_nonblank(_out)}
-    log("info", "Phase 136-RATELIMITBYPASS: application rate limit bypass")
+    log("INFO", "Phase 136-RATELIMITBYPASS: application rate limit bypass")
     findings: List[str] = []
     _urlopen = _get_urlopener()
     _extra_h = _extra_headers_dict()
@@ -697,7 +719,7 @@ async def phase_136_RATELIMITBYPASS(
     all_urls = read_lines(urls_file) if urls_file.exists() else []
 
     if not all_urls:
-        log("warn", "136-RATELIMITBYPASS: no URLs found; skipping")
+        log("WARNING", "136-RATELIMITBYPASS: no URLs found; skipping")
         return {"136-RATELIMITBYPASS": str(_out), "count": 0}
 
     sample = int(getattr(_PIPELINE_CFG, "sample_urls_ratelimitbypass", 20))
@@ -915,45 +937,50 @@ async def phase_136_RATELIMITBYPASS(
             except Exception:
                 pass
 
-        # Technique 8: Distributed rate limit detection — send requests from multiple IPs
-        # and determine if rate limit is per-IP or global
-        dist_ips = [f"192.168.{i}.{j}" for i in range(1, 4) for j in range(1, 256, 50)]
-        dist_statuses: List[int] = []
-        dist_headers_list: List[Dict[str, str]] = []
-        for dist_ip in dist_ips[:10]:
+        # Technique 8: Burst first to trigger a limit, then distribute only if one is observed
+        burst_statuses: List[int] = []
+        for _ in range(8):
             await _throttle_rate()
             try:
-                headers = {"Accept": "*/*", "X-Forwarded-For": dist_ip, **_extra_h}
-                req = urllib.request.Request(url, headers=headers, method="GET")
-                s, rh, _ = await _async_urlopen(_urlopen, req, timeout=12)
-                dist_statuses.append(s)
-                dist_headers_list.append(dict(rh))
+                req = urllib.request.Request(
+                    url, headers={"Accept": "*/*", **_extra_h}, method="GET"
+                )
+                s, _, _ = await _async_urlopen(_urlopen, req, timeout=12)
+                burst_statuses.append(s)
             except urllib.error.HTTPError as e:
-                dist_statuses.append(e.code)
-                dist_headers_list.append({})
+                burst_statuses.append(e.code)
             except Exception:
                 continue
-        first_status = dist_statuses[0] if dist_statuses else None
-        if first_status is not None:
-            all_same = all(s == first_status for s in dist_statuses)
-            any_429 = any(s in (429, 403) for s in dist_statuses)
-            if any_429 and not all_same:
-                findings.append(
-                    f"[ratelimit-distributed] {url} — mixed statuses across IPs: {set(dist_statuses)} — rate limit may be per-IP"
-                )
-            elif any_429 and all_same:
-                findings.append(
-                    f"[ratelimit-distributed] {url} — all IPs return {first_status} — rate limit may be global"
-                )
-            elif not any_429:
-                findings.append(
-                    f"[ratelimit-distributed] {url} — no rate limiting observed across {len(dist_ips[:10])} different IPs"
-                )
+        if any(s in (429, 403) for s in burst_statuses):
+            dist_ips = [f"192.168.{i}.{j}" for i in range(1, 4) for j in range(1, 256, 50)]
+            dist_statuses: List[int] = []
+            for dist_ip in dist_ips[:10]:
+                await _throttle_rate()
+                try:
+                    headers = {"Accept": "*/*", "X-Forwarded-For": dist_ip, **_extra_h}
+                    req = urllib.request.Request(url, headers=headers, method="GET")
+                    s, _, _ = await _async_urlopen(_urlopen, req, timeout=12)
+                    dist_statuses.append(s)
+                except urllib.error.HTTPError as e:
+                    dist_statuses.append(e.code)
+                except Exception:
+                    continue
+            first_status = dist_statuses[0] if dist_statuses else None
+            if first_status is not None:
+                all_same = all(s == first_status for s in dist_statuses)
+                if all_same:
+                    findings.append(
+                        f"[ratelimit-distributed] {url} — all IPs return {first_status} — rate limit may be global"
+                    )
+                else:
+                    findings.append(
+                        f"[ratelimit-distributed] {url} — mixed statuses across IPs: {set(dist_statuses)} — rate limit may be per-IP"
+                    )
 
     if not findings:
         findings.append("[ratelimit-bypass] No findings (expected)")
 
     out = ensure(_out)
     out.write_text("\n".join(findings) + ("\n" if findings else ""))
-    log("ok", f"136-RATELIMITBYPASS: {len(findings)} findings → {out}")
+    log("OK", f"136-RATELIMITBYPASS: {len(findings)} findings → {out}")
     return {"136-RATELIMITBYPASS": str(out), "count": len(findings)}

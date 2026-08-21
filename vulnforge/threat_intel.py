@@ -332,7 +332,7 @@ def _map_findings_to_techniques(
 
     matches.sort(key=lambda m: m.confidence, reverse=True)
     result = [m.to_dict() for m in matches if m.confidence >= min_confidence]
-    log("ok", f"threat_intel: mapped {len(findings)} findings → {len(result)} ATT&CK techniques")
+    log("OK", f"threat_intel: mapped {len(findings)} findings → {len(result)} ATT&CK techniques")
     return result
 
 
@@ -362,10 +362,10 @@ class ThreatIntelEngine:
                 )
                 self._feeds.append(feed)
                 self._indicator_cache[feed.indicator] = feed
-            log("ok", f"threat_intel: loaded {len(self._feeds)} threat feed entries")
+            log("OK", f"threat_intel: loaded {len(self._feeds)} threat feed entries")
             return len(self._feeds)
         except Exception as e:
-            log("warn", f"threat_intel: failed to load feeds: {e}")
+            log("WARNING", f"threat_intel: failed to load feeds: {e}")
             return 0
 
     def check_indicator(self, indicator: str) -> Optional[ThreatFeed]:
@@ -414,7 +414,7 @@ class ThreatIntelEngine:
                         }
                     )
 
-        log("ok", f"threat_intel: {len(matches)} findings matched threat feed indicators")
+        log("OK", f"threat_intel: {len(matches)} findings matched threat feed indicators")
         return matches
 
     def generate_report(self, outdir: Path, domain: str = "") -> Path:
@@ -436,7 +436,7 @@ class ThreatIntelEngine:
 
         out = ensure(outdir / "threat_intel_report.json")
         out.write_text(json.dumps(report, indent=2, default=str))
-        log("ok", f"threat_intel: report → {out}")
+        log("OK", f"threat_intel: report → {out}")
         return out
 
 

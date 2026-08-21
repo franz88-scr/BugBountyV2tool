@@ -9,7 +9,7 @@ import urllib.parse
 import urllib.request
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from vulnforge.phases.helpers import (
     MAX_RECV,
@@ -48,7 +48,7 @@ async def phase_84_WHOIS(
     _out = outdir / "whois.txt"
     if _out.exists() and not force:
         return {"84-WHOIS": str(_out), "count": count_nonblank(_out)}
-    log("info", "Phase 84-WHOIS: WHOIS registration intelligence")
+    log("INFO", "Phase 84-WHOIS: WHOIS registration intelligence")
     findings: List[str] = []
     whois_data = ""
     if t.has("whois"):
@@ -79,7 +79,7 @@ async def phase_84_WHOIS(
         except Exception:
             pass
     if not whois_data:
-        log("warn", "84-WHOIS: no WHOIS data retrieved")
+        log("WARNING", "84-WHOIS: no WHOIS data retrieved")
         ensure(_out).write_text("[no WHOIS data available]\n")
         return {"84-WHOIS": str(_out), "count": 0}
     fields = {
@@ -133,7 +133,7 @@ async def phase_84_WHOIS(
     findings.append(f"raw_length: {len(whois_data)} bytes")
     out = ensure(_out)
     out.write_text("\n".join(findings) + ("\n" if findings else ""))
-    log("ok", f"84-WHOIS: {len(findings)} findings → {out}")
+    log("OK", f"84-WHOIS: {len(findings)} findings → {out}")
     return {"84-WHOIS": str(_out), "count": len(findings)}
 
 
@@ -152,27 +152,32 @@ async def phase_85_ASN(
     _out = outdir / "asn_ranges.txt"
     if _out.exists() and not force:
         return {"85-ASN": str(_out), "count": count_nonblank(_out)}
-    log("info", "Phase 85-ASN: ASN/IP range enumeration")
+    log("INFO", "Phase 85-ASN: ASN/IP range enumeration")
     findings: List[str] = []
     opener = _get_urlopener()
     extra_h = _extra_headers_dict()
     resolved_file = outdir / "resolved.txt"
     ips: Set[str] = set()
+    import socket as _sock
+
     if resolved_file.exists():
         for ln in read_lines(resolved_file):
             ln = ln.strip()
             if re.match(r"^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$", ln):
                 ips.add(ln)
+            elif _is_valid_hostname(ln):
+                try:
+                    ips.add(_sock.gethostbyname(ln))
+                except Exception:
+                    pass
     if not ips:
-        import socket as _sock
-
         try:
             ip = _sock.gethostbyname(domain)
             ips.add(ip)
         except Exception:
             pass
     if not ips:
-        log("warn", "85-ASN: no IPs found for reverse ASN lookup")
+        log("WARNING", "85-ASN: no IPs found for reverse ASN lookup")
         ensure(_out).write_text("[no IPs found]\n")
         return {"85-ASN": str(_out), "count": 0}
     findings.append(f"target_ips={len(ips)}")
@@ -223,8 +228,20 @@ async def phase_85_ASN(
         findings.append("[no ASN data found via BGPView API]")
     out = ensure(_out)
     out.write_text("\n".join(findings) + ("\n" if findings else ""))
-    log("ok", f"85-ASN: {len(findings)} findings → {out}")
+    log("OK", f"85-ASN: {len(findings)} findings → {out}")
     return {"85-ASN": str(_out), "count": len(findings)}
+
+
+def _ddg_result_url(href: str) -> Optional[str]:
+    """Resolve a DuckDuckGo result href to the real target URL.
+
+    DDG serves protocol-relative ``//duckduckgo.com/l/?uddg=...`` redirect links;
+    the actual target is the URL-encoded ``uddg`` parameter.
+    """
+    m = re.search(r"[?&]uddg=([^&]+)", href)
+    if m:
+        return urllib.parse.unquote(m.group(1))
+    return href if href.startswith("http") else None
 
 
 async def phase_86_DORK(
@@ -242,7 +259,7 @@ async def phase_86_DORK(
     _out = outdir / "dork_findings.txt"
     if _out.exists() and not force:
         return {"86-DORK": str(_out), "count": count_nonblank(_out)}
-    log("info", "Phase 86-DORK: search engine dorking")
+    log("INFO", "Phase 86-DORK: search engine dorking")
     findings: List[str] = []
     opener = _get_urlopener()
     extra_h = _extra_headers_dict()
@@ -258,7 +275,7 @@ async def phase_86_DORK(
         f"site:{domain} ext:xml",
         f"site:{domain} inurl:backup",
     ]
-    url_re = re.compile(r'<a[^>]+href="(https?://[^"]+)"', re.I)
+    url_re = re.compile(r'<a[^>]+href="((?:https?:)?//[^"]+)"', re.I)
     for dork in dorks:
         await _throttle_rate()
         await asyncio.sleep(2)
@@ -277,17 +294,18 @@ async def phase_86_DORK(
                 html = body.decode("utf-8", errors="ignore")
                 urls = url_re.findall(html)
                 for u in urls:
-                    if domain in u and u not in findings:
+                    u = _ddg_result_url(u)
+                    if u and domain in u and u not in findings:
                         findings.append(f"[{dork}] {u}")
                 if urls:
-                    log("info", f"86-DORK: {len(urls)} results for '{dork}'")
+                    log("INFO", f"86-DORK: {len(urls)} results for '{dork}'")
         except Exception:
             pass
     if not findings:
         findings.append("[no dork results found]")
     out = ensure(_out)
     out.write_text("\n".join(findings) + ("\n" if findings else ""))
-    log("ok", f"86-DORK: {len(findings)} dork findings → {out}")
+    log("OK", f"86-DORK: {len(findings)} dork findings → {out}")
     return {"86-DORK": str(_out), "count": len(findings)}
 
 
@@ -310,11 +328,11 @@ async def phase_87_SHODAN(
     _out = outdir / "shodan_hosts.txt"
     if _out.exists() and not force:
         return {"87-SHODAN": str(_out), "count": count_nonblank(_out)}
-    log("info", "Phase 87-SHODAN: Shodan/Censys integration")
+    log("INFO", "Phase 87-SHODAN: Shodan/Censys integration")
     findings: List[str] = []
     api_key = os.environ.get("SHODAN_API_KEY", "")
     if not api_key:
-        log("warn", "87-SHODAN: SHODAN_API_KEY not set; skipping")
+        log("WARNING", "87-SHODAN: SHODAN_API_KEY not set; skipping")
         ensure(_out).write_text("[SHODAN_API_KEY not set]\n")
         return {"87-SHODAN": str(_out), "count": 0}
     opener = _get_urlopener()
@@ -371,8 +389,25 @@ async def phase_87_SHODAN(
         findings.append("[no Shodan data found]")
     out = ensure(_out)
     out.write_text("\n".join(findings) + ("\n" if findings else ""))
-    log("ok", f"87-SHODAN: {len(findings)} findings → {out}")
+    log("OK", f"87-SHODAN: {len(findings)} findings → {out}")
     return {"87-SHODAN": str(_out), "count": len(findings)}
+
+
+def _ddg_employee_name(anchor_html: str) -> Optional[Tuple[str, str]]:
+    """Extract a candidate (first, last) name from a DDG ``.result__a`` anchor.
+
+    DDG result titles look like ``John Doe - Company | LinkedIn``; strip the
+    ``- Company`` and ``| LinkedIn`` suffixes and take the leading name tokens.
+    """
+    text = re.sub(r"<[^>]+>", "", anchor_html)
+    text = re.sub(r"\s*\|\s*[^|]*$", "", text.strip())
+    text = re.sub(r"\s*-\s*[^|]*$", "", text).strip()
+    words = [w for w in re.split(r"\s+", text) if re.fullmatch(r"[A-Za-z][A-Za-z'.\-]{0,29}", w)]
+    if len(words) >= 2:
+        first, last = words[0], words[1]
+        if first.lower() not in {"linkedin", "view", "join", "profile", "people"}:
+            return first.lower(), last.lower()
+    return None
 
 
 async def phase_88_EMPLOYEE(
@@ -391,12 +426,11 @@ async def phase_88_EMPLOYEE(
     _wl = outdir / "wordlist_generated.txt"
     if _out.exists() and _wl.exists() and not force:
         return {"88-EMPLOYEE": str(_out), "count": count_nonblank(_out)}
-    log("info", "Phase 88-EMPLOYEE: employee name harvesting")
+    log("INFO", "Phase 88-EMPLOYEE: employee name harvesting")
     findings: List[str] = []
     opener = _get_urlopener()
     extra_h = _extra_headers_dict()
-    name_re = re.compile(r"<h2[^>]*>\s*<span[^>]*>([^<]+)</span>\s*<span[^>]*>([^<]+)</span>", re.I)
-    re.compile(r"at\s+" + re.escape(domain.split(".")[0]), re.I)
+    result_a_re = re.compile(r'<a[^>]*class="[^"]*result__a[^"]*"[^>]*>(.*?)</a>', re.I)
     employees: Set[Tuple[str, str]] = set()
     dork = f'site:linkedin.com/in "at {domain.split(".")[0]}"'
     encoded = urllib.parse.quote_plus(dork)
@@ -413,10 +447,10 @@ async def phase_88_EMPLOYEE(
         status, _, body = await _async_urlopen(opener, req, timeout=15)
         if status == 200:
             html = body.decode("utf-8", errors="ignore")
-            for m in name_re.finditer(html):
-                first, last = m.group(1).strip(), m.group(2).strip()
-                if first and last and len(first) < 30 and len(last) < 30:
-                    employees.add((first.lower(), last.lower()))
+            for m in result_a_re.finditer(html):
+                name = _ddg_employee_name(m.group(1))
+                if name:
+                    employees.add(name)
     except Exception:
         pass
     for first, last in sorted(employees):
@@ -438,7 +472,7 @@ async def phase_88_EMPLOYEE(
     wordlist.add(f"root@{domain}")
     wordlist.add(f"security@{domain}")
     ensure(_wl).write_text("\n".join(sorted(wordlist)) + ("\n" if wordlist else ""))
-    log("ok", f"88-EMPLOYEE: {len(findings)} employees, {len(wordlist)} wordlist entries → {_out}")
+    log("OK", f"88-EMPLOYEE: {len(findings)} employees, {len(wordlist)} wordlist entries → {_out}")
     return {"88-EMPLOYEE": str(_out), "count": len(findings)}
 
 
@@ -457,7 +491,7 @@ async def phase_89_PASSIVEDNS(
     _out = outdir / "passive_dns_subs.txt"
     if _out.exists() and not force:
         return {"89-PASSIVEDNS": str(_out), "count": count_nonblank(_out)}
-    log("info", "Phase 89-PASSIVEDNS: passive DNS aggregation")
+    log("INFO", "Phase 89-PASSIVEDNS: passive DNS aggregation")
     findings: Set[str] = set()
     opener = _get_urlopener()
     extra_h = _extra_headers_dict()
@@ -475,13 +509,13 @@ async def phase_89_PASSIVEDNS(
                     sub = item.get("id", "")
                     if sub and sub != domain:
                         findings.add(sub)
-                        log("info", f"89-PASSIVEDNS: VT found {sub}")
+                        log("INFO", f"89-PASSIVEDNS: VT found {sub}")
             else:
-                log("warn", f"89-PASSIVEDNS: VirusTotal HTTP {status}")
+                log("WARNING", f"89-PASSIVEDNS: VirusTotal HTTP {status}")
         except Exception as e:
-            log("warn", f"89-PASSIVEDNS: VirusTotal error: {e}")
+            log("WARNING", f"89-PASSIVEDNS: VirusTotal error: {e}")
     else:
-        log("info", "89-PASSIVEDNS: VIRUSTOTAL_API_KEY not set, skipping VirusTotal")
+        log("INFO", "89-PASSIVEDNS: VIRUSTOTAL_API_KEY not set, skipping VirusTotal")
     st_key = os.environ.get("SECURITYTRAILS_API_KEY", "")
     if st_key:
         try:
@@ -496,13 +530,13 @@ async def phase_89_PASSIVEDNS(
                     sub = f"{sub_record}.{domain}" if isinstance(sub_record, str) else ""
                     if sub:
                         findings.add(sub)
-                        log("info", f"89-PASSIVEDNS: ST found {sub}")
+                        log("INFO", f"89-PASSIVEDNS: ST found {sub}")
             else:
-                log("warn", f"89-PASSIVEDNS: SecurityTrails HTTP {status}")
+                log("WARNING", f"89-PASSIVEDNS: SecurityTrails HTTP {status}")
         except Exception as e:
-            log("warn", f"89-PASSIVEDNS: SecurityTrails error: {e}")
+            log("WARNING", f"89-PASSIVEDNS: SecurityTrails error: {e}")
     else:
-        log("info", "89-PASSIVEDNS: SECURITYTRAILS_API_KEY not set, skipping SecurityTrails")
+        log("INFO", "89-PASSIVEDNS: SECURITYTRAILS_API_KEY not set, skipping SecurityTrails")
     try:
         url = f"https://urlscan.io/api/v1/search/?q=domain:{domain}"
         req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0", **extra_h})
@@ -517,11 +551,11 @@ async def phase_89_PASSIVEDNS(
                     ip = page.get("ip", "")
                     if ip:
                         findings.add(f"{hostname} ({ip})")
-            log("info", f"89-PASSIVEDNS: urlscan.io returned {len(findings)} subdomains")
+            log("INFO", f"89-PASSIVEDNS: urlscan.io returned {len(findings)} subdomains")
         else:
-            log("warn", f"89-PASSIVEDNS: urlscan.io HTTP {status}")
+            log("WARNING", f"89-PASSIVEDNS: urlscan.io HTTP {status}")
     except Exception as e:
-        log("warn", f"89-PASSIVEDNS: urlscan.io error: {e}")
+        log("WARNING", f"89-PASSIVEDNS: urlscan.io error: {e}")
     clean_subs: List[str] = []
     for f in sorted(findings):
         sub = f.split("(")[0].strip().lower()
@@ -536,5 +570,5 @@ async def phase_89_PASSIVEDNS(
         all_subs = outdir / "all_subs.txt"
         if all_subs.exists():
             merge_unique([_out], all_subs)
-    log("ok", f"89-PASSIVEDNS: {len(clean_subs)} subdomains → {out}")
+    log("OK", f"89-PASSIVEDNS: {len(clean_subs)} subdomains → {out}")
     return {"89-PASSIVEDNS": str(_out), "count": len(clean_subs)}

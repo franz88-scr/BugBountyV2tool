@@ -87,7 +87,7 @@ async def _run_discord_bot(
     try:
         import aiohttp
     except ImportError:
-        log("err", "err: discord bot requires 'aiohttp' package: pip install aiohttp")
+        log("ERROR", "err: discord bot requires 'aiohttp' package: pip install aiohttp")
         return
 
     API = "https://discord.com/api/v10"
@@ -97,10 +97,10 @@ async def _run_discord_bot(
         # Get bot info
         async with session.get(f"{API}/users/@me", headers=HEADERS) as resp:
             if resp.status != 200:
-                log("err", f"err: Discord auth failed (HTTP {resp.status})")
+                log("ERROR", f"err: Discord auth failed (HTTP {resp.status})")
                 return
             bot_info = await resp.json()
-            log("ok", f"ok: Discord bot connected as {bot_info['username']}")
+            log("OK", f"ok: Discord bot connected as {bot_info['username']}")
 
         channel_id_int = int(channel_id)
 
@@ -115,7 +115,7 @@ async def _run_discord_bot(
             ) as resp:
                 if resp.status not in (200, 201):
                     body = await resp.text()
-                    log("warn", f"warn: Discord send failed ({resp.status}): {body[:200]}")
+                    log("WARNING", f"warn: Discord send failed ({resp.status}): {body[:200]}")
 
         async def send_finding(finding: Dict[str, Any]) -> None:
             severity = finding.get("severity", "info")
@@ -144,7 +144,7 @@ async def _run_discord_bot(
             future = asyncio.run_coroutine_threadsafe(coro, _loop)
             future.add_done_callback(
                 lambda f: (
-                    log("err", f"bot task failed: {f.exception()}")
+                    log("ERROR", f"bot task failed: {f.exception()}")
                     if not f.cancelled() and f.exception()
                     else None
                 )
@@ -235,7 +235,7 @@ async def _run_discord_bot(
                 gw_data = await resp.json()
                 ws_url = gw_data["url"]
         except Exception as exc:
-            log("err", f"err: failed to get Discord gateway: {exc}")
+            log("ERROR", f"err: failed to get Discord gateway: {exc}")
             return
 
         async with session.ws_connect(f"{ws_url}?v=10&encoding=json") as ws:
@@ -249,7 +249,7 @@ async def _run_discord_bot(
             }
             await ws.send_json(identify)
 
-            log("ok", "ok: Discord bot connected to gateway")
+            log("OK", "ok: Discord bot connected to gateway")
 
             # Heartbeat + command listener
             seq = 0
@@ -398,7 +398,7 @@ async def _run_slack_bot(
     try:
         import aiohttp
     except ImportError:
-        log("err", "err: slack bot requires 'aiohttp' package: pip install aiohttp")
+        log("ERROR", "err: slack bot requires 'aiohttp' package: pip install aiohttp")
         return
 
     API = "https://api.slack.com/api"
@@ -409,7 +409,7 @@ async def _run_slack_bot(
         future = asyncio.run_coroutine_threadsafe(coro, _loop)
         future.add_done_callback(
             lambda f: (
-                log("err", f"bot task failed: {f.exception()}")
+                log("ERROR", f"bot task failed: {f.exception()}")
                 if not f.cancelled() and f.exception()
                 else None
             )
@@ -420,9 +420,9 @@ async def _run_slack_bot(
         async with session.get(f"{API}/auth.test", headers=HEADERS) as resp:
             body = await resp.json()
             if not body.get("ok"):
-                log("err", f"err: Slack auth failed: {body.get('error', 'unknown')}")
+                log("ERROR", f"err: Slack auth failed: {body.get('error', 'unknown')}")
                 return
-            log("ok", f"ok: Slack bot connected as {body.get('user', 'unknown')}")
+            log("OK", f"ok: Slack bot connected as {body.get('user', 'unknown')}")
 
         async def send_message(text: str, blocks: Optional[List] = None) -> None:
             payload: Dict[str, Any] = {"channel": channel_id, "text": text}
@@ -433,7 +433,7 @@ async def _run_slack_bot(
             ) as resp:
                 body = await resp.json()
                 if not body.get("ok"):
-                    log("warn", f"warn: Slack send failed: {body.get('error', '')}")
+                    log("WARNING", f"warn: Slack send failed: {body.get('error', '')}")
 
         def on_finding(event: Any) -> None:
             severity = event.data.get("severity", _guess_severity(event.data.get("text", "")))
@@ -464,7 +464,7 @@ async def _run_slack_bot(
         bus.subscribe("finding.new", on_finding)
         bus.subscribe("scan.complete", on_scan_complete)
 
-        log("ok", "ok: Slack bot running (event-driven mode)")
+        log("OK", "ok: Slack bot running (event-driven mode)")
 
         # Keep alive
         while True:
@@ -499,10 +499,10 @@ async def start_bot(
         )
 
     if not token or not channel_id:
-        log("err", f"err: {platform} bot requires token and channel_id")
+        log("ERROR", f"err: {platform} bot requires token and channel_id")
         return
 
-    log("ok", f"ok: starting {platform} bot...")
+    log("OK", f"ok: starting {platform} bot...")
     _setup_event_subscriptions()
 
     if platform == "discord":
@@ -510,7 +510,7 @@ async def start_bot(
     elif platform == "slack":
         await _run_slack_bot(token, channel_id, mention_on_critical)
     else:
-        log("err", f"err: unknown bot platform '{platform}'")
+        log("ERROR", f"err: unknown bot platform '{platform}'")
 
 
 def _setup_event_subscriptions() -> None:
@@ -532,8 +532,8 @@ def start_bot_thread(
         try:
             loop.run_until_complete(start_bot(platform, token, channel_id, mention_on_critical))
         except Exception as exc:
-            log("err", f"err: bot thread failed: {exc}")
+            log("ERROR", f"err: bot thread failed: {exc}")
 
     t = Thread(target=_thread, daemon=True, name=f"vulnforge-bot-{platform}")
     t.start()
-    log("ok", f"ok: {platform} bot thread started")
+    log("OK", f"ok: {platform} bot thread started")

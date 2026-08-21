@@ -147,7 +147,7 @@ class CredentialStore:
         try:
             return self._fernet.decrypt(ciphertext.encode()).decode()  # type: ignore[no-any-return]
         except InvalidToken:
-            log("warn", "credential store: failed to decrypt credential (invalid token)")
+            log("WARNING", "credential store: failed to decrypt credential (invalid token)")
             return None
 
     def _load(self) -> None:
@@ -159,7 +159,7 @@ class CredentialStore:
                 entry = CredentialEntry.from_dict(entry_dict)
                 self._entries[entry.name] = entry
         except Exception as e:
-            log("warn", f"credential store: failed to load: {e}")
+            log("WARNING", f"credential store: failed to load: {e}")
 
     def _save(self) -> None:
         ensure(self._cred_path)
@@ -215,7 +215,7 @@ class CredentialStore:
             )
             self._entries[name] = entry
             self._save()
-            log("ok", f"credential saved: {name} (rotation #{entry.rotation_count})")
+            log("OK", f"credential saved: {name} (rotation #{entry.rotation_count})")
             return entry
 
     def load(self, name: str, *, check_expiry: bool = True) -> Optional[str]:
@@ -233,7 +233,7 @@ class CredentialStore:
             if entry is None:
                 return None
             if check_expiry and entry.expires_at and time.time() > entry.expires_at:
-                log("warn", f"credential expired: {name}")
+                log("WARNING", f"credential expired: {name}")
                 return None
             return self._decrypt(entry.encrypted_value)
 
@@ -244,7 +244,7 @@ class CredentialStore:
     def rotate(self, name: str, new_value: str) -> Optional[CredentialEntry]:
         """Rotate a credential (alias for save with explicit semantics)."""
         if name not in self._entries:
-            log("warn", f"cannot rotate non-existent credential: {name}")
+            log("WARNING", f"cannot rotate non-existent credential: {name}")
             return None
         return self.save(name, new_value)
 
@@ -253,7 +253,7 @@ class CredentialStore:
             if name in self._entries:
                 del self._entries[name]
                 self._save()
-                log("ok", f"credential deleted: {name}")
+                log("OK", f"credential deleted: {name}")
                 return True
             return False
 
@@ -285,7 +285,7 @@ class CredentialStore:
             }
             ensure(target)
             target.write_text(json.dumps(data, indent=2))
-            log("ok", f"exported {len(self._entries)} credentials → {target}")
+            log("OK", f"exported {len(self._entries)} credentials → {target}")
 
     def import_encrypted(self, source: Path) -> int:
         """Import encrypted credentials from a file (merges, does not overwrite)."""
@@ -303,8 +303,8 @@ class CredentialStore:
                 if count:
                     self._save()
             if count:
-                log("ok", f"imported {count} new credentials from {source}")
+                log("OK", f"imported {count} new credentials from {source}")
             return count
         except Exception as e:
-            log("warn", f"credential import failed: {e}")
+            log("WARNING", f"credential import failed: {e}")
             return 0

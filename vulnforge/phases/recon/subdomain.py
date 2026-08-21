@@ -47,12 +47,12 @@ async def phase_01_RECON(
     out = outdir / "all_subs.txt"
     if out.exists() and not force:
         return {"01-RECON": str(out), "count": count_nonblank(out)}
-    log("info", "Phase 01-RECON: subdomain enumeration")
+    log("INFO", "Phase 01-RECON: subdomain enumeration")
     jobs: List[Tuple[str, List[str], int]] = []
     if t.has("subfinder"):
         _sub_out = outdir / "subs_subfinder.txt"
         if resume and _sub_out.exists() and count_nonblank(_sub_out) > 0:
-            log("skip", "subfinder (resume — output exists)")
+            log("SKIP", "subfinder (resume — output exists)")
         else:
             _sub_proxy = []
             if _PIPELINE_CFG.proxy:
@@ -67,7 +67,7 @@ async def phase_01_RECON(
     if t.has("findomain"):
         _fd_out = outdir / "subs_findomain.txt"
         if resume and _fd_out.exists() and count_nonblank(_fd_out) > 0:
-            log("skip", "findomain (resume — output exists)")
+            log("SKIP", "findomain (resume — output exists)")
         else:
             runner = outdir / "logs" / "findomain.sh"
             ensure(runner)
@@ -113,7 +113,7 @@ async def phase_01_RECON(
                             if ln and "*" not in ln and ln.endswith(f".{domain}"):
                                 subs.add(ln)
                 except Exception as e:
-                    log("warn", f"01-RECON: crt.sh failed ({e})")
+                    log("WARNING", f"01-RECON: crt.sh failed ({e})")
                 return subs
 
             def _fetch_certspotter() -> Set[str]:
@@ -130,7 +130,7 @@ async def phase_01_RECON(
                             if dns_name and "*" not in dns_name and dns_name.endswith(f".{domain}"):
                                 subs.add(dns_name)
                 except Exception as e:
-                    log("warn", f"01-RECON: certspotter failed ({e})")
+                    log("WARNING", f"01-RECON: certspotter failed ({e})")
                 return subs
 
             crt_results, cs_results = await asyncio.gather(
@@ -139,7 +139,7 @@ async def phase_01_RECON(
             )
             ct_subs.update(crt_results)
             ct_subs.update(cs_results)
-            log("info", f"01-RECON: CT logs returned {len(ct_subs)} subdomains")
+            log("INFO", f"01-RECON: CT logs returned {len(ct_subs)} subdomains")
             return ct_subs
 
         try:
@@ -149,7 +149,7 @@ async def phase_01_RECON(
             else:
                 ensure(_ct_out).write_text("")
         except Exception as e:
-            log("warn", f"01-RECON: CT log enumeration failed ({e})")
+            log("WARNING", f"01-RECON: CT log enumeration failed ({e})")
             ensure(_ct_out).write_text("")
 
     _a1_sources = [
@@ -167,9 +167,9 @@ async def phase_01_RECON(
             )
             if n == 0:
                 out.touch()
-            log("ok", f"01-RECON: {n} unique subdomains → {out}")
+            log("OK", f"01-RECON: {n} unique subdomains → {out}")
             return {"01-RECON": str(out), "count": n}
-        log("warn", "01-RECON: no subdomain tools available")
+        log("WARNING", "01-RECON: no subdomain tools available")
         ensure(out)
         return {"01-RECON": str(out), "count": 0}
 
@@ -212,11 +212,11 @@ async def phase_01_RECON(
     n = merge_unique(_a1_sources, out, validator=_under_domain)
     if n == 0:
         out.touch()
-    log("ok", f"01-RECON: {n} unique subdomains → {out}")
+    log("OK", f"01-RECON: {n} unique subdomains → {out}")
     ret: Dict[str, Any] = {"01-RECON": str(out), "count": n}
     if failures:
         ret["failures"] = failures
-        log("warn", f"01-RECON: partial — failed tools: {failures}")
+        log("WARNING", f"01-RECON: partial — failed tools: {failures}")
     return ret
 
 
@@ -241,10 +241,10 @@ async def phase_03_PERMUTE(
             "03-PERMUTE": str(_a3_out),
             "count": count_nonblank(_a3_out),
         }
-    log("info", "Phase 03-PERMUTE: subdomain permutation (alterx → dnsgen → dnsx)")
+    log("INFO", "Phase 03-PERMUTE: subdomain permutation (alterx → dnsgen → dnsx)")
     subs_in = Path(prev.get("01-RECON") or outdir / "all_subs.txt")
     if not subs_in.exists() or not read_lines(subs_in):
-        log("warn", "03-PERMUTE: no subdomains to permute; skipping")
+        log("WARNING", "03-PERMUTE: no subdomains to permute; skipping")
         return {}
     permuted = outdir / "subs_permuted.txt"
     resolved = outdir / "subs_permuted_resolved.txt"
@@ -341,5 +341,5 @@ async def phase_03_PERMUTE(
     _a3_stamp.write_text("")
     permuted.unlink(missing_ok=True)
     resolved.unlink(missing_ok=True)
-    log("ok", f"03-PERMUTE: {n} total subdomains (after permutation)")
+    log("OK", f"03-PERMUTE: {n} total subdomains (after permutation)")
     return {"01-RECON": str(subs_in), "03-PERMUTE": str(subs_in), "count": n}

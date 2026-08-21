@@ -17,6 +17,7 @@ from vulnforge.utils import (
     _async_urlopen,
     _async_urlopen_no_redirect,
     _extra_headers_dict,
+    _extract_host,
     _get_urlopener,
     _load_live_hosts,
     _throttle_rate,
@@ -40,13 +41,13 @@ async def phase_121_IISASPNET(
     _out = outdir / "iis_aspnet_findings.txt"
     if _out.exists() and not force:
         return {"121-IISASPNET": str(_out), "count": count_nonblank(_out)}
-    log("info", "Phase 121-IISASPNET: probing IIS/ASP.NET hosts")
+    log("INFO", "Phase 121-IISASPNET: probing IIS/ASP.NET hosts")
     findings: List[str] = []
     _urlopen = _get_urlopener()
     _extra_h = _extra_headers_dict()
     hosts = _load_live_hosts(outdir)
     if not hosts:
-        log("warn", "121-IISASPNET: no live hosts; skipping")
+        log("WARNING", "121-IISASPNET: no live hosts; skipping")
         return {"121-IISASPNET": str(_out), "count": 0}
     tech_file = outdir / "tech.txt"
     tech_lines = read_lines(tech_file) if tech_file.exists() else []
@@ -81,8 +82,7 @@ async def phase_121_IISASPNET(
                     req = urllib.request.Request(
                         h.rstrip("/") + path, headers=_extra_h, method="GET"
                     )
-                    status, resp_headers, body_bytes = await _async_urlopen_no_redirect(
-                        _urlopen, req, timeout=10
+                    status, resp_headers, body_bytes = await _async_urlopen_no_redirect(req, timeout=10
                     )
                     if status == 200 and len(body_bytes) > 50:
                         findings.append(f"[iis-webconfig] {h}")
@@ -94,8 +94,7 @@ async def phase_121_IISASPNET(
                     req = urllib.request.Request(
                         h.rstrip("/") + path, headers=_extra_h, method="GET"
                     )
-                    status, resp_headers, body_bytes = await _async_urlopen_no_redirect(
-                        _urlopen, req, timeout=10
+                    status, resp_headers, body_bytes = await _async_urlopen_no_redirect(req, timeout=10
                     )
                     if status == 200:
                         findings.append(f"[iis-debug] {h} path={path}")
@@ -106,8 +105,7 @@ async def phase_121_IISASPNET(
                     req = urllib.request.Request(
                         h.rstrip("/") + payload, headers=_extra_h, method="GET"
                     )
-                    status, resp_headers, body_bytes = await _async_urlopen_no_redirect(
-                        _urlopen, req, timeout=10
+                    status, resp_headers, body_bytes = await _async_urlopen_no_redirect(req, timeout=10
                     )
                     if status == 200:
                         findings.append(f"[iis-traversal] {h} payload={payload}")
@@ -119,8 +117,7 @@ async def phase_121_IISASPNET(
                     req = urllib.request.Request(
                         h.rstrip("/") + path, headers=_extra_h, method="GET"
                     )
-                    status, resp_headers, body_bytes = await _async_urlopen_no_redirect(
-                        _urlopen, req, timeout=10
+                    status, resp_headers, body_bytes = await _async_urlopen_no_redirect(req, timeout=10
                     )
                     if status == 200:
                         tag = "java-webxml" if "web.xml" in path else "java-manifest"
@@ -131,7 +128,7 @@ async def phase_121_IISASPNET(
         findings.append("[iis-webconfig] No findings (expected)")
     out = ensure(_out)
     out.write_text("\n".join(findings) + ("\n" if findings else ""))
-    log("ok", f"121-IISASPNET: {len(findings)} findings → {out}")
+    log("OK", f"121-IISASPNET: {len(findings)} findings → {out}")
     return {"121-IISASPNET": str(out), "count": len(findings)}
 
 
@@ -148,13 +145,13 @@ async def phase_122_TOMCAT(
     _out = outdir / "tomcat_findings.txt"
     if _out.exists() and not force:
         return {"122-TOMCAT": str(_out), "count": count_nonblank(_out)}
-    log("info", "Phase 122-TOMCAT: probing Tomcat hosts")
+    log("INFO", "Phase 122-TOMCAT: probing Tomcat hosts")
     findings: List[str] = []
     _urlopen = _get_urlopener()
     _extra_h = _extra_headers_dict()
     hosts = _load_live_hosts(outdir)
     if not hosts:
-        log("warn", "122-TOMCAT: no live hosts; skipping")
+        log("WARNING", "122-TOMCAT: no live hosts; skipping")
         return {"122-TOMCAT": str(_out), "count": 0}
     creds = [("tomcat", "tomcat"), ("admin", "admin"), ("tomcat", "s3cret")]
     for h in hosts:
@@ -167,8 +164,7 @@ async def phase_122_TOMCAT(
                     req = urllib.request.Request(
                         h.rstrip("/") + path, headers=headers, method="GET"
                     )
-                    status, resp_headers, body_bytes = await _async_urlopen_no_redirect(
-                        _urlopen, req, timeout=10
+                    status, resp_headers, body_bytes = await _async_urlopen_no_redirect(req, timeout=10
                     )
                     if status == 200:
                         findings.append(f"[tomcat-manager] {h} creds={user}:{passwd}")
@@ -177,8 +173,7 @@ async def phase_122_TOMCAT(
         for path in ("/jmx-console/", "/invoker/JMXInvokerServlet"):
             try:
                 req = urllib.request.Request(h.rstrip("/") + path, headers=_extra_h, method="GET")
-                status, resp_headers, body_bytes = await _async_urlopen_no_redirect(
-                    _urlopen, req, timeout=10
+                status, resp_headers, body_bytes = await _async_urlopen_no_redirect(req, timeout=10
                 )
                 if status == 200:
                     findings.append(f"[tomcat-jmx] {h}")
@@ -188,8 +183,7 @@ async def phase_122_TOMCAT(
         for path in ("/WEB-INF/classes/", "/META-INF/MANIFEST.MF"):
             try:
                 req = urllib.request.Request(h.rstrip("/") + path, headers=_extra_h, method="GET")
-                status, resp_headers, body_bytes = await _async_urlopen_no_redirect(
-                    _urlopen, req, timeout=10
+                status, resp_headers, body_bytes = await _async_urlopen_no_redirect(req, timeout=10
                 )
                 if status == 200:
                     findings.append(f"[tomcat-manifest] {h} path={path}")
@@ -198,8 +192,7 @@ async def phase_122_TOMCAT(
         for path in ("/jenkins/", "/hudson/"):
             try:
                 req = urllib.request.Request(h.rstrip("/") + path, headers=_extra_h, method="GET")
-                status, resp_headers, body_bytes = await _async_urlopen_no_redirect(
-                    _urlopen, req, timeout=10
+                status, resp_headers, body_bytes = await _async_urlopen_no_redirect(req, timeout=10
                 )
                 if status == 200:
                     findings.append(f"[tomcat-jenkins] {h}")
@@ -209,8 +202,12 @@ async def phase_122_TOMCAT(
         findings.append("[tomcat-manager] No findings (expected)")
     out = ensure(_out)
     out.write_text("\n".join(findings) + ("\n" if findings else ""))
-    log("ok", f"122-TOMCAT: {len(findings)} findings → {out}")
+    log("OK", f"122-TOMCAT: {len(findings)} findings → {out}")
     return {"122-TOMCAT": str(out), "count": len(findings)}
+
+
+def _nodejs_ssti_triggered(injected_body: str, control_body: str) -> bool:
+    return "49" in injected_body and "49" not in control_body
 
 
 async def phase_123_NODEJS(
@@ -226,13 +223,13 @@ async def phase_123_NODEJS(
     _out = outdir / "nodejs_findings.txt"
     if _out.exists() and not force:
         return {"123-NODEJS": str(_out), "count": count_nonblank(_out)}
-    log("info", "Phase 123-NODEJS: probing Node.js/Express hosts")
+    log("INFO", "Phase 123-NODEJS: probing Node.js/Express hosts")
     findings: List[str] = []
     _urlopen = _get_urlopener()
     _extra_h = _extra_headers_dict()
     hosts = _load_live_hosts(outdir)
     if not hosts:
-        log("warn", "123-NODEJS: no live hosts; skipping")
+        log("WARNING", "123-NODEJS: no live hosts; skipping")
         return {"123-NODEJS": str(_out), "count": 0}
     tech_file = outdir / "tech.txt"
     tech_lines = read_lines(tech_file) if tech_file.exists() else []
@@ -257,8 +254,7 @@ async def phase_123_NODEJS(
         for path in ("/.env", "/package.json", "/node_modules/"):
             try:
                 req = urllib.request.Request(h.rstrip("/") + path, headers=_extra_h, method="GET")
-                status, resp_headers, body_bytes = await _async_urlopen_no_redirect(
-                    _urlopen, req, timeout=10
+                status, resp_headers, body_bytes = await _async_urlopen_no_redirect(req, timeout=10
                 )
                 if status == 200:
                     findings.append(f"[nodejs-exposed] {h} path={path}")
@@ -267,14 +263,21 @@ async def phase_123_NODEJS(
         for path in ("/_debug/", "/__debug/"):
             try:
                 req = urllib.request.Request(h.rstrip("/") + path, headers=_extra_h, method="GET")
-                status, resp_headers, body_bytes = await _async_urlopen_no_redirect(
-                    _urlopen, req, timeout=10
+                status, resp_headers, body_bytes = await _async_urlopen_no_redirect(req, timeout=10
                 )
                 if status == 200:
                     findings.append(f"[nodejs-debug] {h} path={path}")
             except Exception:
                 pass
         for param in ("q", "search", "name", "page"):
+            control_val = "vulnforge_ctrl_control"
+            control_url = h.rstrip("/") + f"?{param}={control_val}"
+            try:
+                req = urllib.request.Request(control_url, headers=_extra_h, method="GET")
+                _, _, control_body_bytes = await _async_urlopen(_urlopen, req, timeout=10)
+                control_body = control_body_bytes.decode("utf-8", errors="replace")
+            except Exception:
+                continue
             for payload in ("<%= 7*7 %>", "#{7*7}"):
                 url = h.rstrip("/") + f"?{param}={urllib.parse.quote(payload)}"
                 try:
@@ -283,7 +286,7 @@ async def phase_123_NODEJS(
                         _urlopen, req, timeout=10
                     )
                     body_str = body_bytes.decode("utf-8", errors="replace")
-                    if "49" in body_str or "7*7" in body_str:
+                    if _nodejs_ssti_triggered(body_str, control_body):
                         findings.append(f"[nodejs-ssti] {url} param={param}")
                         break
                 except Exception:
@@ -292,8 +295,31 @@ async def phase_123_NODEJS(
         findings.append("[nodejs-exposed] No findings (expected)")
     out = ensure(_out)
     out.write_text("\n".join(findings) + ("\n" if findings else ""))
-    log("ok", f"123-NODEJS: {len(findings)} findings → {out}")
+    log("OK", f"123-NODEJS: {len(findings)} findings → {out}")
     return {"123-NODEJS": str(out), "count": len(findings)}
+
+
+_ENV_KEY_VALUE_RE = re.compile(r"(?m)^[A-Z][A-Z0-9_]*\s*=")
+_LARAVEL_LOG_RE = re.compile(
+    r"\[\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}\]\s+"
+    r"(?:local|production|testing)\.(?:EMERGENCY|ALERT|CRITICAL|ERROR|WARNING|NOTICE|INFO|DEBUG):"
+)
+
+
+def _is_env_file_content(body_str: str) -> bool:
+    return bool(_ENV_KEY_VALUE_RE.search(body_str))
+
+
+def _is_laravel_log_content(body_str: str) -> bool:
+    return bool(_LARAVEL_LOG_RE.search(body_str))
+
+
+def _is_laravel_fingerprint(resp_headers: Any, body_str: str) -> bool:
+    lowered = {str(k).lower(): str(v).lower() for k, v in resp_headers.items()}
+    set_cookie = lowered.get("set-cookie", "")
+    if "laravel_session" in set_cookie or "xsrf-token" in set_cookie:
+        return True
+    return bool(re.search(r'name=["\']csrf-token["\']', body_str, re.IGNORECASE))
 
 
 async def phase_124_LARAVEL(
@@ -309,25 +335,34 @@ async def phase_124_LARAVEL(
     _out = outdir / "laravel_exposure.txt"
     if _out.exists() and not force:
         return {"124-LARAVEL": str(_out), "count": count_nonblank(_out)}
-    log("info", "Phase 124-LARAVEL: probing Laravel exposures")
+    log("INFO", "Phase 124-LARAVEL: probing Laravel exposures")
     findings: List[str] = []
     _urlopen = _get_urlopener()
     _extra_h = _extra_headers_dict()
     hosts = _load_live_hosts(outdir)
     if not hosts:
-        log("warn", "124-LARAVEL: no live hosts; skipping")
+        log("WARNING", "124-LARAVEL: no live hosts; skipping")
         return {"124-LARAVEL": str(_out), "count": 0}
     for h in hosts:
         h = h if h.startswith("http") else f"https://{h}"
+        try:
+            fp_req = urllib.request.Request(h.rstrip("/") + "/", headers=_extra_h, method="GET")
+            fp_status, fp_headers, fp_body = await _async_urlopen_no_redirect(fp_req, timeout=10
+            )
+        except Exception:
+            continue
+        if not _is_laravel_fingerprint(fp_headers, fp_body.decode("utf-8", errors="replace")):
+            continue
         secrets_found = []
         for path in ("/.env", "/.env.backup", "/.env.local", "/.env.production"):
             try:
                 req = urllib.request.Request(h.rstrip("/") + path, headers=_extra_h, method="GET")
-                status, resp_headers, body_bytes = await _async_urlopen_no_redirect(
-                    _urlopen, req, timeout=10
+                status, resp_headers, body_bytes = await _async_urlopen_no_redirect(req, timeout=10
                 )
                 if status == 200:
                     body_str = body_bytes.decode("utf-8", errors="replace")
+                    if not _is_env_file_content(body_str):
+                        continue
                     exposed = []
                     for key in ("APP_KEY", "DB_PASSWORD", "AWS_SECRET"):
                         m = re.search(rf"^{key}=(.+)$", body_str, re.MULTILINE)
@@ -348,20 +383,23 @@ async def phase_124_LARAVEL(
             req = urllib.request.Request(
                 h.rstrip("/") + "/storage/logs/laravel.log", headers=_extra_h, method="GET"
             )
-            status, resp_headers, body_bytes = await _async_urlopen_no_redirect(
-                _urlopen, req, timeout=10
+            status, resp_headers, body_bytes = await _async_urlopen_no_redirect(req, timeout=10
             )
-            if status == 200:
+            if status == 200 and _is_laravel_log_content(
+                body_bytes.decode("utf-8", errors="replace")
+            ):
                 findings.append(f"[laravel-log] {h}")
         except Exception:
             pass
         for path in ("/telescope", "/horizon"):
             try:
                 req = urllib.request.Request(h.rstrip("/") + path, headers=_extra_h, method="GET")
-                status, resp_headers, body_bytes = await _async_urlopen_no_redirect(
-                    _urlopen, req, timeout=10
+                status, resp_headers, body_bytes = await _async_urlopen_no_redirect(req, timeout=10
                 )
-                if status == 200:
+                if (
+                    status == 200
+                    and path[1:] in body_bytes.decode("utf-8", errors="replace").lower()
+                ):
                     findings.append(f"[laravel-dashboard] {h} path={path}")
             except Exception:
                 pass
@@ -369,7 +407,7 @@ async def phase_124_LARAVEL(
         findings.append("[laravel-env] No findings (expected)")
     out = ensure(_out)
     out.write_text("\n".join(findings) + ("\n" if findings else ""))
-    log("ok", f"124-LARAVEL: {len(findings)} findings → {out}")
+    log("OK", f"124-LARAVEL: {len(findings)} findings → {out}")
     return {"124-LARAVEL": str(out), "count": len(findings)}
 
 
@@ -386,13 +424,13 @@ async def phase_125_DJANGO(
     _out = outdir / "django_exposure.txt"
     if _out.exists() and not force:
         return {"125-DJANGO": str(_out), "count": count_nonblank(_out)}
-    log("info", "Phase 125-DJANGO: probing Django debug mode")
+    log("INFO", "Phase 125-DJANGO: probing Django debug mode")
     findings: List[str] = []
     _urlopen = _get_urlopener()
     _extra_h = _extra_headers_dict()
     hosts = _load_live_hosts(outdir)
     if not hosts:
-        log("warn", "125-DJANGO: no live hosts; skipping")
+        log("WARNING", "125-DJANGO: no live hosts; skipping")
         return {"125-DJANGO": str(_out), "count": 0}
     for h in hosts:
         h = h if h.startswith("http") else f"https://{h}"
@@ -401,8 +439,7 @@ async def phase_125_DJANGO(
                 req = urllib.request.Request(
                     h.rstrip("/") + trigger_path, headers=_extra_h, method="GET"
                 )
-                status, resp_headers, body_bytes = await _async_urlopen_no_redirect(
-                    _urlopen, req, timeout=10
+                status, resp_headers, body_bytes = await _async_urlopen_no_redirect(req, timeout=10
                 )
                 body_str = body_bytes.decode("utf-8", errors="replace")
                 if (
@@ -426,8 +463,7 @@ async def phase_125_DJANGO(
         for path in ("/admin/", "/admin/login/"):
             try:
                 req = urllib.request.Request(h.rstrip("/") + path, headers=_extra_h, method="GET")
-                status, resp_headers, body_bytes = await _async_urlopen_no_redirect(
-                    _urlopen, req, timeout=10
+                status, resp_headers, body_bytes = await _async_urlopen_no_redirect(req, timeout=10
                 )
                 if status == 200:
                     findings.append(f"[django-admin] {h} path={path}")
@@ -436,8 +472,7 @@ async def phase_125_DJANGO(
         for path in ("/settings.py", "/local_settings.py"):
             try:
                 req = urllib.request.Request(h.rstrip("/") + path, headers=_extra_h, method="GET")
-                status, resp_headers, body_bytes = await _async_urlopen_no_redirect(
-                    _urlopen, req, timeout=10
+                status, resp_headers, body_bytes = await _async_urlopen_no_redirect(req, timeout=10
                 )
                 if status == 200:
                     findings.append(f"[django-settings] {h} path={path}")
@@ -450,8 +485,7 @@ async def phase_125_DJANGO(
                     headers={**_extra_h, "Accept": "text/html,application/json"},
                     method="GET",
                 )
-                status, resp_headers, body_bytes = await _async_urlopen_no_redirect(
-                    _urlopen, req, timeout=10
+                status, resp_headers, body_bytes = await _async_urlopen_no_redirect(req, timeout=10
                 )
                 if status == 200:
                     body_str = body_bytes.decode("utf-8", errors="replace")
@@ -464,7 +498,7 @@ async def phase_125_DJANGO(
         findings.append("[django-debug] No findings (expected)")
     out = ensure(_out)
     out.write_text("\n".join(findings) + ("\n" if findings else ""))
-    log("ok", f"125-DJANGO: {len(findings)} findings → {out}")
+    log("OK", f"125-DJANGO: {len(findings)} findings → {out}")
     return {"125-DJANGO": str(out), "count": len(findings)}
 
 
@@ -481,21 +515,20 @@ async def phase_126_SYMFONY(
     _out = outdir / "symfony_profiler.txt"
     if _out.exists() and not force:
         return {"126-SYMFONY": str(_out), "count": count_nonblank(_out)}
-    log("info", "Phase 126-SYMFONY: probing Symfony profiler")
+    log("INFO", "Phase 126-SYMFONY: probing Symfony profiler")
     findings: List[str] = []
     _urlopen = _get_urlopener()
     _extra_h = _extra_headers_dict()
     hosts = _load_live_hosts(outdir)
     if not hosts:
-        log("warn", "126-SYMFONY: no live hosts; skipping")
+        log("WARNING", "126-SYMFONY: no live hosts; skipping")
         return {"126-SYMFONY": str(_out), "count": 0}
     for h in hosts:
         h = h if h.startswith("http") else f"https://{h}"
         for path in ("/_profiler", "/_profiler/phpinfo", "/_profiler/router"):
             try:
                 req = urllib.request.Request(h.rstrip("/") + path, headers=_extra_h, method="GET")
-                status, resp_headers, body_bytes = await _async_urlopen_no_redirect(
-                    _urlopen, req, timeout=10
+                status, resp_headers, body_bytes = await _async_urlopen_no_redirect(req, timeout=10
                 )
                 if status == 200:
                     findings.append(f"[symfony-profiler] {h} path={path}")
@@ -503,8 +536,7 @@ async def phase_126_SYMFONY(
                 pass
         try:
             req = urllib.request.Request(h.rstrip("/") + "/_wdt", headers=_extra_h, method="GET")
-            status, resp_headers, body_bytes = await _async_urlopen_no_redirect(
-                _urlopen, req, timeout=10
+            status, resp_headers, body_bytes = await _async_urlopen_no_redirect(req, timeout=10
             )
             if status == 200:
                 findings.append(f"[symfony-wdt] {h}")
@@ -514,8 +546,7 @@ async def phase_126_SYMFONY(
             req = urllib.request.Request(
                 h.rstrip("/") + "/app_dev.php/_profiler", headers=_extra_h, method="GET"
             )
-            status, resp_headers, body_bytes = await _async_urlopen_no_redirect(
-                _urlopen, req, timeout=10
+            status, resp_headers, body_bytes = await _async_urlopen_no_redirect(req, timeout=10
             )
             if status == 200:
                 findings.append(f"[symfony-profiler] {h} path=/app_dev.php/_profiler")
@@ -525,7 +556,7 @@ async def phase_126_SYMFONY(
         findings.append("[symfony-profiler] No findings (expected)")
     out = ensure(_out)
     out.write_text("\n".join(findings) + ("\n" if findings else ""))
-    log("ok", f"126-SYMFONY: {len(findings)} findings → {out}")
+    log("OK", f"126-SYMFONY: {len(findings)} findings → {out}")
     return {"126-SYMFONY": str(out), "count": len(findings)}
 
 
@@ -542,13 +573,13 @@ async def phase_131_ENVDEEP(
     _out = outdir / "env_files_found.txt"
     if _out.exists() and not force:
         return {"131-ENVDEEP": str(_out), "count": count_nonblank(_out)}
-    log("info", "Phase 131-ENVDEEP: Deep Env File Scanning")
+    log("INFO", "Phase 131-ENVDEEP: Deep Env File Scanning")
     findings: List[str] = []
     _urlopen = _get_urlopener()
     _extra_h = _extra_headers_dict()
     hosts = _load_live_hosts(outdir)
     if not hosts:
-        log("warn", "131-ENVDEEP: no live hosts; skipping")
+        log("WARNING", "131-ENVDEEP: no live hosts; skipping")
         return {"131-ENVDEEP": str(_out), "count": 0}
     env_paths = [
         "/.env",
@@ -617,7 +648,7 @@ async def phase_131_ENVDEEP(
         findings.append("[env-file] No findings (expected)")
     out = ensure(_out)
     out.write_text("\n".join(findings) + ("\n" if findings else ""))
-    log("ok", f"131-ENVDEEP: {len(findings)} findings \u2192 {out}")
+    log("OK", f"131-ENVDEEP: {len(findings)} findings \u2192 {out}")
     return {"131-ENVDEEP": str(out), "count": len(findings)}
 
 
@@ -634,7 +665,7 @@ async def phase_132_GQLABUSE(
     _out = outdir / "graphql_abuse.txt"
     if _out.exists() and not force:
         return {"132-GQLABUSE": str(_out), "count": count_nonblank(_out)}
-    log("info", "Phase 132-GQLABUSE: GraphQL batching & DoS testing")
+    log("INFO", "Phase 132-GQLABUSE: GraphQL batching & DoS testing")
     findings: List[str] = []
     _urlopen = _get_urlopener()
     _extra_h = _extra_headers_dict()
@@ -649,18 +680,27 @@ async def phase_132_GQLABUSE(
             line = line.strip()
             if not line:
                 continue
-            if line.lower().startswith("http"):
-                gql_endpoints.append(line.split()[0])
+            if line.startswith("  "):
+                continue
+            parts = line.split()
+            url_token = parts[1] if len(parts) >= 2 else ""
+            if url_token.startswith("http"):
+                gql_endpoints.append(url_token)
+            elif line.startswith("http"):
+                gql_endpoints.append(parts[0])
     if not gql_endpoints:
         for h in hosts:
             h = h.strip()
             if not h:
                 continue
-            gql_endpoints.append(f"https://{h}/graphql")
-            gql_endpoints.append(f"http://{h}/graphql")
+            host = _extract_host(h)
+            if not host:
+                continue
+            gql_endpoints.append(f"https://{host}/graphql")
+            gql_endpoints.append(f"http://{host}/graphql")
 
     if not gql_endpoints:
-        log("warn", "132-GQLABUSE: no GraphQL endpoints found; skipping")
+        log("WARNING", "132-GQLABUSE: no GraphQL endpoints found; skipping")
         return {"132-GQLABUSE": str(_out), "count": 0}
 
     sample = int(getattr(_PIPELINE_CFG, "sample_hosts_gqlabuse", 10))
@@ -1069,5 +1109,5 @@ async def phase_132_GQLABUSE(
 
     out = ensure(_out)
     out.write_text("\n".join(findings) + ("\n" if findings else ""))
-    log("ok", f"132-GQLABUSE: {len(findings)} findings → {out}")
+    log("OK", f"132-GQLABUSE: {len(findings)} findings → {out}")
     return {"132-GQLABUSE": str(out), "count": len(findings)}

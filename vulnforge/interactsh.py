@@ -165,13 +165,13 @@ class Interactsh:
             self._httpd.server_activate()
             self._http_thread = threading.Thread(target=self._httpd.serve_forever, daemon=True)
             self._http_thread.start()
-            log("info", f"OOB webhook listening on port {self._webhook_port} (token required)")
+            log("INFO", f"OOB webhook listening on port {self._webhook_port} (token required)")
             return self._webhook_port
         except (OSError, socket.error) as e:
             if sock is not None:
                 with contextlib.suppress(OSError):
                     sock.close()
-            log("warn", f"OOB webhook start failed: {e}")
+            log("WARNING", f"OOB webhook start failed: {e}")
             return None
 
     def stop_webhook(self) -> None:
@@ -201,7 +201,7 @@ class Interactsh:
 
     async def start(self) -> bool:
         if not self.available:
-            log("warn", "interactsh-client not found; OOB phase will be empty")
+            log("WARNING", "interactsh-client not found; OOB phase will be empty")
             return False
         token = os.environ.get("INTERACTSH_TOKEN")
         ensure(self.log)
@@ -242,7 +242,7 @@ class Interactsh:
                 self._log_fh = None
             return False
         except Exception as e:
-            log("err", f"interactsh start failed: {e}")
+            log("ERROR", f"interactsh start failed: {e}")
             self._kill_proc()
             return False
         deadline = time.monotonic() + 90
@@ -256,10 +256,10 @@ class Interactsh:
                             _tail = raw.decode("utf-8", errors="replace")[-2000:]
                     except OSError:
                         pass
-                    log("warn", f"interactsh-client exited prematurely (rc={self.proc.returncode})")
+                    log("WARNING", f"interactsh-client exited prematurely (rc={self.proc.returncode})")
                     if _tail.strip():
                         for _ln in _tail.strip().splitlines()[-10:]:
-                            log("warn", f"  interactsh: {_ln}")
+                            log("WARNING", f"  interactsh: {_ln}")
                     return False
                 try:
                     with self.log.open("rb") as fh:
@@ -273,19 +273,19 @@ class Interactsh:
                         cand = clean.split(":", 1)[1].strip()
                         if cand and "." in cand and " " not in cand:
                             self.domain = cand
-                            log("ok", f"interactsh domain: {self.domain}")
+                            log("OK", f"interactsh domain: {self.domain}")
                             return True
                     if re.search(r"[a-zA-Z0-9-]+\.oast\.[a-z]+", clean):
                         cand = clean.split()[-1].strip()
                         if cand and "." in cand and " " not in cand:
                             self.domain = cand
-                            log("ok", f"interactsh domain: {self.domain}")
+                            log("OK", f"interactsh domain: {self.domain}")
                             return True
                 await asyncio.sleep(1)
         except Exception:
             self._kill_proc()
             raise
-        log("warn", "interactsh did not announce a domain in time")
+        log("WARNING", "interactsh did not announce a domain in time")
         self._kill_proc()
         return False
 

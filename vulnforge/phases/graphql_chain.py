@@ -4,7 +4,6 @@ import asyncio
 import json
 import re
 import shlex
-import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import datetime
@@ -94,7 +93,7 @@ async def phase_20_GRAPHQL(
     _o_out = outdir / "graphql_introspection.txt"
     if _o_out.exists() and not force:
         return {"20-GRAPHQL": str(_o_out), "count": count_nonblank(_o_out)}
-    log("info", "Phase 20-GRAPHQL: GraphQL introspection")
+    log("INFO", "Phase 20-GRAPHQL: GraphQL introspection")
     findings: List[str] = []
     _o_urlopen = _get_urlopener()
     # Collect HTTP targets
@@ -112,7 +111,7 @@ async def phase_20_GRAPHQL(
     # Normalize all targets to HTTPS to avoid 308 redirects
     targets = [re.sub(r"^http://", "https://", t) for t in targets]
     if not targets:
-        log("warn", "Phase 20-GRAPHQL: no HTTP targets; skipping")
+        log("WARNING", "Phase 20-GRAPHQL: no HTTP targets; skipping")
         return {"20-GRAPHQL": str(_o_out), "count": 0}
 
     # ── Smart pre-check: probe all target×endpoint combos in parallel ──
@@ -133,7 +132,7 @@ async def phase_20_GRAPHQL(
 
     _live_gql = await _alive_gql_endpoints()
     if _live_gql:
-        log("ok", f"20-GRAPHQL: {len(_live_gql)} responsive GraphQL endpoint(s) found")
+        log("OK", f"20-GRAPHQL: {len(_live_gql)} responsive GraphQL endpoint(s) found")
         for u in _live_gql:
             findings.append(f"[alive] {u}")
 
@@ -224,41 +223,32 @@ async def phase_20_GRAPHQL(
                         "User-Agent": "Mozilla/5.0",
                     },
                 )
-                _, _, gql_body_bytes = await _async_urlopen(_gql_no_redirect, req, timeout=15)
+                status, gql_headers, gql_body_bytes = await _async_urlopen(
+                    _gql_no_redirect, req, timeout=15
+                )
                 body = gql_body_bytes.decode("utf-8", errors="ignore")
                 live_endpoint = test_url
-                if '"data"' in body and "__schema" in body:
-                    results.append(f"[introspection-enabled] {test_url}")
-                    # Extract schema summary
+                if status == 200 and "application/json" in (gql_headers or {}).get(
+                    "Content-Type", ""
+                ):
                     try:
                         data = json.loads(body)
-                        schema = data.get("data", {}).get("__schema", {})
-                        qtype = schema.get("queryType", {}).get("name", "?")
-                        mtype = schema.get("mutationType", {}).get("name", "none")
-                        stype = schema.get("subscriptionType", {}).get("name", "none")
-                        results.append(f"  query={qtype} mutation={mtype} subscription={stype}")
-                        types = schema.get("types", [])
-                        field_count = sum(
-                            len(t.get("fields") or []) for t in types if isinstance(t, dict)
-                        )
-                        results.append(f"  types={len(types)} fields={field_count}")
+                        schema = (data.get("data") or {}).get("__schema")
+                        if isinstance(schema, dict) and schema:
+                            results.append(f"[introspection-enabled] {test_url}")
+                            # Extract schema summary
+                            qtype = schema.get("queryType", {}).get("name", "?")
+                            mtype = schema.get("mutationType", {}).get("name", "none")
+                            stype = schema.get("subscriptionType", {}).get("name", "none")
+                            results.append(f"  query={qtype} mutation={mtype} subscription={stype}")
+                            types = schema.get("types", [])
+                            field_count = sum(
+                                len(t.get("fields") or []) for t in types if isinstance(t, dict)
+                            )
+                            results.append(f"  types={len(types)} fields={field_count}")
+                            break
                     except json.JSONDecodeError:
                         pass
-                    break
-            except urllib.error.HTTPError as e:
-                try:
-                    body_bytes = await asyncio.to_thread(e.read)
-                    body = body_bytes.decode("utf-8", errors="ignore")
-                    live_endpoint = test_url
-                    if '"data"' in body and "__schema" in body:
-                        results.append(
-                            f"[introspection-enabled (error)] {test_url} (HTTP {e.code})"
-                        )
-                        break
-                except asyncio.CancelledError:
-                    raise
-                except Exception:
-                    pass
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -744,7 +734,7 @@ async def phase_20_GRAPHQL(
 
     out = ensure(_o_out)
     out.write_text("\n".join(findings) + ("\n" if findings else ""))
-    log("ok", f"Phase 20-GRAPHQL: {len(findings)} GraphQL findings → {out}")
+    log("OK", f"Phase 20-GRAPHQL: {len(findings)} GraphQL findings → {out}")
     return {"20-GRAPHQL": str(out), "count": len(findings)}
 
 
@@ -761,7 +751,7 @@ async def phase_44_CHAIN(
     _out = outdir / "chain_correlation.txt"
     if _out.exists() and not force:
         return {"44-CHAIN": str(_out), "count": count_nonblank(_out)}
-    log("info", "Phase 44-CHAIN: cross-reference findings across phases")
+    log("INFO", "Phase 44-CHAIN: cross-reference findings across phases")
     findings: List[str] = []
     # 1. Test secrets from 15-SECRETS as credentials against auth endpoints from 05-HARVEST
     secrets_file = outdir / "secrets.txt"
@@ -802,6 +792,14 @@ async def phase_44_CHAIN(
             for endpoint in auth_endpoints[: _PIPELINE_CFG.sample_endpoints_l]:
                 await _throttle_rate()
                 try:
+                    # Baseline: same request without the secret
+                    base_req = urllib.request.Request(
+                        endpoint,
+                        method="GET",
+                        headers={"User-Agent": "Mozilla/5.0", **_ch_extra_headers},
+                    )
+                    bs, _, b_body = await _async_urlopen(_ch_urlopen, base_req, timeout=10)
+                    b_text = b_body.decode("utf-8", errors="ignore")
                     # Try the secret as a bearer token
                     req = urllib.request.Request(
                         endpoint,
@@ -812,10 +810,11 @@ async def phase_44_CHAIN(
                             **_ch_extra_headers,
                         },
                     )
-                    s, _, _ = await _async_urlopen(_ch_urlopen, req, timeout=10)
-                    if s == 200:
+                    s, _, body = await _async_urlopen(_ch_urlopen, req, timeout=10)
+                    text = body.decode("utf-8", errors="ignore")
+                    if s != bs or text != b_text:
                         findings.append(
-                            f"[credential-hit] Bearer {secret[:60]}... → HTTP 200 on {endpoint}"
+                            f"[credential-hit] Bearer {secret[:60]}... → HTTP {s} (baseline {bs}) on {endpoint} (response differs from unauthenticated baseline)"
                         )
                     # Also try as form-encoded credential
                     data = urllib.parse.urlencode(
@@ -896,7 +895,7 @@ async def phase_44_CHAIN(
         findings.append("[result] No cross-phase correlations identified")
     out = ensure(_out)
     out.write_text("\n".join(findings) + ("\n" if findings else ""))
-    log("ok", f"44-CHAIN: {len(findings)} correlations → {out}")
+    log("OK", f"44-CHAIN: {len(findings)} correlations → {out}")
     return {"44-CHAIN": str(_out), "count": len(findings)}
 
 
@@ -1150,7 +1149,7 @@ async def phase_45_EVIDENCE(
     _out = outdir / "evidence.txt"
     if _out.exists() and not force:
         return {"45-EVIDENCE": str(_out), "count": count_nonblank(_out)}
-    log("info", "Phase 45-EVIDENCE: capture evidence and generate structured PoCs")
+    log("INFO", "Phase 45-EVIDENCE: capture evidence and generate structured PoCs")
     findings: List[str] = []
     _ev_urlopen = _get_urlopener()
     _ev_extra_headers = _extra_headers_dict()
@@ -1262,5 +1261,5 @@ async def phase_45_EVIDENCE(
 
     out = ensure(_out)
     out.write_text("\n".join(findings) + ("\n" if findings else ""))
-    log("ok", f"45-EVIDENCE: {len(findings)} evidence entries, {poc_counter} PoCs → {out}")
+    log("OK", f"45-EVIDENCE: {len(findings)} evidence entries, {poc_counter} PoCs → {out}")
     return {"45-EVIDENCE": str(_out), "count": len(findings)}

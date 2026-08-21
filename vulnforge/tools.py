@@ -73,5 +73,5 @@ class Tools:
             return ok
         except (OSError, subprocess.TimeoutExpired) as e:
             self._broken[name] = True
-            log("warn", f"tool {name} verification failed: {e}")
+            log("WARNING", f"tool {name} verification failed: {e}")
             return False

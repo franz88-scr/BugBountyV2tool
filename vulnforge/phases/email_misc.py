@@ -47,7 +47,7 @@ async def phase_59_EMAIL_SEC(
     _out = outdir / "email_security.txt"
     if _out.exists() and not force:
         return {"59-EMAIL-SEC": str(_out), "count": count_nonblank(_out)}
-    log("info", "Phase 59-EMAIL-SEC: email security (SPF/DMARC/DKIM)")
+    log("INFO", "Phase 59-EMAIL-SEC: email security (SPF/DMARC/DKIM)")
     findings: List[str] = []
 
     async def _dns_query(record_type: str, name: str) -> List[str]:
@@ -71,10 +71,14 @@ async def phase_59_EMAIL_SEC(
                 results = []
                 for ln in text.splitlines():
                     ln = ln.strip()
-                    if "canonical name" in ln.lower() or "name =" in ln.lower():
+                    if (
+                        "canonical name" in ln.lower()
+                        or "name =" in ln.lower()
+                        or "text =" in ln.lower()
+                    ):
                         parts = ln.split("=")
                         if len(parts) > 1:
-                            results.append(parts[-1].strip().rstrip("."))
+                            results.append(parts[-1].strip().strip('"').rstrip("."))
                 return results
         except Exception:
             pass
@@ -141,7 +145,7 @@ async def phase_59_EMAIL_SEC(
         findings.append(f"[email-sec] {domain} — email security posture assessed")
     out = ensure(_out)
     out.write_text("\n".join(findings) + ("\n" if findings else ""))
-    log("ok", f"59-EMAIL-SEC: {len(findings)} email security findings → {out}")
+    log("OK", f"59-EMAIL-SEC: {len(findings)} email security findings → {out}")
     return {"59-EMAIL-SEC": str(out), "count": len(findings)}
 
 
@@ -173,7 +177,7 @@ async def phase_60_SMTP_ENUM(
     _out = outdir / "smtp_enumeration.txt"
     if _out.exists() and not force:
         return {"60-SMTP-ENUM": str(_out), "count": count_nonblank(_out)}
-    log("info", "Phase 60-SMTP-ENUM: SMTP enumeration & abuse testing")
+    log("INFO", "Phase 60-SMTP-ENUM: SMTP enumeration & abuse testing")
     findings: List[str] = []
     hosts_file = outdir / "hosts.txt"
     hosts = read_lines(hosts_file) if hosts_file.exists() else []
@@ -230,7 +234,7 @@ async def phase_60_SMTP_ENUM(
         findings.append("[smtp-enum] No open SMTP services detected")
     out = ensure(_out)
     out.write_text("\n".join(findings) + ("\n" if findings else ""))
-    log("ok", f"60-SMTP-ENUM: {len(findings)} SMTP findings → {out}")
+    log("OK", f"60-SMTP-ENUM: {len(findings)} SMTP findings → {out}")
     return {"60-SMTP-ENUM": str(out), "count": len(findings)}
 
 
@@ -259,14 +263,14 @@ async def phase_62_LOG_INJECT(
     _out = outdir / "log_injection.txt"
     if _out.exists() and not force:
         return {"62-LOG-INJECT": str(_out), "count": count_nonblank(_out)}
-    log("info", "Phase 62-LOG-INJECT: log injection / log forging detection")
+    log("INFO", "Phase 62-LOG-INJECT: log injection / log forging detection")
     findings: List[str] = []
     _l_urlopen = _get_urlopener()
     _l_extra_headers = _extra_headers_dict()
     urls = outdir / "urls_all.txt"
     all_urls = read_lines(urls) if urls.exists() else []
     if not all_urls:
-        log("warn", "62-LOG-INJECT: no URLs; skipping")
+        log("WARNING", "62-LOG-INJECT: no URLs; skipping")
         return {"62-LOG-INJECT": str(_out), "count": 0}
     log_params = {"log", "debug", "trace", "level", "logging", "loglevel", "verbose", "v", "output"}
     log_headers = ["X-Forwarded-For", "X-Real-IP", "X-Forwarded-Host", "Referer", "User-Agent"]
@@ -327,7 +331,7 @@ async def phase_62_LOG_INJECT(
         findings.append("[log-inject] No log injection vectors detected")
     out = ensure(_out)
     out.write_text("\n".join(findings) + ("\n" if findings else ""))
-    log("ok", f"62-LOG-INJECT: {len(findings)} log injection findings → {out}")
+    log("OK", f"62-LOG-INJECT: {len(findings)} log injection findings → {out}")
     return {"62-LOG-INJECT": str(out), "count": len(findings)}
 
 
@@ -381,14 +385,14 @@ async def phase_63_DOC_ATTACK(
     _out = outdir / "document_attacks.txt"
     if _out.exists() and not force:
         return {"63-DOC-ATTACK": str(_out), "count": count_nonblank(_out)}
-    log("info", "Phase 63-DOC-ATTACK: document-based attack vector detection")
+    log("INFO", "Phase 63-DOC-ATTACK: document-based attack vector detection")
     findings: List[str] = []
     _d_urlopen = _get_urlopener()
     _d_extra_headers = _extra_headers_dict()
     hosts_file = outdir / "hosts.txt"
     hosts = read_lines(hosts_file) if hosts_file.exists() else []
     if not hosts:
-        log("warn", "63-DOC-ATTACK: no hosts; skipping")
+        log("WARNING", "63-DOC-ATTACK: no hosts; skipping")
         return {"63-DOC-ATTACK": str(_out), "count": 0}
     for host in hosts[:10]:
         host_clean = _extract_host(host)
@@ -455,12 +459,11 @@ async def phase_63_DOC_ATTACK(
                             continue
                 except Exception:
                     continue
-            break
     if not findings:
         findings.append("[doc-attack] No document-based attack vectors detected")
     out = ensure(_out)
     out.write_text("\n".join(findings) + ("\n" if findings else ""))
-    log("ok", f"63-DOC-ATTACK: {len(findings)} document attack findings → {out}")
+    log("OK", f"63-DOC-ATTACK: {len(findings)} document attack findings → {out}")
     return {"63-DOC-ATTACK": str(out), "count": len(findings)}
 
 
@@ -487,7 +490,7 @@ async def phase_64_IDEMPOTENCY(
     _out = outdir / "idempotency.txt"
     if _out.exists() and not force:
         return {"64-IDEMPOTENCY": str(_out), "count": count_nonblank(_out)}
-    log("info", "Phase 64-IDEMPOTENCY: idempotency key replay testing")
+    log("INFO", "Phase 64-IDEMPOTENCY: idempotency key replay testing")
     findings: List[str] = []
     _id_urlopen = _get_urlopener()
     _id_extra_headers = _extra_headers_dict()
@@ -531,7 +534,7 @@ async def phase_64_IDEMPOTENCY(
         findings.append("[idempotency] No API endpoints found for replay testing")
         out = ensure(_out)
         out.write_text("\n".join(findings) + ("\n" if findings else ""))
-        log("ok", f"64-IDEMPOTENCY: {len(findings)} findings → {out}")
+        log("OK", f"64-IDEMPOTENCY: {len(findings)} findings → {out}")
         return {"64-IDEMPOTENCY": str(out), "count": len(findings)}
 
     for endpoint in targets:
@@ -601,7 +604,7 @@ async def phase_64_IDEMPOTENCY(
         findings.append("[idempotency] No idempotency-key endpoints detected (expected)")
     out = ensure(_out)
     out.write_text("\n".join(findings) + ("\n" if findings else ""))
-    log("ok", f"64-IDEMPOTENCY: {len(findings)} findings → {out}")
+    log("OK", f"64-IDEMPOTENCY: {len(findings)} findings → {out}")
     return {"64-IDEMPOTENCY": str(out), "count": len(findings)}
 
 
@@ -638,7 +641,7 @@ async def phase_67_PATHNORM(
     _out = outdir / "path_normalization.txt"
     if _out.exists() and not force:
         return {"67-PATHNORM": str(_out), "count": count_nonblank(_out)}
-    log("info", "Phase 67-PATHNORM: path normalization / traversal")
+    log("INFO", "Phase 67-PATHNORM: path normalization / traversal")
     findings: List[str] = []
     _pn_urlopen = _get_urlopener()
     _pn_extra = _extra_headers_dict()
@@ -691,7 +694,7 @@ async def phase_67_PATHNORM(
         findings.append("[pathnorm] No path normalization issues detected")
     out = ensure(_out)
     out.write_text("\n".join(findings) + ("\n" if findings else ""))
-    log("ok", f"67-PATHNORM: {len(findings)} findings → {out}")
+    log("OK", f"67-PATHNORM: {len(findings)} findings → {out}")
     return {"67-PATHNORM": str(_out), "count": len(findings)}
 
 
@@ -711,7 +714,7 @@ async def phase_71_EMHARVEST(
     _out = outdir / "emails_harvested.txt"
     if _out.exists() and not force:
         return {"71-EMHARVEST": str(_out), "count": count_nonblank(_out)}
-    log("info", "Phase 71-EMHARVEST: email harvesting from URLs content")
+    log("INFO", "Phase 71-EMHARVEST: email harvesting from URLs content")
     findings: List[str] = []
     _eh_urlopen = _get_urlopener()
     _eh_extra = _extra_headers_dict()
@@ -743,7 +746,7 @@ async def phase_71_EMHARVEST(
         findings.append("[emails] No email addresses found in scanned content")
     out = ensure(_out)
     out.write_text("\n".join(findings) + ("\n" if findings else ""))
-    log("ok", f"71-EMHARVEST: {len(findings)} findings → {out}")
+    log("OK", f"71-EMHARVEST: {len(findings)} findings → {out}")
     return {"71-EMHARVEST": str(_out), "count": len(findings)}
 
 
@@ -762,13 +765,13 @@ async def phase_72_ACCOUNTENUM(
     _out = outdir / "account_enum.txt"
     if _out.exists() and not force:
         return {"72-ACCOUNTENUM": str(_out), "count": count_nonblank(_out)}
-    log("info", "Phase 72-ACCOUNTENUM: account enumeration detection")
+    log("INFO", "Phase 72-ACCOUNTENUM: account enumeration detection")
     findings: List[str] = []
     _ae_urlopen = _get_urlopener()
     _ae_headers = _extra_headers_dict()
     targets_file = outdir / "host_targets.txt"
     if not targets_file.exists() or not read_lines(targets_file):
-        log("warn", "72-ACCOUNTENUM: no host targets; skipping")
+        log("WARNING", "72-ACCOUNTENUM: no host targets; skipping")
         return {"72-ACCOUNTENUM": str(_out), "count": 0}
     enum_paths = [
         ("/login", "POST", {"username": "nonexistent_user_12345", "password": "wrongpass"}),
@@ -814,7 +817,7 @@ async def phase_72_ACCOUNTENUM(
                     findings.append(f"[error] {method} {url} → {e}")
     out = ensure(_out)
     out.write_text("\n".join(findings) + ("\n" if findings else ""))
-    log("ok", f"72-ACCOUNTENUM: {len(findings)} probes → {out}")
+    log("OK", f"72-ACCOUNTENUM: {len(findings)} probes → {out}")
     return {"72-ACCOUNTENUM": str(_out), "count": len(findings)}
 
 
@@ -831,7 +834,7 @@ async def phase_74_GHTOOLS(
     _out = outdir / "github_dorking.txt"
     if _out.exists() and not force:
         return {"74-GHTOOLS": str(_out), "count": count_nonblank(_out)}
-    log("info", "Phase 74-GHTOOLS: GitHub dorking + supply chain scanning")
+    log("INFO", "Phase 74-GHTOOLS: GitHub dorking + supply chain scanning")
     findings: List[str] = []
     org = domain.split(".")[0] if "." in domain else domain
     gh_dorks = [
@@ -894,7 +897,7 @@ async def phase_74_GHTOOLS(
     findings.append("[note] Run 'npm audit' on any found package.json or yarn.lock")
     out = ensure(_out)
     out.write_text("\n".join(findings) + ("\n" if findings else ""))
-    log("ok", f"74-GHTOOLS: {len(findings)} dorking findings → {out}")
+    log("OK", f"74-GHTOOLS: {len(findings)} dorking findings → {out}")
     return {"74-GHTOOLS": str(_out), "count": len(findings)}
 
 
@@ -912,7 +915,7 @@ async def phase_75_MOBILEAPI(
     _out = outdir / "mobile_api.txt"
     if _out.exists() and not force:
         return {"75-MOBILEAPI": str(_out), "count": count_nonblank(_out)}
-    log("info", "Phase 75-MOBILEAPI: Firebase/mobile API surface scanning")
+    log("INFO", "Phase 75-MOBILEAPI: Firebase/mobile API surface scanning")
     findings: List[str] = []
     _mb_urlopen = _get_urlopener()
     _mb_headers = _extra_headers_dict()
@@ -978,8 +981,23 @@ async def phase_75_MOBILEAPI(
                     break
     out = ensure(_out)
     out.write_text("\n".join(findings) + ("\n" if findings else ""))
-    log("ok", f"75-MOBILEAPI: {len(findings)} mobile findings → {out}")
+    log("OK", f"75-MOBILEAPI: {len(findings)} mobile findings → {out}")
     return {"75-MOBILEAPI": str(_out), "count": len(findings)}
+
+
+def _workflow_verdict(
+    baseline_status: int,
+    baseline_body: bytes,
+    method_status: int,
+    method_body: bytes,
+) -> str:
+    if method_status not in (200, 201, 202, 204):
+        return ""
+    if baseline_status not in (200, 201, 202, 204):
+        return "bypass"
+    if method_body != baseline_body:
+        return "bypass"
+    return "info"
 
 
 async def phase_76_WORKFLOW(
@@ -995,13 +1013,13 @@ async def phase_76_WORKFLOW(
     _out = outdir / "workflow_bypass.txt"
     if _out.exists() and not force:
         return {"76-WORKFLOW": str(_out), "count": count_nonblank(_out)}
-    log("info", "Phase 76-WORKFLOW: multi-step workflow bypass detection")
+    log("INFO", "Phase 76-WORKFLOW: multi-step workflow bypass detection")
     findings: List[str] = []
     _wf_urlopen = _get_urlopener()
     _wf_headers = _extra_headers_dict()
     urls_file = outdir / "urls_all.txt"
     if not urls_file.exists() or not read_lines(urls_file):
-        log("warn", "76-WORKFLOW: no URLs; skipping")
+        log("WARNING", "76-WORKFLOW: no URLs; skipping")
         return {"76-WORKFLOW": str(_out), "count": 0}
     # Identify potential workflow endpoints (checkout, order, payment, submit, etc.)
     workflow_keywords = {
@@ -1041,31 +1059,56 @@ async def phase_76_WORKFLOW(
         base = u if u.startswith("http") else f"https://{u}"
         async with _wf_sem:
             await _throttle_rate()
+            statuses: Dict[str, int] = {}
+            bodies: Dict[str, bytes] = {}
             for method in ("GET", "POST", "PUT", "PATCH", "DELETE"):
                 try:
                     req = urllib.request.Request(
                         base, method=method, headers={"User-Agent": "Mozilla/5.0", **_wf_headers}
                     )
-                    status, _, _ = await _async_urlopen(_wf_urlopen, req, timeout=10)
-                    if status in (200, 201, 202, 204):
-                        findings.append(
-                            f"[bypass] {method} {base} → HTTP {status} (may skip workflow)"
-                        )
+                    status, _, body = await _async_urlopen(_wf_urlopen, req, timeout=10)
+                    statuses[method] = status
+                    bodies[method] = body
                 except urllib.error.HTTPError as e:
-                    if e.code in (401, 403):
-                        pass
-                    elif e.code in (405, 501):
-                        findings.append(
-                            f"[expected] {method} {base} → HTTP {e.code} (method not allowed)"
-                        )
-                    else:
-                        findings.append(f"[probed] {method} {base} → HTTP {e.code}")
+                    statuses[method] = e.code
+                    bodies[method] = b""
                 except Exception:
+                    statuses[method] = 0
+                    bodies[method] = b""
+            baseline_status = statuses.get("GET", 0)
+            baseline_body = bodies.get("GET", b"")
+            for method in ("POST", "PUT", "PATCH", "DELETE"):
+                s = statuses.get(method, 0)
+                verdict = _workflow_verdict(
+                    baseline_status, baseline_body, s, bodies.get(method, b"")
+                )
+                if verdict == "bypass":
+                    findings.append(
+                        f"[bypass] {method} {base} → HTTP {s} (response differs from GET baseline)"
+                    )
+                elif verdict == "info":
+                    findings.append(
+                        f"[workflow-info] {method} {base} → HTTP {s} (same as GET baseline; no bypass)"
+                    )
+                elif s in (401, 403):
                     pass
+                elif s in (405, 501):
+                    findings.append(f"[expected] {method} {base} → HTTP {s} (method not allowed)")
+                elif s != 0:
+                    findings.append(f"[probed] {method} {base} → HTTP {s}")
+            if baseline_status in (200, 201, 202, 204):
+                findings.append(f"[workflow-info] GET {base} → HTTP {baseline_status} (baseline)")
     out = ensure(_out)
     out.write_text("\n".join(findings) + ("\n" if findings else ""))
-    log("ok", f"76-WORKFLOW: {len(findings)} workflow findings → {out}")
+    log("OK", f"76-WORKFLOW: {len(findings)} workflow findings → {out}")
     return {"76-WORKFLOW": str(_out), "count": len(findings)}
+
+
+def _cache_key_persisted(test_body: bytes, clean_body: bytes) -> bool:
+    return (
+        bool(test_body)
+        and hashlib.sha256(test_body).digest() == hashlib.sha256(clean_body).digest()
+    )
 
 
 # ───────────────────── Phase 77-CACHEKEY: cache key probing ─────────────────────
@@ -1082,22 +1125,20 @@ async def phase_77_CACHEKEY(
     _out = outdir / "cache_key_probe.txt"
     if _out.exists() and not force:
         return {"77-CACHEKEY": str(_out), "count": count_nonblank(_out)}
-    log("info", "Phase 77-CACHEKEY: cache key composition probing")
+    log("INFO", "Phase 77-CACHEKEY: cache key composition probing")
     findings: List[str] = []
     _ck_urlopen = _get_urlopener()
     _ck_headers = _extra_headers_dict()
     targets_file = outdir / "host_targets.txt"
     if not targets_file.exists() or not read_lines(targets_file):
-        log("warn", "77-CACHEKEY: no targets; skipping")
+        log("WARNING", "77-CACHEKEY: no targets; skipping")
         return {"77-CACHEKEY": str(_out), "count": 0}
     _ck_sem = asyncio.Semaphore(5)
 
     def _cache_key_signature(headers: Any) -> str:
-        age = headers.get("age", "0")
-        cf_cache = headers.get("cf-cache-status", headers.get("x-cache", ""))
         etag = headers.get("etag", "")[:20]
         last_modified = headers.get("last-modified", "")[:20]
-        return f"Age={age} CF={cf_cache} ETag={etag} LM={last_modified}"
+        return f"ETag={etag} LM={last_modified}"
 
     test_headers = [
         ("X-Forwarded-Host", "evil.com"),
@@ -1139,23 +1180,32 @@ async def phase_77_CACHEKEY(
                                     **_ck_headers,
                                 },
                             )
-                            _, test_headers_resp, _ = await _async_urlopen(
+                            _, _, test_body = await _async_urlopen(
                                 _ck_urlopen, test_req, timeout=10
                             )
-                            test_sig = _cache_key_signature(test_headers_resp)
-                            if test_sig != baseline_sig:
+                            test_text = test_body.decode("utf-8", errors="ignore")
+                            if hdr_val not in test_text:
+                                continue
+                            clean_req = urllib.request.Request(
+                                url,
+                                method="GET",
+                                headers={"User-Agent": "Mozilla/5.0", **_ck_headers},
+                            )
+                            _, _, clean_body = await _async_urlopen(
+                                _ck_urlopen, clean_req, timeout=10
+                            )
+                            if _cache_key_persisted(test_body, clean_body):
                                 findings.append(
-                                    f"[cache-key-factor] {url} header={hdr_name}:{hdr_val} differs from baseline"
+                                    f"[cache-key-unkeyed] {url} header={hdr_name}:{hdr_val} — reflected and persisted in clean request (header NOT in cache key)"
                                 )
                                 findings.append(f"  baseline={baseline_sig}")
-                                findings.append(f"  test={test_sig}")
                         except Exception:
                             continue
                 except Exception:
                     continue
     out = ensure(_out)
     out.write_text("\n".join(findings) + ("\n" if findings else ""))
-    log("ok", f"77-CACHEKEY: {len(findings)} cache key findings → {out}")
+    log("OK", f"77-CACHEKEY: {len(findings)} cache key findings → {out}")
     return {"77-CACHEKEY": str(_out), "count": len(findings)}
 
 
@@ -1173,11 +1223,11 @@ async def phase_78_FILEUPLOADADV(
     _out = outdir / "file_upload_adv.txt"
     if _out.exists() and not force:
         return {"78-FILEUPLOADADV": str(_out), "count": count_nonblank(_out)}
-    log("info", "Phase 78-FILEUPLOADADV: advanced file upload polyglot + path traversal")
+    log("INFO", "Phase 78-FILEUPLOADADV: advanced file upload polyglot + path traversal")
     findings: List[str] = []
     urls_file = outdir / "urls_all.txt"
     if not urls_file.exists() or not read_lines(urls_file):
-        log("warn", "78-FILEUPLOADADV: no URLs; skipping")
+        log("WARNING", "78-FILEUPLOADADV: no URLs; skipping")
         return {"78-FILEUPLOADADV": str(_out), "count": 0}
     upload_indicators = [
         "upload",
@@ -1469,7 +1519,7 @@ async def phase_78_FILEUPLOADADV(
 
     out = ensure(_out)
     out.write_text("\n".join(findings) + ("\n" if findings else ""))
-    log("ok", f"78-FILEUPLOADADV: {len(findings)} file upload findings → {out}")
+    log("OK", f"78-FILEUPLOADADV: {len(findings)} file upload findings → {out}")
     return {"78-FILEUPLOADADV": str(_out), "count": len(findings)}
 
 
@@ -1487,7 +1537,7 @@ async def phase_81_IDORFUZZ(
     _out = outdir / "idor_fuzz.txt"
     if _out.exists() and not force:
         return {"81-IDORFUZZ": str(_out), "count": count_nonblank(_out)}
-    log("info", "Phase 81-IDORFUZZ: cross-session IDOR diffing")
+    log("INFO", "Phase 81-IDORFUZZ: cross-session IDOR diffing")
     findings: List[str] = []
     from vulnforge.pipeline import _CREDENTIAL_LOCK, _CREDENTIAL_STORE
 
@@ -1501,11 +1551,11 @@ async def phase_81_IDORFUZZ(
         _id_cookie_b = _CREDENTIAL_STORE.get("COOKIE_B", "")
     cookie_b = (getattr(cfg, "idor_session_b", "") or "") or _id_cookie_b
     if not cookie_a and not cookie_b:
-        log("warn", "81-IDORFUZZ: set COOKIE_A and COOKIE_B env vars for cross-session diffing")
-        log("info", "81-IDORFUZZ: running in single-session mode (no diff)")
+        log("WARNING", "81-IDORFUZZ: set COOKIE_A and COOKIE_B env vars for cross-session diffing")
+        log("INFO", "81-IDORFUZZ: running in single-session mode (no diff)")
     urls_file = outdir / "urls_all.txt"
     if not urls_file.exists() or not read_lines(urls_file):
-        log("warn", "81-IDORFUZZ: no URLs; skipping")
+        log("WARNING", "81-IDORFUZZ: no URLs; skipping")
         return {"81-IDORFUZZ": str(_out), "count": 0}
     idor_sensitive_params = [
         "id",
@@ -1662,5 +1712,5 @@ async def phase_81_IDORFUZZ(
 
     out = ensure(_out)
     out.write_text("\n".join(findings) + ("\n" if findings else ""))
-    log("ok", f"81-IDORFUZZ: {len(findings)} IDOR probes → {out}")
+    log("OK", f"81-IDORFUZZ: {len(findings)} IDOR probes → {out}")
     return {"81-IDORFUZZ": str(_out), "count": len(findings)}

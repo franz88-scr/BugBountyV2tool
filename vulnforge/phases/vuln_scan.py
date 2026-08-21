@@ -44,7 +44,7 @@ async def phase_09_VULNSCAN(
     _f1_out = outdir / "nuclei_combined.txt"
     if _f1_out.exists() and not force:
         return {"09-VULNSCAN": str(_f1_out), "count": count_nonblank(_f1_out)}
-    log("info", "Phase 09-VULNSCAN: nuclei (full) + tech-scanner (sequential)")
+    log("INFO", "Phase 09-VULNSCAN: nuclei (full) + tech-scanner (sequential)")
     hosts = outdir / "host_targets.txt"
     if not hosts.exists() or not read_lines(hosts):
         raw_hosts = outdir / "hosts.txt"
@@ -53,7 +53,7 @@ async def phase_09_VULNSCAN(
     if not hosts.exists() or not read_lines(hosts):
         hosts = outdir / "resolved.txt"
     if not hosts.exists() or not read_lines(hosts):
-        log("warn", "09-VULNSCAN: no hosts; skipping")
+        log("WARNING", "09-VULNSCAN: no hosts; skipping")
         return {"09-VULNSCAN": str(outdir / "nuclei_combined.txt"), "count": 0}
     _proxy_opt = []
     if _PIPELINE_CFG.proxy:
@@ -145,7 +145,7 @@ async def phase_09_VULNSCAN(
                 outdir,
             )
         else:
-            log("info", "nuclei-headless: no Chrome/Chromium found; skipping")
+            log("INFO", "nuclei-headless: no Chrome/Chromium found; skipping")
     n = merge_unique(
         [outdir / "nuclei.txt", outdir / "nuclei_headless.txt", outdir / "tech.txt"],
         outdir / "nuclei_combined.txt",
@@ -185,7 +185,7 @@ async def phase_10_TLSCMS(
     _f2_out = outdir / "tls_wp.txt"
     if _f2_out.exists() and not force:
         return {"10-TLSCMS": str(_f2_out), "count": count_nonblank(_f2_out)}
-    log("info", "Phase 10-TLSCMS: testssl + wpscan")
+    log("INFO", "Phase 10-TLSCMS: testssl + wpscan")
     hosts = outdir / "host_targets.txt"
     if not hosts.exists() or not read_lines(hosts):
         raw_hosts = outdir / "hosts.txt"
@@ -194,7 +194,7 @@ async def phase_10_TLSCMS(
     if not hosts.exists() or not read_lines(hosts):
         hosts = outdir / "resolved.txt"
     if not hosts.exists() or not read_lines(hosts):
-        log("warn", "10-TLSCMS: no hosts; skipping")
+        log("WARNING", "10-TLSCMS: no hosts; skipping")
         return {"10-TLSCMS": str(outdir / "tls_wp.txt"), "count": 0}
     sample = read_lines(hosts)[: _PIPELINE_CFG.sample_hosts_ssl]
     testssl_bin = "testssl.sh" if t.has("testssl.sh") else ("testssl" if t.has("testssl") else None)
@@ -247,7 +247,7 @@ async def phase_10_TLSCMS(
                     _srv = _resp.headers.get("Server", "")
                     if "cloudflare" in _srv.lower() or "cf-ray" in _resp.headers:
                         _cf_skip.add(h)
-                        log("info", f"10-TLSCMS: {h} is behind Cloudflare; skipping testssl")
+                        log("INFO", f"10-TLSCMS: {h} is behind Cloudflare; skipping testssl")
                 finally:
                     _resp.close()
             except asyncio.CancelledError:
@@ -426,13 +426,13 @@ async def phase_13_OOB(
     _h_out = outdir / "oast" / "callbacks.txt"
     if _h_out.exists() and not force:
         return {"13-OOB": str(_h_out), "count": count_nonblank(_h_out)}
-    log("info", "Phase 13-OOB: OAST callback collection")
+    log("INFO", "Phase 13-OOB: OAST callback collection")
     out = oast.stop()
     n = count_nonblank(out)
     if n:
-        log("ok", f"13-OOB: {n} OOB callback(s) captured")
+        log("OK", f"13-OOB: {n} OOB callback(s) captured")
     else:
-        log("info", "13-OOB: no OOB callbacks captured")
+        log("INFO", "13-OOB: no OOB callbacks captured")
     return {"13-OOB": str(out), "count": n}
 
 
@@ -448,7 +448,7 @@ async def phase_68_DEPCVE(
     _out = outdir / "dep_cve.txt"
     if _out.exists() and not force:
         return {"68-DEPCVE": str(_out), "count": count_nonblank(_out)}
-    log("info", "Phase 68-DEPCVE: dependency CVE scanning")
+    log("INFO", "Phase 68-DEPCVE: dependency CVE scanning")
     findings: List[str] = []
     js_urls = outdir / "urls_js.txt"
     urls_all = outdir / "urls_all.txt"
@@ -477,9 +477,7 @@ async def phase_68_DEPCVE(
                     else:
                         ver_offset = i + 2
                     ver = ""
-                    if ver_offset < len(parts) and parts[ver_offset].startswith(("@", "v")):
-                        ver = parts[ver_offset]
-                    elif ver_offset < len(parts):
+                    if ver_offset < len(parts) and re.match(r"v?\d+(\.\d+)+", parts[ver_offset]):
                         ver = parts[ver_offset]
                     if pkg and pkg not in deps_found:
                         deps_found[pkg] = ver
@@ -492,11 +490,11 @@ async def phase_68_DEPCVE(
                     deps_found[pkg] = ver
 
     known_vulns = {
-        "jquery": (">=3.0.0", "CVE-2020-11023 (XSS) fixed in 3.5.0"),
+        "jquery": (">=3.5.0", "CVE-2020-11023 (XSS) fixed in 3.5.0"),
         "lodash": (">=4.17.21", "CVE-2021-23337 (ReDoS) fixed in 4.17.21"),
         "moment": (">=2.29.4", "CVE-2022-24785 (ReDoS) fixed in 2.29.4"),
-        "express": (">=4.18.2", "CVE-2022-24999 (qs) fixed in 4.18.0"),
-        "underscore": (">=1.13.3", "CVE-2021-23358 (ReDoS) fixed in 1.13.1"),
+        "express": (">=4.18.0", "CVE-2022-24999 (qs) fixed in 4.18.0"),
+        "underscore": (">=1.13.1", "CVE-2021-23358 (ReDoS) fixed in 1.13.1"),
         "axios": (">=1.6.0", "CVE-2023-45857 (SSRF) fixed in 1.6.0"),
     }
 
@@ -546,13 +544,13 @@ async def phase_68_DEPCVE(
             300,
             outdir,
         )
-        # If trivy failed (e.g. DB download 403), retry with --skip-db
+        # If trivy failed (e.g. DB download 403), retry with --skip-db-update
         if not (trivy_out.exists() and read_lines(trivy_out)):
-            log("info", "68-DEPCVE: trivy DB unavailable, retrying with --skip-db")
+            log("INFO", "68-DEPCVE: trivy DB unavailable, retrying with --skip-db-update")
             trivy_out.unlink(missing_ok=True)
             await _run(
                 "trivy-check",
-                trivy_base + ["--skip-db", "--output", str(trivy_out), str(tmp_dir)],
+                trivy_base + ["--skip-db-update", "--output", str(trivy_out), str(tmp_dir)],
                 300,
                 outdir,
             )
@@ -567,5 +565,5 @@ async def phase_68_DEPCVE(
 
     out = ensure(_out)
     out.write_text("\n".join(findings) + ("\n" if findings else ""))
-    log("ok", f"68-DEPCVE: {len(findings)} findings → {out}")
+    log("OK", f"68-DEPCVE: {len(findings)} findings → {out}")
     return {"68-DEPCVE": str(_out), "count": len(findings)}

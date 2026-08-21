@@ -111,13 +111,13 @@ def _diff_findings(before: Dict[str, Set[str]], after: Dict[str, Set[str]], outd
             diff_path = diff_dir / f"new_{fname}"
             diff_path.write_text("\n".join(sorted(added)) + "\n")
             total_new += len(added)
-            log("ok", f"diff: {len(added)} new entries in {fname}")
+            log("OK", f"diff: {len(added)} new entries in {fname}")
     if total_new:
         summary = diff_dir / "summary.txt"
         summary.write_text(f"New findings: {total_new}\n")
-        log("ok", f"diff summary: {total_new} total new findings → {diff_dir}")
+        log("OK", f"diff summary: {total_new} total new findings → {diff_dir}")
     else:
-        log("info", "diff: no new findings since last scan")
+        log("INFO", "diff: no new findings since last scan")
 
 
 def _preflight_memory_check(safe_mode: bool = False) -> None:
@@ -149,7 +149,7 @@ def _preflight_memory_check(safe_mode: bool = False) -> None:
                 f"System has only {total_ram_gb:.1f} GB RAM (minimum {min_total:.0f} GB). "
                 f"A full scan will likely freeze the VM. Aborting."
             )
-            log("err", msg)
+            log("ERROR", msg)
             raise InsufficientResourcesError(msg)
 
         if avail_gb < min_ram:
@@ -159,7 +159,7 @@ def _preflight_memory_check(safe_mode: bool = False) -> None:
                 f"Only {avail_gb:.1f} GB RAM available (minimum {min_ram:.0f} GB). "
                 f"Close other applications and retry."
             )
-            log("err", msg)
+            log("ERROR", msg)
             raise InsufficientResourcesError(msg)
 
         if swap_total_gb > 0 and swap_free_gb < min_swap:
@@ -176,7 +176,7 @@ def _preflight_memory_check(safe_mode: bool = False) -> None:
                 "Consider running with --safe for a lighter scan.",
             )
     except ImportError:
-        log("warn", "psutil not installed; skipping preflight memory check")
+        log("WARNING", "psutil not installed; skipping preflight memory check")
 
 
 async def run_pipeline(args: argparse.Namespace) -> int:
@@ -199,11 +199,11 @@ async def run_pipeline(args: argparse.Namespace) -> int:
             plugins = discover_plugins(dirs) if dirs else []
             if plugins:
                 register_plugin_to_pipeline(plugins)
-                log("info", f"Loaded {len(plugins)} plugin(s)")
+                log("INFO", f"Loaded {len(plugins)} plugin(s)")
         except asyncio.CancelledError:
             raise
         except Exception as _plug_exc:
-            log("warn", f"plugin loading failed: {_plug_exc}")
+            log("WARNING", f"plugin loading failed: {_plug_exc}")
     import vulnforge.process as _proc_mod
 
     with _proc_mod._SPAWNED_PIDS_LOCK:
@@ -223,6 +223,8 @@ async def run_pipeline(args: argparse.Namespace) -> int:
 
         raise OutputPathError(f"output path exists and is not a directory: {outdir}")
     outdir.mkdir(parents=True, exist_ok=True)
+    from vulnforge.utils import set_debug_log
+    set_debug_log(str(outdir / "debug.log"))
     # Audit logging: record scan initiation
     try:
         from vulnforge.audit import init_audit_log
@@ -242,7 +244,7 @@ async def run_pipeline(args: argparse.Namespace) -> int:
     except asyncio.CancelledError:
         raise
     except Exception as exc:
-        log("warn", f"Failed to write audit scan_init event: {exc}")
+        log("WARNING", f"Failed to write audit scan_init event: {exc}")
     for tmp in outdir.glob("*.tmp"):
         tmp.unlink(missing_ok=True)
     for tmp in outdir.glob("*.ds_tmp"):
@@ -252,7 +254,7 @@ async def run_pipeline(args: argparse.Namespace) -> int:
     _pre_scan_snapshot: Dict[str, Set[str]] = {}
     if incremental and any(outdir.glob("*.txt")):
         _pre_scan_snapshot = _snapshot_findings(outdir)
-        log("info", f"Incremental mode: captured {len(_pre_scan_snapshot)} files for diff")
+        log("INFO", f"Incremental mode: captured {len(_pre_scan_snapshot)} files for diff")
     state_path = outdir / "state.json"
     state: Dict[str, Any] = {
         "domain": args.domain,
@@ -298,9 +300,9 @@ async def run_pipeline(args: argparse.Namespace) -> int:
                         rebased[k] = str(outdir / Path(v).name)
                 saved["artifacts"] = rebased
                 state = saved
-                log("info", f"resuming from {state_path}")
+                log("INFO", f"resuming from {state_path}")
         except json.JSONDecodeError:
-            log("warn", f"{state_path} corrupt; ignoring and starting fresh")
+            log("WARNING", f"{state_path} corrupt; ignoring and starting fresh")
     state["outdir"] = str(outdir)
     t = Tools()
     scan_status = ScanStatus(args.domain, outdir)
@@ -335,7 +337,7 @@ async def run_pipeline(args: argparse.Namespace) -> int:
     # Sequential mode: force jobs=1 when --no-parallel is set
     if os.environ.get("VULNFORGE_SEQUENTIAL") == "1":
         jobs = 1
-        log("info", "Sequential mode: phases run one at a time")
+        log("INFO", "Sequential mode: phases run one at a time")
     _adaptive_enabled = getattr(args, "adaptive", True)
     _adaptive_start = getattr(args, "adaptive_start", 2)
     _adaptive_max = getattr(args, "adaptive_max", 0)
@@ -391,7 +393,7 @@ async def run_pipeline(args: argparse.Namespace) -> int:
         _PHASE_SEM = asyncio.Semaphore(jobs)
         _proc_mod._OS_PROC_SEM = AdaptiveThreadSemaphore(max_procs)
         _resmon = None
-        log("info", f"Static concurrency: {max_procs} procs, {jobs} phases")
+        log("INFO", f"Static concurrency: {max_procs} procs, {jobs} phases")
 
     cookie = getattr(args, "cookie", "")
     if not cookie:
@@ -420,7 +422,7 @@ async def run_pipeline(args: argparse.Namespace) -> int:
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            log("info", f"Tor not detected on 127.0.0.1:9050 ({exc})")
+            log("INFO", f"Tor not detected on 127.0.0.1:9050 ({exc})")
     proxy_timeout_mult = getattr(args, "proxy_timeout_multiplier", 1.5)
 
     rate_limit = getattr(args, "rate_limit", 0)
@@ -486,7 +488,7 @@ async def run_pipeline(args: argparse.Namespace) -> int:
     except asyncio.CancelledError:
         raise
     except Exception as exc:
-        log("warn", f"Failed to init tool health monitor: {exc}")
+        log("WARNING", f"Failed to init tool health monitor: {exc}")
 
     # v3.0: Target profiling (after initial recon phases run)
     _target_profile = None
@@ -500,7 +502,7 @@ async def run_pipeline(args: argparse.Namespace) -> int:
     except asyncio.CancelledError:
         raise
     except Exception as exc:
-        log("warn", f"Failed to init learning engine: {exc}")
+        log("WARNING", f"Failed to init learning engine: {exc}")
 
     _pipeline = getattr(sys.modules.get("vulnforge"), "PIPELINE", None) or _PIPELINE
     phase_map = {name: fn for name, fn, _ in _pipeline}
@@ -528,7 +530,7 @@ async def run_pipeline(args: argparse.Namespace) -> int:
             )
             _kept = [name for name in phases_to_run if name in _suggested]
             if not _kept and phases_to_run:
-                log("warn", "ML phase selection excluded all phases; running the full set")
+                log("WARNING", "ML phase selection excluded all phases; running the full set")
             else:
                 _dropped = len(phases_to_run) - len(_kept)
                 phases_to_run = _kept
@@ -540,7 +542,7 @@ async def run_pipeline(args: argparse.Namespace) -> int:
         except asyncio.CancelledError:
             raise
         except Exception as _ml_exc:
-            log("warn", f"ML phase selection failed: {_ml_exc}")
+            log("WARNING", f"ML phase selection failed: {_ml_exc}")
 
     progress = Progress(phases_to_run)
     scan_status.set_total(len(phases_to_run))
@@ -563,12 +565,12 @@ async def run_pipeline(args: argparse.Namespace) -> int:
                 lambda _e: _tui_instance.update(phase=str(_e.data.get("phase", ""))),
             )
             _tui_instance.start()
-            log("info", "TUI dashboard active (use --no-tui to disable)")
+            log("INFO", "TUI dashboard active (use --no-tui to disable)")
         except asyncio.CancelledError:
             raise
         except Exception as _tui_exc:
             _tui = None
-            log("warn", f"TUI dashboard disabled: {_tui_exc}")
+            log("WARNING", f"TUI dashboard disabled: {_tui_exc}")
     active_needs_oast = any(
         name in {"08-FUZZ", "09-VULNSCAN", "10-TLSCMS", "11-INJECT"} for name in phases_to_run
     )
@@ -608,7 +610,7 @@ async def run_pipeline(args: argparse.Namespace) -> int:
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:
-                    log("warn", f"Failed to emit finding event: {exc}")
+                    log("WARNING", f"Failed to emit finding event: {exc}")
         for m in t.missing:
             if m not in state["missing_tools"]:
                 state["missing_tools"].append(m)
@@ -718,10 +720,10 @@ async def run_pipeline(args: argparse.Namespace) -> int:
             try:
                 _phase_result = await fn(**call)  # type: ignore[operator]
             except asyncio.CancelledError:
-                log("warn", f"phase {name} cancelled")
+                log("WARNING", f"phase {name} cancelled")
                 raise
             except Exception as e:
-                log("err", f"phase {name} crashed: {e}")
+                log("ERROR", f"phase {name} crashed: {e}")
                 scan_status.add_error(str(e))
                 bus.emit("phase.fail", {"phase": name, "error": str(e)})
             finally:
@@ -742,14 +744,18 @@ async def run_pipeline(args: argparse.Namespace) -> int:
                     try:
                         for _tk, _tv in _TOOL_RC_REGISTRY.items():
                             if isinstance(_tv, int):
+                                # Only count real failures (not rc=1,2 which mean "no findings")
                                 if _tv == 0:
                                     _tool_health.record_success(_tk, elapsed)
-                                else:
+                                elif _tv not in (1, 2, None):
                                     _tool_health.record_failure(_tk, f"rc={_tv}")
+                                # rc=1,2 are treated as success (no findings) for health tracking
+                                else:
+                                    _tool_health.record_success(_tk, elapsed)
                     except asyncio.CancelledError:
                         raise
                     except Exception as exc:
-                        log("warn", f"Failed to record tool health: {exc}")
+                        log("WARNING", f"Failed to record tool health: {exc}")
                 scan_status.set_missing(state.get("missing_tools", []))
                 bus.emit(
                     "phase.complete",
@@ -779,7 +785,7 @@ async def run_pipeline(args: argparse.Namespace) -> int:
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                log("warn", f"Failed to kill child processes: {exc}")
+                log("WARNING", f"Failed to kill child processes: {exc}")
             _cleanup_child_procs()
             return
         _shutdown_event.set()
@@ -797,14 +803,14 @@ async def run_pipeline(args: argparse.Namespace) -> int:
         _NUCLEI_PHASES = {"04-SCAN", "06-JSINTEL", "09-VULNSCAN", "10-TLSCMS"}
         if any(p in _NUCLEI_PHASES for p in phases_to_run):
             if _safe_mode:
-                log("info", "Safe mode: skipping nuclei template update (memory-intensive)")
+                log("INFO", "Safe mode: skipping nuclei template update (memory-intensive)")
             else:
                 try:
                     await _update_nuclei_templates(outdir, proxy=vuln_proxy)
                 except asyncio.CancelledError:
                     raise
                 except Exception as _nuc_exc:
-                    log("warn", f"nuclei template update failed: {_nuc_exc}")
+                    log("WARNING", f"nuclei template update failed: {_nuc_exc}")
 
         prev: Dict[str, Any] = dict(state.get("artifacts", {}))
         waf_file = outdir / "waf_detection.txt"
@@ -818,9 +824,9 @@ async def run_pipeline(args: argparse.Namespace) -> int:
         # Log skipped phases for user visibility
         for name, _, _ in _pipeline:
             if name in skip:
-                log("skip", f"phase {name} (--skip)")
+                log("SKIP", f"phase {name} (--skip)")
             elif only and name not in only:
-                log("skip", f"phase {name} (not in --only)")
+                log("SKIP", f"phase {name} (not in --only)")
 
         completed_phases: Set[str] = set()
         pending_tasks: Dict[str, asyncio.Task] = {}
@@ -829,7 +835,7 @@ async def run_pipeline(args: argparse.Namespace) -> int:
         phase_timeout = int(7200 * proxy_timeout_mult) if vuln_proxy else 7200
         if _safe_mode:
             phase_timeout = min(phase_timeout, 1800)
-            log("info", f"Safe mode: phase timeout reduced to {phase_timeout}s")
+            log("INFO", f"Safe mode: phase timeout reduced to {phase_timeout}s")
 
         def _check_memory() -> None:
             """Warn if resource monitor reports critically low memory."""
@@ -851,14 +857,14 @@ async def run_pipeline(args: argparse.Namespace) -> int:
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                log("warn", f"Failed to emit resource update: {exc}")
+                log("WARNING", f"Failed to emit resource update: {exc}")
             if ram_gb < 1.0:
                 log(
                     "warn",
                     f"LOW MEMORY: {ram_gb:.1f} GB available — concurrency={conc}, CPU={cpu:.0f}%",
                 )
             elif cpu > 90:
-                log("warn", f"HIGH CPU: {cpu:.0f}% — concurrency={conc}, RAM={ram_gb:.1f}GB")
+                log("WARNING", f"HIGH CPU: {cpu:.0f}% — concurrency={conc}, RAM={ram_gb:.1f}GB")
 
         _memory_check_counter = 0
         # Build initial ready set (phases whose deps are all satisfied)
@@ -892,7 +898,7 @@ async def run_pipeline(args: argparse.Namespace) -> int:
                     continue
                 longest = max(phase_started, key=lambda n: phase_started[n])
                 _debug_ts(f"phase {longest} TIMED OUT after {phase_timeout}s")
-                log("warn", f"phase {longest} timed out after {phase_timeout}s; cancelling")
+                log("WARNING", f"phase {longest} timed out after {phase_timeout}s; cancelling")
                 # Kill all running subprocesses so the thread pool thread unblocks
                 with _proc_mod._SPAWNED_PIDS_LOCK:
                     for _pid in list(_proc_mod._SPAWNED_PIDS):
@@ -928,7 +934,7 @@ async def run_pipeline(args: argparse.Namespace) -> int:
                     except asyncio.CancelledError:
                         result = {}
                     except Exception as e:
-                        log("err", f"phase {name} crashed: {e}\n{traceback.format_exc()}")
+                        log("ERROR", f"phase {name} crashed: {e}\n{traceback.format_exc()}")
                         result = {}
                     _apply(name, result)
                     progress.next(name)
@@ -951,7 +957,7 @@ async def run_pipeline(args: argparse.Namespace) -> int:
                     except asyncio.CancelledError:
                         raise
                     except Exception as exc:
-                        log("warn", f"Failed to log phase_complete audit: {exc}")
+                        log("WARNING", f"Failed to log phase_complete audit: {exc}")
                     for _candidate in phases_to_run:
                         if _candidate not in completed_phases and _candidate not in pending_tasks:
                             _deps = PHASE_DEPS.get(_candidate, set()) & selected_set
@@ -1025,7 +1031,7 @@ async def run_pipeline(args: argparse.Namespace) -> int:
                     except asyncio.CancelledError:
                         raise
                     except Exception as e:
-                        log("warn", f"state.json write failed: {e}")
+                        log("WARNING", f"state.json write failed: {e}")
     finally:
         if _resmon is not None:
             try:
@@ -1055,12 +1061,12 @@ async def run_pipeline(args: argparse.Namespace) -> int:
         try:
             due = _monitor.due_scans()
             if due:
-                log("info", f"Monitor: {len(due)} scan(s) due, starting...")
+                log("INFO", f"Monitor: {len(due)} scan(s) due, starting...")
                 await asyncio.to_thread(_monitor.run_due_scans)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            log("warn", f"Failed to check due scans: {exc}")
+            log("WARNING", f"Failed to check due scans: {exc}")
         # v3.0: Write tool health report
         if _tool_health is not None:
             try:
@@ -1068,7 +1074,7 @@ async def run_pipeline(args: argparse.Namespace) -> int:
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                log("warn", f"Failed to write tool health report: {exc}")
+                log("WARNING", f"Failed to write tool health report: {exc}")
         _empty_removed = 0
         for _fp in outdir.glob("*.txt"):
             try:
@@ -1078,8 +1084,8 @@ async def run_pipeline(args: argparse.Namespace) -> int:
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                log("warn", f"Failed to remove empty file {_fp.name}: {exc}")
-        log("info", f"Removed {_empty_removed} empty output files")
+                log("WARNING", f"Failed to remove empty file {_fp.name}: {exc}")
+        log("INFO", f"Removed {_empty_removed} empty output files")
         counts = _counts(outdir)
 
         # v3.0: Build target profile from early recon data (used for smart gating on future scans)
@@ -1096,7 +1102,7 @@ async def run_pipeline(args: argparse.Namespace) -> int:
         except asyncio.CancelledError:
             raise
         except Exception as _tp_exc:
-            log("warn", f"target profiling failed: {_tp_exc}")
+            log("WARNING", f"target profiling failed: {_tp_exc}")
 
         # v3.0: Risk scoring
         try:
@@ -1104,11 +1110,11 @@ async def run_pipeline(args: argparse.Namespace) -> int:
 
             _risk = calculate_risk_score(outdir)
             write_risk_score(outdir, _risk)
-            log("ok", f"risk score: {_risk.grade} ({_risk.score:.0f}/100)")
+            log("OK", f"risk score: {_risk.grade} ({_risk.score:.0f}/100)")
         except asyncio.CancelledError:
             raise
         except Exception as _risk_exc:
-            log("warn", f"risk scoring failed: {_risk_exc}")
+            log("WARNING", f"risk scoring failed: {_risk_exc}")
 
         # v3.0: Confidence scoring
         try:
@@ -1126,7 +1132,7 @@ async def run_pipeline(args: argparse.Namespace) -> int:
         except asyncio.CancelledError:
             raise
         except Exception as _conf_exc:
-            log("warn", f"confidence scoring failed: {_conf_exc}")
+            log("WARNING", f"confidence scoring failed: {_conf_exc}")
 
         # v3.0: Auto-PoC generation
         try:
@@ -1134,11 +1140,11 @@ async def run_pipeline(args: argparse.Namespace) -> int:
 
             _poc_path = generate_all_pocs(outdir)
             if _poc_path and _poc_path.exists():
-                log("ok", f"auto-pocs → {_poc_path}")
+                log("OK", f"auto-pocs → {_poc_path}")
         except asyncio.CancelledError:
             raise
         except Exception as _poc_exc:
-            log("warn", f"auto-PoC generation failed: {_poc_exc}")
+            log("WARNING", f"auto-PoC generation failed: {_poc_exc}")
         if t.has("gowitness"):
             try:
                 gowitness_targets = outdir / "host_targets.txt"
@@ -1170,11 +1176,11 @@ async def run_pipeline(args: argparse.Namespace) -> int:
                         len(list(screenshots_dir.glob("*.png"))) if screenshots_dir.exists() else 0
                     )
                     if n_screenshots:
-                        log("ok", f"gowitness: {n_screenshots} screenshots → {screenshots_dir}")
+                        log("OK", f"gowitness: {n_screenshots} screenshots → {screenshots_dir}")
             except asyncio.CancelledError:
                 raise
             except Exception as _gw_exc:
-                log("warn", f"gowitness failed: {_gw_exc}")
+                log("WARNING", f"gowitness failed: {_gw_exc}")
         try:
             state["coverage"] = _coverage(outdir, phases_to_run)
             sj = write_summary(outdir, args.domain, state, counts)
@@ -1186,28 +1192,28 @@ async def run_pipeline(args: argparse.Namespace) -> int:
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                log("warn", f"Failed to merge phase timing into summary: {exc}")
+                log("WARNING", f"Failed to merge phase timing into summary: {exc}")
             hj = write_html(outdir, args.domain, counts, t.missing)
             mj = write_markdown(outdir, args.domain, counts, t.missing)
             tj = write_full_summary(outdir, args.domain, counts, t.missing)
-            log("ok", f"summary → {sj}")
-            log("ok", f"report  → {hj}")
-            log("ok", f"report  → {mj}")
-            log("ok", f"details → {tj}")
+            log("OK", f"summary → {sj}")
+            log("OK", f"report  → {hj}")
+            log("OK", f"report  → {mj}")
+            log("OK", f"details → {tj}")
             report_format = getattr(args, "format", "html")
             if report_format == "sarif":
                 sj_path = write_sarif(outdir, args.domain, counts, state)
-                log("ok", f"sarif   → {sj_path}")
+                log("OK", f"sarif   → {sj_path}")
             # Generate Faraday report
             fj_path = write_faraday(outdir, args.domain, counts, state)
-            log("ok", f"faraday → {fj_path}")
+            log("OK", f"faraday → {fj_path}")
             # Generate interactive dashboard
             dj_path = write_html_dashboard(outdir, args.domain, counts, t.missing)
-            log("ok", f"dashboard → {dj_path}")
+            log("OK", f"dashboard → {dj_path}")
         except asyncio.CancelledError:
             raise
         except Exception as _rep_exc:
-            log("warn", f"report generation failed: {_rep_exc}")
+            log("WARNING", f"report generation failed: {_rep_exc}")
 
         # --- Post-scan: Exploit chain analysis (heuristic) ---
         _exploit_chains_enabled = getattr(args, "exploit_chains", True)
@@ -1217,11 +1223,11 @@ async def run_pipeline(args: argparse.Namespace) -> int:
 
                 _chains = analyze_exploit_chains(outdir)
                 if _chains:
-                    log("ok", f"exploit chains: {len(_chains)} chains identified")
+                    log("OK", f"exploit chains: {len(_chains)} chains identified")
             except asyncio.CancelledError:
                 raise
             except Exception as _chain_exc:
-                log("warn", f"exploit chain analysis failed: {_chain_exc}")
+                log("WARNING", f"exploit chain analysis failed: {_chain_exc}")
 
         # --- Post-scan: Attack surface graph ---
         _attack_graph = getattr(args, "attack_graph", False)
@@ -1240,7 +1246,7 @@ async def run_pipeline(args: argparse.Namespace) -> int:
             except asyncio.CancelledError:
                 raise
             except Exception as _graph_exc:
-                log("warn", f"attack surface generation failed: {_graph_exc}")
+                log("WARNING", f"attack surface generation failed: {_graph_exc}")
 
         # --- Post-scan: Compliance reports (PCI-DSS / HIPAA / SOC2) ---
         if getattr(args, "compliance", False):
@@ -1255,7 +1261,7 @@ async def run_pipeline(args: argparse.Namespace) -> int:
             except asyncio.CancelledError:
                 raise
             except Exception as _comp_exc:
-                log("warn", f"compliance reports failed: {_comp_exc}")
+                log("WARNING", f"compliance reports failed: {_comp_exc}")
 
         # --- Post-scan: Threat intelligence report (MITRE ATT&CK + feeds) ---
         if getattr(args, "threat_intel", False):
@@ -1268,11 +1274,11 @@ async def run_pipeline(args: argparse.Namespace) -> int:
                     domain=args.domain,
                     feed_path=Path(_ti_feed).resolve() if _ti_feed else None,
                 )
-                log("ok", f"threat intel report → {_ti_path}")
+                log("OK", f"threat intel report → {_ti_path}")
             except asyncio.CancelledError:
                 raise
             except Exception as _ti_exc:
-                log("warn", f"threat intel report failed: {_ti_exc}")
+                log("WARNING", f"threat intel report failed: {_ti_exc}")
 
         # --- Post-scan: ML vulnerability classification ---
         if getattr(args, "ml_classify", False):
@@ -1291,7 +1297,7 @@ async def run_pipeline(args: argparse.Namespace) -> int:
             except asyncio.CancelledError:
                 raise
             except Exception as _mlc_exc:
-                log("warn", f"ML classification failed: {_mlc_exc}")
+                log("WARNING", f"ML classification failed: {_mlc_exc}")
 
         # --- Post-scan: AI-powered analysis ---
         _ai_enabled = getattr(args, "ai_provider", "none") != "none"
@@ -1313,17 +1319,17 @@ async def run_pipeline(args: argparse.Namespace) -> int:
                 _duration_str = f"{int(_scan_duration // 60)}m {int(_scan_duration % 60)}s"
 
                 # AI triage
-                log("info", "AI: running vulnerability triage...")
+                log("INFO", "AI: running vulnerability triage...")
                 _triage_results = await run_triage(outdir, args.domain, _duration_str)
 
                 # AI exploit chain suggestions
-                log("info", "AI: generating exploit chain suggestions...")
+                log("INFO", "AI: generating exploit chain suggestions...")
                 await suggest_exploit_chains(outdir, args.domain)
 
             except asyncio.CancelledError:
                 raise
             except Exception as _ai_exc:
-                log("warn", f"AI analysis failed: {_ai_exc}")
+                log("WARNING", f"AI analysis failed: {_ai_exc}")
 
         # --- Start live dashboard if configured ---
         _dashboard_port = getattr(args, "dashboard_port", 0)
@@ -1340,7 +1346,7 @@ async def run_pipeline(args: argparse.Namespace) -> int:
             except asyncio.CancelledError:
                 raise
             except Exception as _dash_exc:
-                log("warn", f"dashboard server failed: {_dash_exc}")
+                log("WARNING", f"dashboard server failed: {_dash_exc}")
 
         # --- Start REST API server if configured ---
         _api_port = getattr(args, "api_port", 0)
@@ -1353,7 +1359,7 @@ async def run_pipeline(args: argparse.Namespace) -> int:
             except asyncio.CancelledError:
                 raise
             except Exception as _api_exc:
-                log("warn", f"REST API server failed: {_api_exc}")
+                log("WARNING", f"REST API server failed: {_api_exc}")
 
         # --- Start companion bot if configured ---
         _bot_platform = getattr(args, "bot", "")
@@ -1370,7 +1376,7 @@ async def run_pipeline(args: argparse.Namespace) -> int:
             except asyncio.CancelledError:
                 raise
             except Exception as _bot_exc:
-                log("warn", f"companion bot failed: {_bot_exc}")
+                log("WARNING", f"companion bot failed: {_bot_exc}")
 
         _scan_duration_val = sum(v.get("elapsed_seconds", 0) for v in phase_timing.values())
         _duration_str = f"{int(_scan_duration_val // 60)}m {int(_scan_duration_val % 60)}s"
@@ -1394,7 +1400,7 @@ async def run_pipeline(args: argparse.Namespace) -> int:
             except asyncio.CancelledError:
                 raise
             except Exception as _diff_exc:
-                log("warn", f"incremental diff failed: {_diff_exc}")
+                log("WARNING", f"incremental diff failed: {_diff_exc}")
         # Send notification if configured
         try:
             from vulnforge.notify import send_scan_summary
@@ -1411,13 +1417,13 @@ async def run_pipeline(args: argparse.Namespace) -> int:
         except asyncio.CancelledError:
             raise
         except Exception as _notify_exc:
-            log("warn", f"notification failed: {_notify_exc}")
+            log("WARNING", f"notification failed: {_notify_exc}")
         if _tui is not None:
             try:
                 _tui.stop()
             except asyncio.CancelledError:
                 raise
             except Exception as _tui_stop_exc:
-                log("warn", f"TUI shutdown failed: {_tui_stop_exc}")
+                log("WARNING", f"TUI shutdown failed: {_tui_stop_exc}")
         progress.close()
     return 0

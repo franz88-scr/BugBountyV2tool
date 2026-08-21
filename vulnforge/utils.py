@@ -210,7 +210,7 @@ def _write_target_tokens(src: Path, dst: Path) -> int:
         if token not in seen:
             seen.add(token)
     if not seen:
-        log("warn", f"_write_target_tokens: no valid tokens found in {src.name}")
+        log("WARNING", f"_write_target_tokens: no valid tokens found in {src.name}")
         ensure(dst).write_text("")
     else:
         ensure(dst).write_text("\n".join(sorted(seen)) + "\n")
@@ -295,7 +295,7 @@ C = {
     "m": "\033[35m" if _color() else "",
     "red": "\033[31m" if _color() else "",
 }
-LVL = {"info": C["c"], "ok": C["g"], "warn": C["y"], "err": C["red"], "skip": C["d"]}
+LVL = {"INFO": C["c"], "OK": C["g"], "WARNING": C["y"], "ERROR": C["red"], "SKIP": C["d"], "DEBUG": C["m"]}
 
 
 def disable_color() -> None:
@@ -307,6 +307,24 @@ def disable_color() -> None:
 _active_progress: Optional["Progress"] = None
 _active_progress_lock = threading.Lock()
 
+_debug_log_fh = None
+_debug_log_lock = threading.Lock()
+
+
+def set_debug_log(path: str) -> None:
+    global _debug_log_fh
+    with _debug_log_lock:
+        if _debug_log_fh:
+            _debug_log_fh.close()
+        _debug_log_fh = open(path, "a", encoding="utf-8")
+
+
+def _write_debug(msg: str) -> None:
+    with _debug_log_lock:
+        if _debug_log_fh:
+            _debug_log_fh.write(msg + "\n")
+            _debug_log_fh.flush()
+
 
 def _sanitize_log_msg(msg: str) -> str:
     return "".join(c if c >= " " or c in "\t\n\r" else "?" for c in msg)
@@ -314,7 +332,11 @@ def _sanitize_log_msg(msg: str) -> str:
 
 def log(lvl: str, msg: str) -> None:
     msg = _sanitize_log_msg(msg)
-    text = f"{LVL.get(lvl, '')}[{lvl[0].upper() if lvl else '?'}]{C['r']} {msg}"
+    lvl_upper = lvl.upper()
+    text = f"{LVL.get(lvl_upper, '')}[{lvl_upper if lvl_upper else '?'}]{C['r']} {msg}"
+    if lvl_upper == "DEBUG":
+        _write_debug(text)
+        return
     with _active_progress_lock:
         prog = _active_progress
         if prog and prog._enabled and sys.stderr.isatty():
@@ -421,7 +443,7 @@ def _auto_detect_cookies(outdir: Optional[Path] = None, fix_permissions: bool = 
                         try:
                             cookie_file.chmod(0o600)
                         except OSError:
-                            log("warn", f"could not fix permissions on {cookie_file}")
+                            log("WARNING", f"could not fix permissions on {cookie_file}")
                     else:
                         log(
                             "warn",
@@ -435,7 +457,7 @@ def _auto_detect_cookies(outdir: Optional[Path] = None, fix_permissions: bool = 
     else:
         cookie_file = Path("cookies.txt")
         if cookie_file.exists():
-            log("warn", "cookies.txt found in CWD — use --cookie or COOKIE env var instead")
+            log("WARNING", "cookies.txt found in CWD — use --cookie or COOKIE env var instead")
             try:
                 mode = cookie_file.stat().st_mode & 0o777
                 if mode & 0o077:
@@ -447,7 +469,7 @@ def _auto_detect_cookies(outdir: Optional[Path] = None, fix_permissions: bool = 
                         try:
                             cookie_file.chmod(0o600)
                         except OSError:
-                            log("warn", f"could not fix permissions on {cookie_file}")
+                            log("WARNING", f"could not fix permissions on {cookie_file}")
                     else:
                         log(
                             "warn",
@@ -479,7 +501,7 @@ def _validate_cookie(value: str) -> str:
     parts = [p.strip() for p in value.split(";") if p.strip()]
     for part in parts:
         if "=" not in part:
-            log("warn", f"cookie part '{part[:40]}' does not look like name=value format")
+            log("WARNING", f"cookie part '{part[:40]}' does not look like name=value format")
     return value
 
 
@@ -576,7 +598,7 @@ def _patch_socks(proxy: str) -> bool:
             )
             return False
         except Exception as _e:
-            log("warn", f"SOCKS patch failed: {_e}")
+            log("WARNING", f"SOCKS patch failed: {_e}")
             return False
 
 
@@ -611,10 +633,9 @@ def _get_urlopener() -> Callable[..., Any]:
                     "https": proxy,
                 }
             )
-            opener = urllib.request.build_opener(handler)
-            return lambda *a, **kw: opener.open(
-                *a, **{k: v for k, v in kw.items() if k != "context"}
-            )
+            https_handler = urllib.request.HTTPSHandler(context=ctx)
+            opener = urllib.request.build_opener(handler, https_handler)
+            return lambda *a, **kw: opener.open(*a, **{k: v for k, v in kw.items() if k != "context"})
         if proxy.startswith(("socks4://", "socks5://", "socks5h://", "socks4a://")):
             try:
                 import socks as _socks
@@ -624,13 +645,15 @@ def _get_urlopener() -> Callable[..., Any]:
                 _pt = _socks.SOCKS5 if _parsed.scheme.startswith("socks5") else _socks.SOCKS4
                 _handler = SocksiPyHandler(_pt, _parsed.hostname, _parsed.port or 1080)
                 _opener = urllib.request.build_opener(_handler)
-                return lambda *a, **kw: _opener.open(*a, **{**kw, "context": ctx})
+                return lambda *a, **kw: _opener.open(*a, **{k: v for k, v in kw.items() if k != "context"})
             except ImportError:
                 with _SOCKS_PATCH_LOCK:
                     global _socks_patched
                     if not _socks_patched:
                         _socks_patched = _patch_socks(proxy)
-    return lambda *a, **kw: urllib.request.urlopen(*a, **{**kw, "context": ctx})
+    https_handler = urllib.request.HTTPSHandler(context=ctx)
+    opener = urllib.request.build_opener(https_handler)
+    return lambda *a, **kw: opener.open(*a, **{k: v for k, v in kw.items() if k != "context"})
 
 
 class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
@@ -651,10 +674,9 @@ def _get_no_redirect_urlopener() -> Callable[..., Any]:
                     "https": proxy,
                 }
             )
-            opener = urllib.request.build_opener(_NoRedirectHandler, handler)
-            return lambda *a, **kw: opener.open(
-                *a, **{k: v for k, v in kw.items() if k != "context"}
-            )
+            https_handler = urllib.request.HTTPSHandler(context=ctx)
+            opener = urllib.request.build_opener(_NoRedirectHandler, handler, https_handler)
+            return lambda *a, **kw: opener.open(*a, **{k: v for k, v in kw.items() if k != "context"})
         if proxy.startswith(("socks4://", "socks5://", "socks5h://", "socks4a://")):
             try:
                 import socks as _socks
@@ -664,14 +686,15 @@ def _get_no_redirect_urlopener() -> Callable[..., Any]:
                 _pt = _socks.SOCKS5 if _parsed.scheme.startswith("socks5") else _socks.SOCKS4
                 _handler = SocksiPyHandler(_pt, _parsed.hostname, _parsed.port or 1080)
                 _opener = urllib.request.build_opener(_NoRedirectHandler, _handler)
-                return lambda *a, **kw: _opener.open(*a, **{**kw, "context": ctx})
+                return lambda *a, **kw: _opener.open(*a, **{k: v for k, v in kw.items() if k != "context"})
             except ImportError:
                 with _SOCKS_PATCH_LOCK:
                     global _socks_patched
                     if not _socks_patched:
                         _socks_patched = _patch_socks(proxy)
-    opener = urllib.request.build_opener(_NoRedirectHandler)
-    return lambda *a, **kw: opener.open(*a, **{**kw, "context": ctx})
+    https_handler = urllib.request.HTTPSHandler(context=ctx)
+    opener = urllib.request.build_opener(_NoRedirectHandler, https_handler)
+    return lambda *a, **kw: opener.open(*a, **{k: v for k, v in kw.items() if k != "context"})
 
 
 async def _async_urlopen(
@@ -731,9 +754,7 @@ def invalidate_urlopener_cache() -> None:
         _no_redirect_urlopener_cache_proxy = ""
 
 
-async def _async_urlopen_no_redirect(
-    urlopen_func: Any, req: urllib.request.Request, timeout: int = 10
-) -> Tuple[int, Any, bytes]:
+async def _async_urlopen_no_redirect(req: urllib.request.Request, timeout: int = 10) -> Tuple[int, Any, bytes]:
     global _no_redirect_urlopener_cache, _no_redirect_urlopener_cache_proxy
     from vulnforge.process import _PIPELINE_CFG
 
@@ -1348,7 +1369,7 @@ class ScanStatus:
                     self._path.unlink()
                     raise OSError("Symlink attack detected: final path outside status dir")
             except Exception as exc:
-                log("err", f"ScanStatus write failed: {exc}")
+                log("ERROR", f"ScanStatus write failed: {exc}")
                 with self._data_lock:
                     self._data.setdefault("write_errors", []).append(str(exc))
 

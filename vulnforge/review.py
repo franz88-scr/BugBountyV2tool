@@ -97,11 +97,11 @@ def run_interactive_review(outdir: Path) -> None:
     unreviewed = review.get_unreviewed()
 
     if not unreviewed:
-        log("ok", "No unreviewed findings — all findings have been reviewed!")
+        log("OK", "No unreviewed findings — all findings have been reviewed!")
         return
 
-    log("info", f"Found {len(unreviewed)} unreviewed findings. Press Ctrl+C to stop.")
-    log("info", "Commands: [c]onfirm, [f]alse positive, [n]eeds review, [s]kip, [q]uit\n")
+    log("INFO", f"Found {len(unreviewed)} unreviewed findings. Press Ctrl+C to stop.")
+    log("INFO", "Commands: [c]onfirm, [f]alse positive, [n]eeds review, [s]kip, [q]uit\n")
 
     reviewed = 0
     for item in unreviewed:

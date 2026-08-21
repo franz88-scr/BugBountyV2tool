@@ -294,7 +294,7 @@ class SSHScanner:
         - Result aggregation and deduplication
         """
         if not self.hosts:
-            log("warn", "No remote hosts configured for distributed scanning")
+            log("WARNING", "No remote hosts configured for distributed scanning")
             return []
 
         results: List[Dict[str, Any]] = []
@@ -318,7 +318,7 @@ class SSHScanner:
                     results.append(result)
                     if result["returncode"] not in (0, 1, 2):
                         failed_hosts.add(host)
-                        log("warn", f"distributed: host {host} failed task, removing from pool")
+                        log("WARNING", f"distributed: host {host} failed task, removing from pool")
                 finally:
                     self._load_balancer.release(host)
 
@@ -326,7 +326,7 @@ class SSHScanner:
         gather_results = await asyncio.gather(*worker_tasks, return_exceptions=True)
         for i, r in enumerate(gather_results):
             if isinstance(r, Exception):
-                log("err", f"distributed: worker task {i} raised {r}")
+                log("ERROR", f"distributed: worker task {i} raised {r}")
 
         # Aggregate results
         out = ensure(outdir / "distributed_results.json")
@@ -337,14 +337,14 @@ class SSHScanner:
         stats_path = ensure(outdir / "distributed_stats.json")
         stats_path.write_text(json.dumps(lb_stats, indent=2, default=str))
 
-        log("ok", f"Distributed scan: {len(results)} results → {out}")
+        log("OK", f"Distributed scan: {len(results)} results → {out}")
         return results
 
     def setup_workers(self) -> None:
         """Setup worker connections to remote hosts."""
-        log("info", f"Setting up {len(self.hosts)} remote workers")
+        log("INFO", f"Setting up {len(self.hosts)} remote workers")
         for host in self.hosts:
-            log("info", f"  - {host}")
+            log("INFO", f"  - {host}")
 
     def get_health_report(self) -> Dict[str, Any]:
         """Return a summary of all host health statuses."""

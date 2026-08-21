@@ -224,7 +224,7 @@ def _ensure_resolver_file(path: Path) -> bool:
         return True
     ensure(path)
     path.write_text("\n".join(_DEFAULT_RESOLVERS) + "\n")
-    log("info", f"created default resolver list at {path} ({len(_DEFAULT_RESOLVERS)} resolvers)")
+    log("INFO", f"created default resolver list at {path} ({len(_DEFAULT_RESOLVERS)} resolvers)")
     return True
 
 

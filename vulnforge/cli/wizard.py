@@ -58,11 +58,11 @@ def _prompt(
             val = _clean_input(input(f"  {prompt_text}{suffix}: "))
         if not val:
             if sensitive and default:
-                log("warn", "sensitive field returned default value — ensure this is intended")
+                log("WARNING", "sensitive field returned default value — ensure this is intended")
             return default
         if validator is None or validator(val):
             return val
-        log("err", error_msg or "invalid input")
+        log("ERROR", error_msg or "invalid input")
     return default
 
 
@@ -243,9 +243,9 @@ class InteractiveWizard:
                 if data:
                     self.profile_name = profiles[idx]["name"]
                     self._apply_profile(data)
-                    log("ok", f"Loaded profile: {self.profile_name}")
+                    log("OK", f"Loaded profile: {self.profile_name}")
                     return
-        log("warn", "Invalid selection — starting new scan")
+        log("WARNING", "Invalid selection — starting new scan")
         self.profile_name = ""
 
     def _apply_profile(self, data: Dict[str, Any]) -> None:
@@ -292,9 +292,9 @@ class InteractiveWizard:
                 self.selected_phases = set(preset["phases"])
                 for k, v in preset.get("defaults", {}).items():
                     self.config[k] = v
-                log("ok", f"Preset: {preset['name']}")
+                log("OK", f"Preset: {preset['name']}")
                 return
-        log("warn", "Invalid selection — using standard")
+        log("WARNING", "Invalid selection — using standard")
         self.preset = "standard"
         self.selected_phases = set(WIZARD_PRESETS["standard"]["phases"])
 
@@ -365,7 +365,7 @@ class InteractiveWizard:
                 if self.domain:
                     if _prompt_yes_no(f"{C['g']}Start scan{C['r']}", default=True):
                         break
-                    log("info", "Aborted by user")
+                    log("INFO", "Aborted by user")
                     sys.exit(0)
                 else:
                     log(
@@ -373,7 +373,7 @@ class InteractiveWizard:
                         f"{C['red']}Domain is required{C['r']} — set it in section {C['y']}[1]{C['r']}",
                     )
             elif choice == "q":
-                log("info", "Aborted by user")
+                log("INFO", "Aborted by user")
                 sys.exit(0)
 
     def _print_main_menu(self) -> None:
@@ -629,10 +629,10 @@ class InteractiveWizard:
                 break
             elif choice == "a":
                 self.selected_phases = set(VALID_PHASES)
-                log("ok", "All phases selected")
+                log("OK", "All phases selected")
             elif choice == "n":
                 self.selected_phases = set()
-                log("ok", "All phases deselected")
+                log("OK", "All phases deselected")
             elif choice == "s":
                 self._phase_search()
             elif choice.isdigit():
@@ -717,7 +717,7 @@ class InteractiveWizard:
                             else:
                                 self.selected_phases.add(pid)
                 except ValueError:
-                    log("err", f"Invalid range: {part}")
+                    log("ERROR", f"Invalid range: {part}")
             elif part.isdigit():
                 idx = int(part)
                 if 1 <= idx <= len(phases):
@@ -727,7 +727,7 @@ class InteractiveWizard:
                     else:
                         self.selected_phases.add(pid)
                 else:
-                    log("err", f"Number out of range: {part}")
+                    log("ERROR", f"Number out of range: {part}")
             else:
                 upper = part.upper()
                 matches = [pid for pid, _ in phases if upper in pid.upper()]
@@ -738,7 +738,7 @@ class InteractiveWizard:
                         else:
                             self.selected_phases.add(pid)
                 else:
-                    log("err", f"No matching phase for: {part}")
+                    log("ERROR", f"No matching phase for: {part}")
 
     def _phase_search(self) -> None:
         query = _prompt("Search phases (keyword)").strip().lower()
@@ -750,7 +750,7 @@ class InteractiveWizard:
             if query in pid.lower() or query in desc.lower()
         ]
         if not matches:
-            log("warn", f"No phases matching '{query}'")
+            log("WARNING", f"No phases matching '{query}'")
             return
 
         print()
@@ -1059,7 +1059,7 @@ class InteractiveWizard:
         self.config["compliance_report"] = len(frameworks) > 0
 
         if frameworks:
-            log("ok", f"Compliance frameworks: {', '.join(frameworks)}")
+            log("OK", f"Compliance frameworks: {', '.join(frameworks)}")
 
     # ── Section 9: Intelligence & ML ─────────────────────────────────────────
 
@@ -1122,7 +1122,7 @@ class InteractiveWizard:
                 "Workspace name",
                 default=self.config.get("workspace_name", self.domain or "default"),
             )
-            log("ok", f"Collaborative workspace: {self.config['workspace_name']}")
+            log("OK", f"Collaborative workspace: {self.config['workspace_name']}")
 
     # ── Section 10: Sampling ────────────────────────────────────────────────
 
@@ -1156,20 +1156,20 @@ class InteractiveWizard:
         mode = _prompt("Sample mode", default="2").strip()
         if mode == "1":
             self.config["sample_mode"] = "minimal"
-            log("ok", "Sample mode: minimal — all sample sizes set to 1")
+            log("OK", "Sample mode: minimal — all sample sizes set to 1")
         elif mode == "3":
             self.config["sample_mode"] = "all"
-            log("ok", "Sample mode: all — no sampling limits applied")
+            log("OK", "Sample mode: all — no sampling limits applied")
         else:
             self.config["sample_mode"] = "normal"
-            log("ok", "Sample mode: normal — default sample sizes")
+            log("OK", "Sample mode: normal — default sample sizes")
 
     # ── Profile save/load helpers ────────────────────────────────────────────
 
     def _do_save_profile(self) -> None:
         name = _prompt("Profile name", default=self.profile_name or self.domain).strip()
         if not name:
-            log("err", "Profile name required")
+            log("ERROR", "Profile name required")
             return
         from vulnforge.conf import save_profile
 
@@ -1182,16 +1182,16 @@ class InteractiveWizard:
         }
         if save_profile(name, data):
             self.profile_name = name
-            log("ok", f"Profile saved: {name}")
+            log("OK", f"Profile saved: {name}")
         else:
-            log("err", "Failed to save profile")
+            log("ERROR", "Failed to save profile")
 
     def _do_load_profile(self) -> None:
         from vulnforge.conf import list_profiles, load_profile
 
         profiles = list_profiles()
         if not profiles:
-            log("warn", "No saved profiles found")
+            log("WARNING", "No saved profiles found")
             return
 
         print()
@@ -1219,14 +1219,14 @@ class InteractiveWizard:
                 if data:
                     self._apply_profile(data)
                     self.profile_name = profiles[idx]["name"]
-                    log("ok", f"Loaded profile: {self.profile_name}")
+                    log("OK", f"Loaded profile: {self.profile_name}")
 
     def _reset_to_preset(self) -> None:
         if self.preset in WIZARD_PRESETS:
             self.selected_phases = set(WIZARD_PRESETS[self.preset]["phases"])
             for k, v in WIZARD_PRESETS[self.preset].get("defaults", {}).items():
                 self.config[k] = v
-            log("ok", f"Reset to preset: {WIZARD_PRESETS[self.preset]['name']}")
+            log("OK", f"Reset to preset: {WIZARD_PRESETS[self.preset]['name']}")
 
     # ── Preview ──────────────────────────────────────────────────────────────
 
@@ -1428,7 +1428,7 @@ class InteractiveWizard:
             try:
                 return sys.maxsize if v.lower() == "all" else int(v)
             except ValueError:
-                log("warn", f"Invalid count value '{v}', defaulting to 10")
+                log("WARNING", f"Invalid count value '{v}', defaulting to 10")
                 return 10
 
         from vulnforge.config import SAMPLE_DEFAULTS

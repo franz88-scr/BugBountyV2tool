@@ -43,7 +43,7 @@ async def phase_192_REDOS(
     _out = outdir / "redos_findings.txt"
     if _out.exists() and not force:
         return {"192-REDOS": str(_out), "count": count_nonblank(_out)}
-    log("info", "Phase 192-REDOS: ReDoS detection via timing differential")
+    log("INFO", "Phase 192-REDOS: ReDoS detection via timing differential")
     findings: List[str] = []
     redos_urlopen = _get_urlopener()
     redos_extra_headers = _extra_headers_dict()
@@ -64,7 +64,7 @@ async def phase_192_REDOS(
         if urls_file.exists():
             param_urls = [u for u in read_lines(urls_file) if "=" in u]
     if not param_urls:
-        log("warn", "192-REDOS: no parameter URLs; skipping")
+        log("WARNING", "192-REDOS: no parameter URLs; skipping")
         return {"192-REDOS": str(_out), "count": 0}
 
     param_urls = param_urls[:50]
@@ -139,5 +139,5 @@ async def phase_192_REDOS(
         findings.append("[redos] No ReDoS candidates detected (expected)")
     out = ensure(_out)
     out.write_text("\n".join(findings) + ("\n" if findings else ""))
-    log("ok", f"192-REDOS: {len(findings)} findings -> {out}")
+    log("OK", f"192-REDOS: {len(findings)} findings -> {out}")
     return {"192-REDOS": str(out), "count": len(findings)}

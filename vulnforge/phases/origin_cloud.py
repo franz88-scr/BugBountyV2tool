@@ -6,6 +6,7 @@ import os
 import random
 import re
 import shlex
+import socket
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -24,6 +25,7 @@ from vulnforge.tools import Tools
 from vulnforge.utils import (
     _async_urlopen,
     _extra_headers_dict,
+    _get_no_redirect_urlopener,
     _get_urlopener,
     _is_valid_hostname,
     _mmh3_hash,
@@ -33,6 +35,33 @@ from vulnforge.utils import (
     log,
     read_lines,
 )
+
+_CDN_ORG_MARKERS = (
+    "cloudflare",
+    "akamai",
+    "fastly",
+    "sucuri",
+    "imperva",
+    "incapsula",
+    "stackpath",
+    "cloudfront",
+    "cdn",
+)
+_CDN_ASNS = {"13335", "20940", "54113", "30148", "19994", "45498", "16509", "35994", "16625"}
+
+
+def _is_cdn_org(org: str) -> bool:
+    lower = org.lower()
+    if any(marker in lower for marker in _CDN_ORG_MARKERS):
+        return True
+    return any(asn in lower for asn in _CDN_ASNS)
+
+
+def _spf_ip_candidates(sp_text: str) -> List[str]:
+    out: List[str] = []
+    for m in re.finditer(r"\bip[46]:([0-9a-fA-F:.]+(?:/[0-9]+)?)", sp_text.lower()):
+        out.append(m.group(1))
+    return out
 
 
 async def phase_14_ORIGIN(
@@ -49,7 +78,7 @@ async def phase_14_ORIGIN(
     _j_out = outdir / "origin.txt"
     if _j_out.exists() and not force:
         return {"14-ORIGIN": str(_j_out), "count": count_nonblank(_j_out)}
-    log("info", "Phase 14-ORIGIN: origin IP bypass enumeration")
+    log("INFO", "Phase 14-ORIGIN: origin IP bypass enumeration")
     findings: List[str] = []
     _j_extra_headers = _extra_headers_dict()
     _j_urlopen = _get_urlopener()
@@ -240,12 +269,44 @@ async def phase_14_ORIGIN(
                         findings.append(f"    → {label}: neutral (?all) — no enforcement")
                     elif "v=spf1" in sp_text.lower() and "-all" not in sp_text.lower():
                         findings.append(f"    → {label}: no hardfail — consider -all")
+                    if label == "SPF":
+                        for ip in _spf_ip_candidates(sp_text):
+                            findings.append(f"  origin_candidate={ip} (from SPF ip-mechanism)")
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                continue
+    # 3d. X-Forwarded-Host header echo test — CDN pass-through leaks origin behavior
+    if have_hosts:
+        echo_marker = f"vulnforge-echo-{random.randrange(10**9)}"
+        for host_line in read_lines(hosts_file)[: _PIPELINE_CFG.sample_hosts_origin]:
+            base = host_line if host_line.startswith("http") else f"https://{host_line}"
+            try:
+                _j_echo_hdr = {"User-Agent": "Mozilla/5.0", "X-Forwarded-Host": echo_marker}
+                _j_echo_hdr.update(_j_extra_headers)
+                req = urllib.request.Request(base.rstrip("/") + "/", headers=_j_echo_hdr)
+                _, resp_headers, body_bytes = await _async_urlopen(_j_urlopen, req, timeout=10)
+                if (
+                    echo_marker in body_bytes.decode("utf-8", errors="ignore")
+                    or echo_marker in str(resp_headers).lower()
+                ):
+                    findings.append(
+                        f"  header_echo=YES (X-Forwarded-Host {echo_marker} echoed by {base})"
+                    )
             except asyncio.CancelledError:
                 raise
             except Exception:
                 continue
     # 4. Check resolved IPs against Cloudflare ASN (with local caching)
-    resolved_path = Path(prev.get("02-RESOLVE") or outdir / "resolved_full.txt")
+    resolved_path = outdir / "resolved_full.txt"
+    prev_resolve = prev.get("02-RESOLVE")
+    if (
+        not resolved_path.exists()
+        and prev_resolve
+        and Path(prev_resolve).exists()
+        and Path(prev_resolve).name != "resolved.txt"
+    ):
+        resolved_path = Path(prev_resolve)
     ipcache = outdir / ".ipinfo_cache.json"
     ipcache_data: Dict[str, dict] = {}
     if ipcache.exists():
@@ -253,8 +314,8 @@ async def phase_14_ORIGIN(
             ipcache_data = json.loads(ipcache.read_text(encoding="utf-8", errors="ignore"))
         except (json.JSONDecodeError, ValueError):
             ipcache_data = {}
+    resolved_ips: Set[str] = set()
     if resolved_path.exists():
-        resolved_ips: Set[str] = set()
         for ln in read_lines(resolved_path):
             parts = ln.split()
             if len(parts) >= 3 and parts[-2].strip("[]") == "A":
@@ -262,45 +323,57 @@ async def phase_14_ORIGIN(
                 ip = parts[-1].strip("[]")
                 if ip and ip.count(".") == 3:
                     resolved_ips.add(ip)
-        if resolved_ips:
-            cf_ips: Set[str] = set()
-            non_cf_ips: Set[str] = set()
-            for ip in sorted(resolved_ips)[: _PIPELINE_CFG.sample_hosts_origin]:
-                if ip in ipcache_data:
-                    info_data = ipcache_data[ip]
-                else:
-                    try:
-                        _j_ip_hdr = {"User-Agent": "Mozilla/5.0"}
-                        _j_ip_hdr.update(_j_extra_headers)
-                        req = urllib.request.Request(
-                            f"https://ipinfo.io/{ip}/json", headers=_j_ip_hdr
-                        )
-                        _, _, ip_info_bytes = await _async_urlopen(_j_urlopen, req, timeout=10)
-                        info = ip_info_bytes.decode("utf-8", errors="ignore")
-                        info_data = json.loads(info)
-                        ipcache_data[ip] = info_data
-                    except asyncio.CancelledError:
-                        raise
-                    except Exception:
-                        findings.append(f"  unresolved_ip={ip} (check manually)")
-                        continue
-                org = (info_data.get("org") or "").lower()
-                if "cloudflare" in org or "13335" in org:
-                    cf_ips.add(ip)
-                else:
-                    non_cf_ips.add(ip)
-                    findings.append(
-                        f"  non_cloudflare_ip={ip}  org={info_data.get('org', 'unknown')}"
+        if not resolved_ips:
+            # Fallback: bare hostnames (e.g. resolved.txt) -> resolve via getaddrinfo
+            for ln in read_lines(resolved_path):
+                token = ln.split()[0].strip("[]")
+                if not token:
+                    continue
+                try:
+                    ainfo = await asyncio.to_thread(
+                        socket.getaddrinfo, token, None, socket.AF_INET
                     )
-            if ipcache_data:
-                ipcache.write_text(json.dumps(ipcache_data, indent=2))
-            if cf_ips:
-                findings.append(f"  cloudflare_ips={', '.join(sorted(cf_ips))}")
-            if non_cf_ips:
-                findings.append(f"  non_cloudflare_candidates={', '.join(sorted(non_cf_ips))}")
+                except socket.gaierror:
+                    continue
+                for ai in ainfo:
+                    addr_ip = ai[4][0]
+                    if isinstance(addr_ip, str) and addr_ip.count(".") == 3:
+                        resolved_ips.add(addr_ip)
+    if resolved_ips:
+        cf_ips: Set[str] = set()
+        non_cf_ips: Set[str] = set()
+        for ip in sorted(resolved_ips)[: _PIPELINE_CFG.sample_hosts_origin]:
+            if ip in ipcache_data:
+                info_data = ipcache_data[ip]
+            else:
+                try:
+                    _j_ip_hdr = {"User-Agent": "Mozilla/5.0"}
+                    _j_ip_hdr.update(_j_extra_headers)
+                    req = urllib.request.Request(f"https://ipinfo.io/{ip}/json", headers=_j_ip_hdr)
+                    _, _, ip_info_bytes = await _async_urlopen(_j_urlopen, req, timeout=10)
+                    info = ip_info_bytes.decode("utf-8", errors="ignore")
+                    info_data = json.loads(info)
+                    ipcache_data[ip] = info_data
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    findings.append(f"  unresolved_ip={ip} (check manually)")
+                    continue
+            org = (info_data.get("org") or "").lower()
+            if _is_cdn_org(org):
+                cf_ips.add(ip)
+            else:
+                non_cf_ips.add(ip)
+                findings.append(f"  non_cloudflare_ip={ip}  org={info_data.get('org', 'unknown')}")
+        if ipcache_data:
+            ipcache.write_text(json.dumps(ipcache_data, indent=2))
+        if cf_ips:
+            findings.append(f"  cloudflare_ips={', '.join(sorted(cf_ips))}")
+        if non_cf_ips:
+            findings.append(f"  non_cloudflare_candidates={', '.join(sorted(non_cf_ips))}")
     out = ensure(outdir / "origin.txt")
     out.write_text("\n".join(findings) + ("\n" if findings else ""))
-    log("ok", f"14-ORIGIN: {len(findings)} origin findings → {out}")
+    log("OK", f"14-ORIGIN: {len(findings)} origin findings → {out}")
     return {"14-ORIGIN": str(out), "count": len(findings)}
 
 
@@ -406,7 +479,7 @@ async def phase_18_CLOUD(
     _m_out = outdir / "cloud_buckets.txt"
     if _m_out.exists() and not force:
         return {"18-CLOUD": str(_m_out), "count": count_nonblank(_m_out)}
-    log("info", "Phase 18-CLOUD: cloud bucket discovery")
+    log("INFO", "Phase 18-CLOUD: cloud bucket discovery")
     findings: List[str] = []
     _m_urlopen = _get_urlopener()
     seen_buckets: Set[str] = set()
@@ -469,11 +542,20 @@ async def phase_18_CLOUD(
             seen_buckets.add(key)
             try:
                 req = urllib.request.Request(
-                    url, method="HEAD", headers={"User-Agent": "Mozilla/5.0"}
+                    url, method="GET", headers={"User-Agent": "Mozilla/5.0"}
                 )
-                bucket_status, _, _ = await _async_urlopen(_m_urlopen, req, timeout=10)
-                if bucket_status in (200, 301, 302, 403):
+                bucket_status, _, body_bytes = await _async_urlopen(_m_urlopen, req, timeout=10)
+                if bucket_status in (301, 302):
                     results.append(f"[{provider['name']}] {url} (HTTP {bucket_status})")
+                    continue
+                if bucket_status == 200:
+                    body = body_bytes.decode("utf-8", errors="ignore")
+                    if "<ListBucketResult" in body:
+                        results.append(f"[{provider['name']}] {url} (HTTP 200)")
+                elif bucket_status == 403:
+                    body = body_bytes.decode("utf-8", errors="ignore")
+                    if "<Error>" in body and "AccessDenied" in body:
+                        results.append(f"[{provider['name']}] {url} (HTTP 403)")
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -485,8 +567,16 @@ async def phase_18_CLOUD(
         findings.extend(pr)
     out = ensure(_m_out)
     out.write_text("\n".join(findings) + ("\n" if findings else ""))
-    log("ok", f"Phase 18-CLOUD: {len(findings)} cloud bucket findings → {out}")
+    log("OK", f"Phase 18-CLOUD: {len(findings)} cloud bucket findings → {out}")
     return {"18-CLOUD": str(out), "count": len(findings)}
+
+
+def _s3_bucket_verdict(body: str, bucket: str) -> str:
+    if "<ListBucketResult" in body and f"<Name>{bucket}</Name>" in body:
+        return "open"
+    if "<Error>" in body and "AccessDenied" in body:
+        return "restricted"
+    return ""
 
 
 async def phase_46_BUCKET(
@@ -502,7 +592,7 @@ async def phase_46_BUCKET(
     _out = outdir / "bucket_enum.txt"
     if _out.exists() and not force:
         return {"46-BUCKET": str(_out), "count": count_nonblank(_out)}
-    log("info", "Phase 46-BUCKET: cloud bucket enumeration (AWS/GCP/Azure)")
+    log("INFO", "Phase 46-BUCKET: cloud bucket enumeration (AWS/GCP/Azure)")
     domains = set()
     for key in ("01-RECON", "02-RESOLVE", "04-SCAN"):
         p = prev.get(key)
@@ -539,20 +629,35 @@ async def phase_46_BUCKET(
             seen.add(url)
             try:
                 await _throttle_rate()
-                req = urllib.request.Request(url, method="HEAD")
-                urlopen = _get_urlopener()
-                code, _, _ = await _async_urlopen(urlopen, req, timeout=10)
-                if code < 400:
+                req = urllib.request.Request(url, method="GET")
+                urlopen = _get_no_redirect_urlopener()
+                code, _, body_bytes = await _async_urlopen(urlopen, req, timeout=10)
+                body = body_bytes.decode("utf-8", errors="ignore")
+                cand_host = urllib.parse.urlparse(url).hostname or ""
+                cand_bucket = cand_host.split(".")[0] if cand_host else ""
+                verdict = _s3_bucket_verdict(body, cand_bucket)
+                if verdict == "open":
                     findings.append(f"[open] {url} (HTTP {code})")
-                elif code == 403:
+                elif verdict == "restricted":
                     findings.append(f"[restricted] {url} (HTTP 403)")
             except asyncio.CancelledError:
                 raise
             except Exception:
                 continue
     ensure(_out).write_text("\n".join(findings) + ("\n" if findings else ""))
-    log("ok", f"46-BUCKET: {len(findings)} bucket(s) found")
+    log("OK", f"46-BUCKET: {len(findings)} bucket(s) found")
     return {"46-BUCKET": str(_out), "count": len(findings)}
+
+
+def _bucket_entry_base(entry: str) -> str:
+    cleaned = entry.split("]", 1)[-1].strip()
+    cleaned = re.sub(r"\s*\(HTTP \d+\)$", "", cleaned.strip())
+    if "://" not in cleaned:
+        cleaned = f"http://{cleaned}"
+    host = urllib.parse.urlparse(cleaned).hostname or ""
+    if ".s3" in host:
+        return host.split(".s3")[0]
+    return host
 
 
 async def phase_50_BUCKET_PERMS(
@@ -567,7 +672,7 @@ async def phase_50_BUCKET_PERMS(
     _out = outdir / "bucket_permissions.txt"
     if _out.exists() and not force:
         return {"50-BUCKET-PERMS": str(_out), "count": count_nonblank(_out)}
-    log("info", "Phase 50-BUCKET-PERMS: cloud bucket permission auditing")
+    log("INFO", "Phase 50-BUCKET-PERMS: cloud bucket permission auditing")
     findings: List[str] = []
     _b_urlopen = _get_urlopener()
     _b_extra_headers = _extra_headers_dict()
@@ -587,14 +692,10 @@ async def phase_50_BUCKET_PERMS(
             )
             s, _, body_bytes = await _async_urlopen(_b_urlopen, req, timeout=10)
             body = body_bytes.decode("utf-8", errors="ignore")
-            if s == 200 and (
-                "<Key" in body or "<Contents" in body or "ETag" in body or "Name>" in body
-            ):
+            if s == 200 and ("<ListBucketResult" in body or "<Contents" in body):
                 res.append(
                     f"[bucket-public-read] {label} — {url} — HTTP {s} (public listing accessible)"
                 )
-            elif s == 200:
-                res.append(f"[bucket-public-access] {label} — {url} — HTTP {s}")
             elif s in (301, 302, 307):
                 res.append(f"[bucket-redirect] {label} — {url} — HTTP {s}")
         except urllib.error.HTTPError as e:
@@ -620,9 +721,8 @@ async def phase_50_BUCKET_PERMS(
                 res.append(
                     f"[bucket-public-write] {label} — {url} — PUT HTTP {ps} (unauthenticated write)"
                 )
-        except urllib.error.HTTPError as e:
-            if e.code == 405:
-                res.append(f"[bucket-write-allowed] {label} — {url} — PUT not allowed (expected)")
+        except urllib.error.HTTPError:
+            pass
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -630,14 +730,15 @@ async def phase_50_BUCKET_PERMS(
         return res
 
     for entry in bucket_entries:
-        entry_lower = entry.lower()
-        if "s3" in entry_lower or "amazonaws" in entry_lower or "aws" in entry_lower:
+        url_text = entry.split("]", 1)[-1].strip()
+        url_text = re.sub(r"\s*\(HTTP \d+\)$", "", url_text).strip()
+        if "://" not in url_text:
+            url_text = f"http://{url_text}"
+        host = urllib.parse.urlparse(url_text).hostname or ""
+        host_lower = host.lower()
+        if "amazonaws.com" in host_lower:
             for region in ["us-east-1", "eu-west-1", "us-west-2", ""]:
-                base = (
-                    entry.split(".s3")[0]
-                    if ".s3" in entry
-                    else entry.split("://")[-1].split("/")[0]
-                )
+                base = _bucket_entry_base(entry)
                 url = (
                     f"https://{base}.s3.{region}.amazonaws.com/"
                     if region
@@ -645,26 +746,27 @@ async def phase_50_BUCKET_PERMS(
                 )
                 r = await _probe_bucket(url, entry[:60])
                 findings.extend(r)
-        elif "blob.core" in entry_lower or "azure" in entry_lower:
-            url = entry.rstrip("/") + "?restype=container&comp=list" if "?" not in entry else entry
+        elif "backblazeb2.com" in host_lower:
+            r = await _probe_bucket(url_text.rstrip("/") + "/", entry[:60])
+            findings.extend(r)
+        elif "blob.core.windows.net" in host_lower:
+            url = (
+                url_text.rstrip("/") + "?restype=container&comp=list"
+                if "?" not in url_text
+                else url_text
+            )
             r = await _probe_bucket(url, entry[:60])
             findings.extend(r)
-        elif (
-            "storage.googleapis" in entry_lower
-            or "gcp" in entry_lower
-            or "googleapis" in entry_lower
-        ):
-            r = await _probe_bucket(entry.rstrip("/") + "/", entry[:60])
+        elif "googleapis.com" in host_lower:
+            r = await _probe_bucket(url_text.rstrip("/") + "/", entry[:60])
             findings.extend(r)
         else:
-            for prefix in ["https://", "http://"]:
-                if entry.startswith(prefix):
-                    r = await _probe_bucket(entry.rstrip("/") + "/", entry[:60])
-                    findings.extend(r)
+            r = await _probe_bucket(url_text.rstrip("/") + "/", entry[:60])
+            findings.extend(r)
 
     if not findings:
         findings.append("[bucket-perms] No public bucket permissions detected")
     out = ensure(_out)
     out.write_text("\n".join(findings) + ("\n" if findings else ""))
-    log("ok", f"50-BUCKET-PERMS: {len(findings)} bucket permission findings → {out}")
+    log("OK", f"50-BUCKET-PERMS: {len(findings)} bucket permission findings → {out}")
     return {"50-BUCKET-PERMS": str(out), "count": len(findings)}

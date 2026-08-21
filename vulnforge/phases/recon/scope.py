@@ -30,7 +30,7 @@ async def phase_00_SCOPE(
     out = outdir / "scope_validated.txt"
     if out.exists() and not force:
         return {"00-SCOPE": str(out), "count": count_nonblank(out)}
-    log("info", "Phase 00-SCOPE: scope validation")
+    log("INFO", "Phase 00-SCOPE: scope validation")
 
     global _SCOPE_FILE, _SCOPE_PATTERNS
     scope_sources = [
@@ -92,5 +92,5 @@ async def phase_00_SCOPE(
         _SCOPE_PATTERNS = []
 
     out.write_text("\n".join(findings) + ("\n" if findings else ""))
-    log("ok", f"00-SCOPE: {len(findings)} scope findings → {out}")
+    log("OK", f"00-SCOPE: {len(findings)} scope findings → {out}")
     return {"00-SCOPE": str(out), "count": len(findings)}

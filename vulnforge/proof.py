@@ -338,7 +338,7 @@ def generate_all_pocs(outdir: Path, max_pocs: int = 2000) -> Path:
             poc_file.write_text(json.dumps(file_pocs, indent=2, default=str))
 
     if budget <= 0:
-        log("warn", f"Auto-PoC: hit cap of {max_pocs} PoCs; remaining findings skipped")
+        log("WARNING", f"Auto-PoC: hit cap of {max_pocs} PoCs; remaining findings skipped")
 
     # Write combined PoC file
     combined = poc_dir / "all_pocs.json"
@@ -364,5 +364,5 @@ def generate_all_pocs(outdir: Path, max_pocs: int = 2000) -> Path:
     summary_file = poc_dir / "poc_summary.md"
     summary_file.write_text("\n".join(summary_lines))
 
-    log("ok", f"Auto-PoC: {total} payloads generated in {poc_dir}")
+    log("OK", f"Auto-PoC: {total} payloads generated in {poc_dir}")
     return poc_dir

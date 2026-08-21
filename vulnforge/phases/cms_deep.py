@@ -34,21 +34,20 @@ async def phase_185_MAGENTO(
     _out = outdir / "magento.txt"
     if _out.exists() and not force:
         return {"185-MAGENTO": str(_out), "count": count_nonblank(_out)}
-    log("info", "Phase 185-MAGENTO: probing Magento/Adobe Commerce hosts")
+    log("INFO", "Phase 185-MAGENTO: probing Magento/Adobe Commerce hosts")
     findings: List[str] = []
     _urlopen = _get_urlopener()
     _extra_h = _extra_headers_dict()
     hosts = _load_live_hosts(outdir)
     if not hosts:
-        log("warn", "185-MAGENTO: no live hosts; skipping")
+        log("WARNING", "185-MAGENTO: no live hosts; skipping")
         return {"185-MAGENTO": str(_out), "count": 0}
     for h in hosts:
         h = h if h.startswith("http") else f"https://{h}"
         for path in ("/admin", "/index.php/admin"):
             try:
                 req = urllib.request.Request(h.rstrip("/") + path, headers=_extra_h, method="GET")
-                status, resp_headers, body_bytes = await _async_urlopen_no_redirect(
-                    _urlopen, req, timeout=10
+                status, resp_headers, body_bytes = await _async_urlopen_no_redirect(req, timeout=10
                 )
                 if status == 200:
                     findings.append(f"[magento-admin] {h} path={path}")
@@ -61,8 +60,7 @@ async def phase_185_MAGENTO(
                 method="POST",
                 data=b'{"username":"test","password":"test"}',
             )
-            status, resp_headers, body_bytes = await _async_urlopen_no_redirect(
-                _urlopen, req, timeout=10
+            status, resp_headers, body_bytes = await _async_urlopen_no_redirect(req, timeout=10
             )
             if status == 200 and body_bytes:
                 findings.append(
@@ -78,8 +76,7 @@ async def phase_185_MAGENTO(
                     method="POST",
                     data=b'{"query":"{__schema{types{name}}}"}',
                 )
-                g_status, g_headers, g_body = await _async_urlopen_no_redirect(
-                    _urlopen, gql_req, timeout=10
+                g_status, g_headers, g_body = await _async_urlopen_no_redirect(gql_req, timeout=10
                 )
                 if g_status == 200 and g_body:
                     g_str = g_body.decode("utf-8", errors="ignore")
@@ -91,7 +88,7 @@ async def phase_185_MAGENTO(
         findings.append("[magento] No Magento findings (expected)")
     out = ensure(_out)
     out.write_text("\n".join(findings) + ("\n" if findings else ""))
-    log("ok", f"185-MAGENTO: {len(findings)} findings → {out}")
+    log("OK", f"185-MAGENTO: {len(findings)} findings → {out}")
     return {"185-MAGENTO": str(out), "count": len(findings)}
 
 
@@ -108,13 +105,13 @@ async def phase_186_SHAREPOINT(
     _out = outdir / "sharepoint.txt"
     if _out.exists() and not force:
         return {"186-SHAREPOINT": str(_out), "count": count_nonblank(_out)}
-    log("info", "Phase 186-SHAREPOINT: probing SharePoint hosts")
+    log("INFO", "Phase 186-SHAREPOINT: probing SharePoint hosts")
     findings: List[str] = []
     _urlopen = _get_urlopener()
     _extra_h = _extra_headers_dict()
     hosts = _load_live_hosts(outdir)
     if not hosts:
-        log("warn", "186-SHAREPOINT: no live hosts; skipping")
+        log("WARNING", "186-SHAREPOINT: no live hosts; skipping")
         return {"186-SHAREPOINT": str(_out), "count": 0}
     for h in hosts:
         h = h if h.startswith("http") else f"https://{h}"
@@ -124,8 +121,7 @@ async def phase_186_SHAREPOINT(
                 headers=_extra_h,
                 method="GET",
             )
-            status, resp_headers, body_bytes = await _async_urlopen_no_redirect(
-                _urlopen, req, timeout=10
+            status, resp_headers, body_bytes = await _async_urlopen_no_redirect(req, timeout=10
             )
             if status == 200 and body_bytes:
                 findings.append(f"[sharepoint-user-enum] {h} /_api/web/siteusers")
@@ -138,8 +134,7 @@ async def phase_186_SHAREPOINT(
         ):
             try:
                 req = urllib.request.Request(h.rstrip("/") + path, headers=_extra_h, method="GET")
-                status, resp_headers, body_bytes = await _async_urlopen_no_redirect(
-                    _urlopen, req, timeout=10
+                status, resp_headers, body_bytes = await _async_urlopen_no_redirect(req, timeout=10
                 )
                 if status == 200 and body_bytes:
                     findings.append(f"[sharepoint-layouts] {h} path={path}")
@@ -151,8 +146,7 @@ async def phase_186_SHAREPOINT(
                 headers=_extra_h,
                 method="GET",
             )
-            status, resp_headers, body_bytes = await _async_urlopen_no_redirect(
-                _urlopen, req, timeout=10
+            status, resp_headers, body_bytes = await _async_urlopen_no_redirect(req, timeout=10
             )
             if status == 200:
                 findings.append(
@@ -164,7 +158,7 @@ async def phase_186_SHAREPOINT(
         findings.append("[sharepoint] No SharePoint findings (expected)")
     out = ensure(_out)
     out.write_text("\n".join(findings) + ("\n" if findings else ""))
-    log("ok", f"186-SHAREPOINT: {len(findings)} findings → {out}")
+    log("OK", f"186-SHAREPOINT: {len(findings)} findings → {out}")
     return {"186-SHAREPOINT": str(out), "count": len(findings)}
 
 
@@ -181,13 +175,13 @@ async def phase_187_CONFLUENCE(
     _out = outdir / "confluence.txt"
     if _out.exists() and not force:
         return {"187-CONFLUENCE": str(_out), "count": count_nonblank(_out)}
-    log("info", "Phase 187-CONFLUENCE: probing Confluence hosts")
+    log("INFO", "Phase 187-CONFLUENCE: probing Confluence hosts")
     findings: List[str] = []
     _urlopen = _get_urlopener()
     _extra_h = _extra_headers_dict()
     hosts = _load_live_hosts(outdir)
     if not hosts:
-        log("warn", "187-CONFLUENCE: no live hosts; skipping")
+        log("WARNING", "187-CONFLUENCE: no live hosts; skipping")
         return {"187-CONFLUENCE": str(_out), "count": 0}
     for h in hosts:
         h = h if h.startswith("http") else f"https://{h}"
@@ -197,8 +191,7 @@ async def phase_187_CONFLUENCE(
                 headers=_extra_h,
                 method="GET",
             )
-            status, resp_headers, body_bytes = await _async_urlopen_no_redirect(
-                _urlopen, req, timeout=10
+            status, resp_headers, body_bytes = await _async_urlopen_no_redirect(req, timeout=10
             )
             if status == 200 and body_bytes:
                 body_str = body_bytes.decode("utf-8", errors="ignore")
@@ -209,8 +202,7 @@ async def phase_187_CONFLUENCE(
         for path in ("/s/", "/s/backup", "/s/backups"):
             try:
                 req = urllib.request.Request(h.rstrip("/") + path, headers=_extra_h, method="GET")
-                status, resp_headers, body_bytes = await _async_urlopen_no_redirect(
-                    _urlopen, req, timeout=10
+                status, resp_headers, body_bytes = await _async_urlopen_no_redirect(req, timeout=10
                 )
                 if status == 200 and body_bytes:
                     findings.append(f"[confluence-backup-exposure] {h} path={path}")
@@ -222,8 +214,7 @@ async def phase_187_CONFLUENCE(
                 headers=_extra_h,
                 method="GET",
             )
-            status, resp_headers, body_bytes = await _async_urlopen_no_redirect(
-                _urlopen, req, timeout=10
+            status, resp_headers, body_bytes = await _async_urlopen_no_redirect(req, timeout=10
             )
             if status == 200 and body_bytes:
                 findings.append(
@@ -235,7 +226,7 @@ async def phase_187_CONFLUENCE(
         findings.append("[confluence] No Confluence findings (expected)")
     out = ensure(_out)
     out.write_text("\n".join(findings) + ("\n" if findings else ""))
-    log("ok", f"187-CONFLUENCE: {len(findings)} findings → {out}")
+    log("OK", f"187-CONFLUENCE: {len(findings)} findings → {out}")
     return {"187-CONFLUENCE": str(out), "count": len(findings)}
 
 
@@ -252,21 +243,20 @@ async def phase_188_CICD(
     _out = outdir / "cicd_deep.txt"
     if _out.exists() and not force:
         return {"188-CICD": str(_out), "count": count_nonblank(_out)}
-    log("info", "Phase 188-CICD: CI/CD / GitLab / Jenkins exposure deep")
+    log("INFO", "Phase 188-CICD: CI/CD / GitLab / Jenkins exposure deep")
     findings: List[str] = []
     _urlopen = _get_urlopener()
     _extra_h = _extra_headers_dict()
     hosts = _load_live_hosts(outdir)
     if not hosts:
-        log("warn", "188-CICD: no live hosts; skipping")
+        log("WARNING", "188-CICD: no live hosts; skipping")
         return {"188-CICD": str(_out), "count": 0}
     for h in hosts:
         h = h if h.startswith("http") else f"https://{h}"
         for path in ("/script", "/script/", "/scriptText"):
             try:
                 req = urllib.request.Request(h.rstrip("/") + path, headers=_extra_h, method="GET")
-                status, resp_headers, body_bytes = await _async_urlopen_no_redirect(
-                    _urlopen, req, timeout=10
+                status, resp_headers, body_bytes = await _async_urlopen_no_redirect(req, timeout=10
                 )
                 if status == 200 and body_bytes:
                     body_str = body_bytes.decode("utf-8", errors="ignore")
@@ -277,8 +267,7 @@ async def phase_188_CICD(
         for path in ("/api/v4/projects", "/api/v3/projects"):
             try:
                 req = urllib.request.Request(h.rstrip("/") + path, headers=_extra_h, method="GET")
-                status, resp_headers, body_bytes = await _async_urlopen_no_redirect(
-                    _urlopen, req, timeout=10
+                status, resp_headers, body_bytes = await _async_urlopen_no_redirect(req, timeout=10
                 )
                 if status == 200 and body_bytes:
                     body_str = body_bytes.decode("utf-8", errors="ignore")
@@ -289,8 +278,7 @@ async def phase_188_CICD(
         for path in ("/api/v4/projects/1/variables", "/api/v3/projects/1/variables"):
             try:
                 req = urllib.request.Request(h.rstrip("/") + path, headers=_extra_h, method="GET")
-                status, resp_headers, body_bytes = await _async_urlopen_no_redirect(
-                    _urlopen, req, timeout=10
+                status, resp_headers, body_bytes = await _async_urlopen_no_redirect(req, timeout=10
                 )
                 if status == 200 and body_bytes:
                     findings.append(f"[gitlab-variable-leak] {h} {path}")
@@ -299,8 +287,7 @@ async def phase_188_CICD(
         for path in ("/admin/runners", "/api/v4/runners"):
             try:
                 req = urllib.request.Request(h.rstrip("/") + path, headers=_extra_h, method="GET")
-                status, resp_headers, body_bytes = await _async_urlopen_no_redirect(
-                    _urlopen, req, timeout=10
+                status, resp_headers, body_bytes = await _async_urlopen_no_redirect(req, timeout=10
                 )
                 if status == 200 and body_bytes:
                     findings.append(f"[cicd-runner-abuse] {h} path={path}")
@@ -310,7 +297,7 @@ async def phase_188_CICD(
         findings.append("[cicd] No CI/CD findings (expected)")
     out = ensure(_out)
     out.write_text("\n".join(findings) + ("\n" if findings else ""))
-    log("ok", f"188-CICD: {len(findings)} findings → {out}")
+    log("OK", f"188-CICD: {len(findings)} findings → {out}")
     return {"188-CICD": str(out), "count": len(findings)}
 
 
@@ -327,13 +314,13 @@ async def phase_189_TOMCAT(
     _out = outdir / "tomcat_deep.txt"
     if _out.exists() and not force:
         return {"189-TOMCAT": str(_out), "count": count_nonblank(_out)}
-    log("info", "Phase 189-TOMCAT: Apache Tomcat in-depth probes")
+    log("INFO", "Phase 189-TOMCAT: Apache Tomcat in-depth probes")
     findings: List[str] = []
     _urlopen = _get_urlopener()
     _extra_h = _extra_headers_dict()
     hosts = _load_live_hosts(outdir)
     if not hosts:
-        log("warn", "189-TOMCAT: no live hosts; skipping")
+        log("WARNING", "189-TOMCAT: no live hosts; skipping")
         return {"189-TOMCAT": str(_out), "count": 0}
     creds = [
         ("tomcat", "tomcat"),
@@ -351,8 +338,7 @@ async def phase_189_TOMCAT(
                     req = urllib.request.Request(
                         h.rstrip("/") + path, headers=headers, method="GET"
                     )
-                    status, resp_headers, body_bytes = await _async_urlopen_no_redirect(
-                        _urlopen, req, timeout=10
+                    status, resp_headers, body_bytes = await _async_urlopen_no_redirect(req, timeout=10
                     )
                     if status == 200:
                         findings.append(
@@ -363,8 +349,7 @@ async def phase_189_TOMCAT(
         for path in ("/examples/", "/examples/servlets/", "/examples/jsp/"):
             try:
                 req = urllib.request.Request(h.rstrip("/") + path, headers=_extra_h, method="GET")
-                status, resp_headers, body_bytes = await _async_urlopen_no_redirect(
-                    _urlopen, req, timeout=10
+                status, resp_headers, body_bytes = await _async_urlopen_no_redirect(req, timeout=10
                 )
                 if status == 200 and body_bytes:
                     body_str = body_bytes.decode("utf-8", errors="ignore")
@@ -388,5 +373,5 @@ async def phase_189_TOMCAT(
         findings.append("[tomcat-deep] No Tomcat findings (expected)")
     out = ensure(_out)
     out.write_text("\n".join(findings) + ("\n" if findings else ""))
-    log("ok", f"189-TOMCAT: {len(findings)} findings → {out}")
+    log("OK", f"189-TOMCAT: {len(findings)} findings → {out}")
     return {"189-TOMCAT": str(out), "count": len(findings)}

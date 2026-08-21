@@ -52,11 +52,11 @@ async def phase_11_INJECT(
     _g_out = outdir / "vulns.txt"
     if _g_out.exists() and not force:
         return {"11-INJECT": str(_g_out), "count": count_nonblank(_g_out)}
-    log("info", "Phase 11-INJECT: dalfox → sqlmap → SSRF probes")
+    log("INFO", "Phase 11-INJECT: dalfox → sqlmap → SSRF probes")
     urls = outdir / "urls_all.txt"
     all_urls = read_lines(urls) if urls.exists() else []
     if not all_urls:
-        log("warn", "11-INJECT: no URLs; skipping")
+        log("WARNING", "11-INJECT: no URLs; skipping")
         return {"11-INJECT": str(outdir / "vulns.txt"), "count": 0}
     all_urls = _dedupe_by_host_params(all_urls)
     all_urls = _dedupe_by_normalized_url(all_urls)
@@ -308,7 +308,7 @@ async def phase_11_INJECT(
             blind_script.chmod(0o700)
             jobs.append(("blind-xss-probe", ["python3", str(blind_script)], 300))
     elif oast_domain and ssrf_urls:
-        log("warn", "11-INJECT: interactsh domain has unsafe characters, skipping SSRF probes")
+        log("WARNING", "11-INJECT: interactsh domain has unsafe characters, skipping SSRF probes")
     await run_parallel(jobs, outdir)
     # LDAP injection probes on param-bearing URLs
     ldap_findings: List[str] = []
@@ -476,7 +476,7 @@ async def phase_11_INJECT(
     ]
     xss_methodology_out = ensure(outdir / "xss_methodology.txt")
     xss_methodology_out.write_text("\n".join(xss_notes) + "\n")
-    log("info", f"11-INJECT: XSS methodology notes → {xss_methodology_out}")
+    log("INFO", f"11-INJECT: XSS methodology notes → {xss_methodology_out}")
 
     parts = [
         outdir / "xss.txt",
@@ -486,6 +486,27 @@ async def phase_11_INJECT(
     ]
     n = merge_unique([p for p in parts if p.exists()], outdir / "vulns.txt")
     return {"11-INJECT": str(outdir / "vulns.txt"), "count": n}
+
+
+_DOMXSS_HOOKS_JS = """() => {
+    window.__rc_canary = "__RC_CANARY__";
+    window.__rc_hits = [];
+    const _eval = window.eval;
+    window.eval = function(s) { if(typeof s==='string'&&s.includes(window.__rc_canary)) window.__rc_hits.push('eval'); return _eval.call(window,s); };
+    const _st = window.setTimeout;
+    window.setTimeout = function(f,d) { if(typeof f==='string'&&f.includes(window.__rc_canary)) window.__rc_hits.push('setTimeout(string)'); return _st.call(window,f,d); };
+    const _fn = window.Function;
+    window.Function = function() { const s = Array.from(arguments).join(','); if(s.includes(window.__rc_canary)) window.__rc_hits.push('Function()'); return _fn.apply(this, arguments); };
+    const _dw = document.write;
+    document.write = function(h) { if(typeof h==='string'&&h.includes(window.__rc_canary)) window.__rc_hits.push('document.write'); return _dw.call(document,h); };
+    const _dle = document.writeln;
+    document.writeln = function(h) { if(typeof h==='string'&&h.includes(window.__rc_canary)) window.__rc_hits.push('document.writeln'); return _dle.call(document,h); };
+    const _sa = Element.prototype.setAttribute;
+    Element.prototype.setAttribute = function(n,v) { if(typeof v==='string'&&v.includes(window.__rc_canary)) window.__rc_hits.push('setAttribute:'+n); return _sa.call(this,n,v); };
+    const _oj = window.onerror;
+    window.onerror = function(m,s,l,c,e) { if(window.__rc_canary&&(m||'').includes(window.__rc_canary)) window.__rc_hits.push('onerror'); if(_oj) return _oj.call(window,m,s,l,c,e); };
+    const _ue = window.UncaughtError; if(_ue) { const _ueh = _ue.listen; if(_ueh) { _ue.listen = function(h) { const _wh = function(e) { if(e&&e.message&&e.message.includes(window.__rc_canary)) window.__rc_hits.push('UncaughtError'); h(e); }; return _ueh.call(_ue,_wh); }; }}
+}"""
 
 
 async def phase_11a_DOMXSS(
@@ -501,21 +522,21 @@ async def phase_11a_DOMXSS(
     _out = outdir / "domxss_findings.txt"
     if _out.exists() and not force:
         return {"11a-DOMXSS": str(_out), "count": count_nonblank(_out)}
-    log("info", "Phase 11a-DOMXSS: DOM-based XSS detection via browser automation")
+    log("INFO", "Phase 11a-DOMXSS: DOM-based XSS detection via browser automation")
     findings: List[str] = []
     urls_file = outdir / "urls_all.txt"
     all_urls = read_lines(urls_file) if urls_file.exists() else []
     if not all_urls:
-        log("warn", "11a-DOMXSS: no URLs available; skipping")
+        log("WARNING", "11a-DOMXSS: no URLs available; skipping")
         return {"11a-DOMXSS": str(_out), "count": 0}
     param_urls = [u for u in all_urls if "=" in u][: _PIPELINE_CFG.sample_urls_domxss]
     if not param_urls:
-        log("warn", "11a-DOMXSS: no parameter-bearing URLs; skipping")
+        log("WARNING", "11a-DOMXSS: no parameter-bearing URLs; skipping")
         return {"11a-DOMXSS": str(_out), "count": 0}
     try:
         from playwright.async_api import async_playwright
     except ImportError:
-        log("warn", "11a-DOMXSS: playwright not installed; skipping (pip install playwright)")
+        log("WARNING", "11a-DOMXSS: playwright not installed; skipping (pip install playwright)")
         return {"11a-DOMXSS": str(_out), "count": 0}
     _CANARY = "rcxss" + base64.b64encode(os.urandom(6)).decode().rstrip("=")
     try:
@@ -529,28 +550,12 @@ async def phase_11a_DOMXSS(
                     context = await browser.new_context(
                         user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
                     )
+                    await context.add_init_script(
+                        _DOMXSS_HOOKS_JS.replace("__RC_CANARY__", _CANARY)
+                    )
                     page = await context.new_page()
                     try:
                         await page.goto(url, timeout=15000, wait_until="domcontentloaded")
-                        await page.evaluate(f"""() => {{
-                            window.__rc_canary = "{_CANARY}";
-                            window.__rc_hits = [];
-                            const _eval = window.eval;
-                            window.eval = function(s) {{ if(typeof s==='string'&&s.includes(window.__rc_canary)) window.__rc_hits.push('eval'); return _eval.call(window,s); }};
-                            const _st = window.setTimeout;
-                            window.setTimeout = function(f,d) {{ if(typeof f==='string'&&f.includes(window.__rc_canary)) window.__rc_hits.push('setTimeout(string)'); return _st.call(window,f,d); }};
-                            const _fn = window.Function;
-                            window.Function = function() {{ const s = Array.from(arguments).join(','); if(s.includes(window.__rc_canary)) window.__rc_hits.push('Function()'); return _fn.apply(this, arguments); }};
-                            const _dw = document.write;
-                            document.write = function(h) {{ if(typeof h==='string'&&h.includes(window.__rc_canary)) window.__rc_hits.push('document.write'); return _dw.call(document,h); }};
-                            const _dle = document.writeln;
-                            document.writeln = function(h) {{ if(typeof h==='string'&&h.includes(window.__rc_canary)) window.__rc_hits.push('document.writeln'); return _dle.call(document,h); }};
-                            const _sa = Element.prototype.setAttribute;
-                            Element.prototype.setAttribute = function(n,v) {{ if(typeof v==='string'&&v.includes(window.__rc_canary)) window.__rc_hits.push('setAttribute:'+n); return _sa.call(this,n,v); }};
-                            const _oj = window.onerror;
-                            window.onerror = function(m,s,l,c,e) {{ if(window.__rc_canary&&(m||'').includes(window.__rc_canary)) window.__rc_hits.push('onerror'); if(_oj) return _oj.call(window,m,s,l,c,e); }};
-                            const _ue = window.UncaughtError; if(_ue) {{ const _ueh = _ue.listen; if(_ueh) {{ _ue.listen = function(h) {{ const _wh = function(e) {{ if(e&&e.message&&e.message.includes(window.__rc_canary)) window.__rc_hits.push('UncaughtError'); h(e); }}; return _ueh.call(_ue,_wh); }}; }}
-                        }}""")
                         await page.evaluate(f"location.hash='#/{_CANARY}'")
                         await asyncio.sleep(1)
                         sink_report = await page.evaluate("""() => {
@@ -596,7 +601,9 @@ async def phase_11a_DOMXSS(
                         }""")
                         for s in frag_report:
                             findings.append(f"[domxss-sink] {url} — sink={s} source=url-fragment")
-                        await page.evaluate(f"window.postMessage({{__rc:\"{_CANARY}\"}}, '*')")
+                        await page.evaluate(
+                            f"window.__rc_hits = []; window.postMessage({{__rc:\"{_CANARY}\"}}, '*')"
+                        )
                         await asyncio.sleep(1)
                         pm_report = await page.evaluate("""() => {
                             const c = window.__rc_canary;
@@ -623,12 +630,12 @@ async def phase_11a_DOMXSS(
     except asyncio.CancelledError:
         raise
     except Exception as e:
-        log("warn", f"11a-DOMXSS: browser crashed ({e}); saving {len(findings)} partial findings")
+        log("WARNING", f"11a-DOMXSS: browser crashed ({e}); saving {len(findings)} partial findings")
     if not findings:
         findings.append("[domxss] No DOM-based XSS candidates detected (expected)")
     out = ensure(_out)
     out.write_text("\n".join(findings) + ("\n" if findings else ""))
-    log("ok", f"11a-DOMXSS: {len(findings)} DOM XSS findings → {out}")
+    log("OK", f"11a-DOMXSS: {len(findings)} DOM XSS findings → {out}")
     return {"11a-DOMXSS": str(_out), "count": len(findings)}
 
 
@@ -645,7 +652,7 @@ async def phase_11b_SQLMAP(
     _out = outdir / "sqlmap_findings.txt"
     if _out.exists() and not force:
         return {"11b-SQLMAP": str(_out), "count": count_nonblank(_out)}
-    log("info", "Phase 11b-SQLMAP: sqlmap with enriched parameter set")
+    log("INFO", "Phase 11b-SQLMAP: sqlmap with enriched parameter set")
     findings: List[str] = []
     # Collect param-bearing URLs from harvested URLs and Arjun-discovered params
     all_urls: List[str] = []
@@ -660,7 +667,7 @@ async def phase_11b_SQLMAP(
         : _PIPELINE_CFG.sample_urls_fuzz
     ]
     if not param_urls:
-        log("warn", "11b-SQLMAP: no parameter-bearing URLs available; skipping")
+        log("WARNING", "11b-SQLMAP: no parameter-bearing URLs available; skipping")
         return {"11b-SQLMAP": str(_out), "count": 0}
     candidates = list(param_urls)
     for url in candidates:
@@ -763,7 +770,7 @@ async def phase_11b_SQLMAP(
         findings.append("[result] No SQL injection vulnerabilities detected")
     out = ensure(_out)
     out.write_text("\n".join(findings) + ("\n" if findings else ""))
-    log("ok", f"11b-SQLMAP: {len(findings)} findings → {out}")
+    log("OK", f"11b-SQLMAP: {len(findings)} findings → {out}")
     return {"11b-SQLMAP": str(_out), "count": len(findings)}
 
 
@@ -781,18 +788,18 @@ async def phase_12_SSTI(
     _g2_out = outdir / "ssti.txt"
     if _g2_out.exists() and not force:
         return {"12-SSTI": str(_g2_out), "count": count_nonblank(_g2_out)}
-    log("info", "Phase 12-SSTI: SSTI + deep XSS/SQLi fuzzing")
+    log("INFO", "Phase 12-SSTI: SSTI + deep XSS/SQLi fuzzing")
     urls = outdir / "urls_all.txt"
     all_urls = read_lines(urls) if urls.exists() else []
     if not all_urls:
-        log("warn", "12-SSTI: no URLs; skipping")
+        log("WARNING", "12-SSTI: no URLs; skipping")
         ensure(_g2_out).write_text("")
         return {"12-SSTI": str(_g2_out), "count": 0}
     all_urls = _dedupe_by_host_params(all_urls)
     all_urls = _dedupe_by_normalized_url(all_urls)
     param_urls = [u for u in all_urls if "=" in u and not _is_static_url(u)]
     if not param_urls:
-        log("warn", "12-SSTI: no param-bearing URLs; skipping")
+        log("WARNING", "12-SSTI: no param-bearing URLs; skipping")
         ensure(_g2_out).write_text("")
         return {"12-SSTI": str(_g2_out), "count": 0}
 
@@ -965,5 +972,5 @@ async def phase_12_SSTI(
     ensure(outdir / "ssti.txt").write_text(
         "\n".join(ssti_findings) + ("\n" if ssti_findings else "")
     )
-    log("ok", f"12-SSTI: {len(ssti_findings)} SSTI reflections detected")
+    log("OK", f"12-SSTI: {len(ssti_findings)} SSTI reflections detected")
     return {"12-SSTI": str(outdir / "ssti.txt"), "count": len(ssti_findings)}

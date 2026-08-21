@@ -33,7 +33,7 @@ async def phase_183_CACHEDIG(
     _out = outdir / "cache_dig.txt"
     if _out.exists() and not force:
         return {"183-CACHEDIG": str(_out), "count": count_nonblank(_out)}
-    log("info", "Phase 183-CACHEDIG: HTTP/2 cache digestion / web cache poisoning extended")
+    log("INFO", "Phase 183-CACHEDIG: HTTP/2 cache digestion / web cache poisoning extended")
     findings: List[str] = []
     _urlopen = _get_urlopener()
     _extra_h = _extra_headers_dict()
@@ -59,7 +59,7 @@ async def phase_183_CACHEDIG(
         : _PIPELINE_CFG.sample_hosts_cached
     ]
     if not cached_hosts:
-        log("warn", "183-CACHEDIG: no cached hosts; skipping")
+        log("WARNING", "183-CACHEDIG: no cached hosts; skipping")
         return {"183-CACHEDIG": str(_out), "count": 0}
 
     for h in cached_hosts:
@@ -138,5 +138,5 @@ async def phase_183_CACHEDIG(
         findings.append("[cache-digest] No cache digestion candidates detected (expected)")
     out = ensure(_out)
     out.write_text("\n".join(findings) + ("\n" if findings else ""))
-    log("ok", f"183-CACHEDIG: {len(findings)} findings → {out}")
+    log("OK", f"183-CACHEDIG: {len(findings)} findings → {out}")
     return {"183-CACHEDIG": str(out), "count": len(findings)}

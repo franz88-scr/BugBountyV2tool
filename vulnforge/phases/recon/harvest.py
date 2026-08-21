@@ -25,10 +25,12 @@ from vulnforge.utils import (
     _async_urlopen,
     _extra_headers_dict,
     _extra_http_args,
+    _extract_host,
     _get_urlopener,
     _is_under_domain,
     _is_valid_hostname,
     _throttle_rate,
+    _write_target_tokens,
     count_nonblank,
     ensure,
     log,
@@ -53,7 +55,7 @@ async def phase_05_HARVEST(
     _c1_out = outdir / "urls_all.txt"
     if _c1_out.exists() and not force:
         return {"05-HARVEST": str(_c1_out), "count": count_nonblank(_c1_out)}
-    log("info", "Phase 05-HARVEST: URL harvesting (parallel groups)")
+    log("INFO", "Phase 05-HARVEST: URL harvesting (parallel groups)")
 
     async def _c1_resolve_hosts() -> Optional[Path]:
         h = Path(prev.get("04-SCAN.targets") or outdir / "host_targets.txt")
@@ -66,8 +68,11 @@ async def phase_05_HARVEST(
                     log(
                         "info", f"05-HARVEST: {len(_active)}/{len(read_lines(h_raw))} non-404 hosts"
                     )
-                    ensure(h).write_text("\n".join(_active) + "\n")
-                    h_ok = True
+                    _tmp_active = outdir / ".harvest_active_hosts.txt"
+                    _tmp_active.write_text("\n".join(_active) + "\n")
+                    _write_target_tokens(_tmp_active, h)
+                    _tmp_active.unlink(missing_ok=True)
+                    h_ok = h.exists() and bool(read_lines(h))
         if not h_ok:
             h = Path(prev.get("02-RESOLVE") or outdir / "resolved.txt")
         if h.exists() and bool(read_lines(h)):
@@ -76,11 +81,11 @@ async def phase_05_HARVEST(
 
     hosts = await _c1_resolve_hosts()
     if hosts is None:
-        log("warn", "05-HARVEST: no host input; skipping")
+        log("WARNING", "05-HARVEST: no host input; skipping")
         return {}
     waf_detected = getattr(_PIPELINE_CFG, "waf_detected", False)
     if waf_detected:
-        log("info", "05-HARVEST: WAF detected, reducing crawler depth/concurrency")
+        log("INFO", "05-HARVEST: WAF detected, reducing crawler depth/concurrency")
     g1: List[Tuple[str, List[str], int]] = []
     if t.has("gau"):
         runner = outdir / "logs" / "gau_runner.sh"
@@ -195,9 +200,9 @@ async def phase_05_HARVEST(
         outdir / "urls_waymore.txt",
     ]
     if not any(p.exists() and read_lines(p) for p in harvested):
-        log("warn", "05-HARVEST: no URL harvesters produced output")
+        log("WARNING", "05-HARVEST: no URL harvesters produced output")
     n = merge_unique(harvested, outdir / "urls_all.txt")
-    log("ok", f"05-HARVEST: {n} unique URLs")
+    log("OK", f"05-HARVEST: {n} unique URLs")
     urls_file = outdir / "urls_all.txt"
     targets_file = outdir / "host_targets.txt"
     if urls_file.exists() and read_lines(urls_file):
@@ -229,7 +234,7 @@ async def phase_05_HARVEST(
             except Exception:
                 pass
         if new_hosts:
-            log("info", f"05-HARVEST: {len(new_hosts)} new hosts from URLs (probing...)")
+            log("INFO", f"05-HARVEST: {len(new_hosts)} new hosts from URLs (probing...)")
             tmp = outdir / ".harvest_new_hosts.txt"
             tmp.write_text("\n".join(sorted(new_hosts)) + "\n")
             if t.has("httpx"):
@@ -290,7 +295,7 @@ async def phase_05b_APISPEC(
     _out = outdir / "api_specs.txt"
     if _out.exists() and not force:
         return {"05b-APISPEC": str(_out), "count": count_nonblank(_out)}
-    log("info", "Phase 05b-APISPEC: hunt API spec files (swagger, openapi, graphql SDL)")
+    log("INFO", "Phase 05b-APISPEC: hunt API spec files (swagger, openapi, graphql SDL)")
     findings: List[str] = []
     _ap_urlopen = _get_urlopener()
     _ap_extra_headers = _extra_headers_dict()
@@ -299,9 +304,9 @@ async def phase_05b_APISPEC(
     hosts: Set[str] = set()
     if hosts_file.exists():
         for h in read_lines(hosts_file):
-            h = h.strip().rstrip("/")
-            if h:
-                hosts.add(h)
+            hostname = _extract_host(h)
+            if hostname:
+                hosts.add(f"https://{hostname}")
     if urls_file.exists():
         for u in read_lines(urls_file):
             u = u.strip().rstrip("/")
@@ -313,19 +318,18 @@ async def phase_05b_APISPEC(
                         f"{parsed.scheme}://{netloc}" if parsed.scheme else f"http://{netloc}"
                     )
     if not hosts:
-        log("warn", "05b-APISPEC: no hosts found; skipping")
+        log("WARNING", "05b-APISPEC: no hosts found; skipping")
         return {"05b-APISPEC": str(_out), "count": 0}
     if domain:
         host_domain = domain.lower().lstrip("*.")
         in_scope: Set[str] = set()
         for h in hosts:
-            if "://" in h:
-                hostname = h.lower().split("/")[2].split(":")[0]
-                if host_domain in hostname:
-                    in_scope.add(h)
+            hostname = _extract_host(h)
+            if hostname and host_domain in hostname.lower():
+                in_scope.add(h)
         dropped = len(hosts) - len(in_scope)
         if dropped:
-            log("info", f"05b-APISPEC: dropped {dropped} out-of-scope host(s)")
+            log("INFO", f"05b-APISPEC: dropped {dropped} out-of-scope host(s)")
         hosts = in_scope
     findings.append(f"target_hosts={len(hosts)}")
     api_paths = [
@@ -422,5 +426,5 @@ async def phase_05b_APISPEC(
         findings.append("[result] No API spec files discovered")
     out = ensure(_out)
     out.write_text("\n".join(findings) + ("\n" if findings else ""))
-    log("ok", f"05b-APISPEC: {len(findings)} findings → {out}")
+    log("OK", f"05b-APISPEC: {len(findings)} findings → {out}")
     return {"05b-APISPEC": str(_out), "count": len(findings)}

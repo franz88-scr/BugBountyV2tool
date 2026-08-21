@@ -28,6 +28,16 @@ from vulnforge.utils import (
 )
 
 
+def _ssi_processing_found(
+    body: str, baseline_body: str, payload: str, indicators: List[str]
+) -> bool:
+    """True only when an SSI indicator is new vs baseline and the raw payload
+    is not merely reflected (i.e. real server-side expansion occurred)."""
+    if payload in body:
+        return False
+    return any(ind in body and ind not in baseline_body for ind in indicators)
+
+
 async def phase_100_SSI(
     outdir: Path,
     t: Tools,
@@ -41,11 +51,11 @@ async def phase_100_SSI(
     _out = outdir / "ssi_injection.txt"
     if _out.exists() and not force:
         return {"100-SSI": str(_out), "count": count_nonblank(_out)}
-    log("info", "Phase 100-SSI: Server-Side Includes injection testing")
+    log("INFO", "Phase 100-SSI: Server-Side Includes injection testing")
     urls = outdir / "urls_all.txt"
     all_urls = read_lines(urls) if urls.exists() else []
     if not all_urls:
-        log("warn", "100-SSI: no URLs; skipping")
+        log("WARNING", "100-SSI: no URLs; skipping")
         return {"100-SSI": str(_out), "count": 0}
     findings: List[str] = []
     _urlopen = _get_urlopener()
@@ -75,6 +85,13 @@ async def phase_100_SSI(
         qs = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
         if not qs:
             continue
+        baseline_body = ""
+        try:
+            base_req = urllib.request.Request(u, headers={"User-Agent": "Mozilla/5.0", **_extra_h})
+            _, _, base_bytes = await _async_urlopen(_urlopen, base_req, timeout=10)
+            baseline_body = base_bytes.decode("utf-8", errors="ignore")
+        except Exception:
+            continue
         for param_name in qs:
             if param_name.lower() in _SKIP_PARAMS:
                 continue
@@ -92,21 +109,17 @@ async def phase_100_SSI(
                         _urlopen, req, timeout=10
                     )
                     body = body_bytes.decode("utf-8", errors="ignore")
-                    for indicator in _ssi_indicators:
-                        if indicator in body:
-                            findings.append(
-                                f"[ssi-injection] {test_url} param={param_name} payload={payload}"
-                            )
-                            break
+                    if _ssi_processing_found(body, baseline_body, payload, _ssi_indicators):
+                        findings.append(
+                            f"[ssi-injection] {test_url} param={param_name} payload={payload}"
+                        )
                 except urllib.error.HTTPError as e:
                     try:
                         body = e.read().decode("utf-8", errors="ignore")
-                        for indicator in _ssi_indicators:
-                            if indicator in body:
-                                findings.append(
-                                    f"[ssi-injection] {test_url} param={param_name} payload={payload}"
-                                )
-                                break
+                        if _ssi_processing_found(body, baseline_body, payload, _ssi_indicators):
+                            findings.append(
+                                f"[ssi-injection] {test_url} param={param_name} payload={payload}"
+                            )
                     except Exception:
                         pass
                 except Exception:
@@ -115,6 +128,15 @@ async def phase_100_SSI(
     for u in param_urls[: _PIPELINE_CFG.sample_urls_ssi]:
         parsed = urllib.parse.urlparse(u)
         base_url = urllib.parse.urlunparse((parsed.scheme, parsed.netloc, parsed.path, "", "", ""))
+        baseline_body = ""
+        try:
+            base_req = urllib.request.Request(
+                base_url, headers={"User-Agent": "Mozilla/5.0", **_extra_h}
+            )
+            _, _, base_bytes = await _async_urlopen(_urlopen, base_req, timeout=10)
+            baseline_body = base_bytes.decode("utf-8", errors="ignore")
+        except Exception:
+            continue
         for payload in _ssi_payloads:
             await _throttle_rate()
             try:
@@ -125,12 +147,8 @@ async def phase_100_SSI(
                     _urlopen, head_req, timeout=10
                 )
                 body = body_bytes.decode("utf-8", errors="ignore")
-                for indicator in _ssi_indicators:
-                    if indicator in body:
-                        findings.append(
-                            f"[ssi-header] {base_url} header=User-Agent payload={payload}"
-                        )
-                        break
+                if _ssi_processing_found(body, baseline_body, payload, _ssi_indicators):
+                    findings.append(f"[ssi-header] {base_url} header=User-Agent payload={payload}")
             except Exception:
                 pass
             await _throttle_rate()
@@ -142,17 +160,15 @@ async def phase_100_SSI(
                     _urlopen, ref_req, timeout=10
                 )
                 body = body_bytes.decode("utf-8", errors="ignore")
-                for indicator in _ssi_indicators:
-                    if indicator in body:
-                        findings.append(f"[ssi-header] {base_url} header=Referer payload={payload}")
-                        break
+                if _ssi_processing_found(body, baseline_body, payload, _ssi_indicators):
+                    findings.append(f"[ssi-header] {base_url} header=Referer payload={payload}")
             except Exception:
                 pass
     if not findings:
         findings.append("[ssi] No SSI injection candidates detected")
     out = ensure(_out)
     out.write_text("\n".join(findings) + ("\n" if findings else ""))
-    log("ok", f"100-SSI: {len(findings)} findings → {out}")
+    log("OK", f"100-SSI: {len(findings)} findings → {out}")
     return {"100-SSI": str(out), "count": len(findings)}
 
 
@@ -169,11 +185,11 @@ async def phase_101_JSONINJECT(
     _out = outdir / "json_injection.txt"
     if _out.exists() and not force:
         return {"101-JSONINJECT": str(_out), "count": count_nonblank(_out)}
-    log("info", "Phase 101-JSONINJECT: JSON/noSQL injection and mass assignment testing")
+    log("INFO", "Phase 101-JSONINJECT: JSON/noSQL injection and mass assignment testing")
     urls = outdir / "urls_all.txt"
     all_urls = read_lines(urls) if urls.exists() else []
     if not all_urls:
-        log("warn", "101-JSONINJECT: no URLs; skipping")
+        log("WARNING", "101-JSONINJECT: no URLs; skipping")
         return {"101-JSONINJECT": str(_out), "count": 0}
     findings: List[str] = []
     _urlopen = _get_urlopener()
@@ -211,6 +227,29 @@ async def phase_101_JSONINJECT(
             tested += 1
             parsed = urllib.parse.urlparse(u)
             base = urllib.parse.urlunparse((parsed.scheme, parsed.netloc, parsed.path, "", "", ""))
+            base_status = 0
+            base_body = ""
+            try:
+                base_req = urllib.request.Request(
+                    base,
+                    data=b'{"key": "baseline"}',
+                    headers={
+                        "User-Agent": "Mozilla/5.0",
+                        "Content-Type": "application/json",
+                        **_extra_h,
+                    },
+                    method="POST",
+                )
+                base_status, _, base_bytes = await _async_urlopen(_urlopen, base_req, timeout=10)
+                base_body = base_bytes.decode("utf-8", errors="ignore").lower()
+            except urllib.error.HTTPError as e:
+                base_status = e.code
+                try:
+                    base_body = e.read().decode("utf-8", errors="ignore").lower()
+                except Exception:
+                    pass
+            except Exception:
+                continue
             nosql_payloads = [
                 ('{"key": "value", "admin": true}', "admin"),
                 ('{"key": {"$ne": ""}}', "$ne"),
@@ -231,12 +270,24 @@ async def phase_101_JSONINJECT(
                         },
                         method="POST",
                     )
-                    p_status, _, _ = await _async_urlopen(_urlopen, post_req, timeout=10)
-                    if p_status in (200, 302):
-                        findings.append(f"[nosql-operator] {base} field=body operator={operator}")
+                    p_status, _, p_body = await _async_urlopen(_urlopen, post_req, timeout=10)
+                    p_text = p_body.decode("utf-8", errors="ignore").lower()
+                    if p_status == base_status and p_status in (200, 302) and p_text != base_body:
+                        findings.append(
+                            f"[nosql-operator] {base} field=body operator={operator} "
+                            f"(response differs from benign POST baseline)"
+                        )
                 except urllib.error.HTTPError as e:
-                    if e.code in (200, 302):
-                        findings.append(f"[nosql-operator] {base} field=body operator={operator}")
+                    err_body = ""
+                    try:
+                        err_body = e.read().decode("utf-8", errors="ignore").lower()
+                    except Exception:
+                        pass
+                    if e.code == base_status and e.code in (200, 302) and err_body != base_body:
+                        findings.append(
+                            f"[nosql-operator] {base} field=body operator={operator} "
+                            f"(response differs from benign POST baseline)"
+                        )
                 except Exception:
                     pass
             mass_assign_fields = ["role", "admin", "is_admin", "user_id"]
@@ -254,12 +305,24 @@ async def phase_101_JSONINJECT(
                         },
                         method="POST",
                     )
-                    p_status, _, _ = await _async_urlopen(_urlopen, post_req, timeout=10)
-                    if p_status in (200, 302):
-                        findings.append(f"[mass-assignment] {base} field={field}")
+                    p_status, _, p_body = await _async_urlopen(_urlopen, post_req, timeout=10)
+                    p_text = p_body.decode("utf-8", errors="ignore").lower()
+                    if p_status == base_status and p_status in (200, 302) and p_text != base_body:
+                        findings.append(
+                            f"[mass-assignment] {base} field={field} "
+                            f"(response differs from benign POST baseline)"
+                        )
                 except urllib.error.HTTPError as e:
-                    if e.code in (200, 302):
-                        findings.append(f"[mass-assignment] {base} field={field}")
+                    err_body = ""
+                    try:
+                        err_body = e.read().decode("utf-8", errors="ignore").lower()
+                    except Exception:
+                        pass
+                    if e.code == base_status and e.code in (200, 302) and err_body != base_body:
+                        findings.append(
+                            f"[mass-assignment] {base} field={field} "
+                            f"(response differs from benign POST baseline)"
+                        )
                 except Exception:
                     pass
         except Exception:
@@ -268,7 +331,7 @@ async def phase_101_JSONINJECT(
         findings.append("[jsoninject] No JSON injection candidates detected")
     out = ensure(_out)
     out.write_text("\n".join(findings) + ("\n" if findings else ""))
-    log("ok", f"101-JSONINJECT: {len(findings)} findings → {out}")
+    log("OK", f"101-JSONINJECT: {len(findings)} findings → {out}")
     return {"101-JSONINJECT": str(out), "count": len(findings)}
 
 
@@ -285,11 +348,11 @@ async def phase_102_NULLBYTE(
     _out = outdir / "null_byte_injection.txt"
     if _out.exists() and not force:
         return {"102-NULLBYTE": str(_out), "count": count_nonblank(_out)}
-    log("info", "Phase 102-NULLBYTE: null byte injection testing")
+    log("INFO", "Phase 102-NULLBYTE: null byte injection testing")
     urls = outdir / "urls_all.txt"
     all_urls = read_lines(urls) if urls.exists() else []
     if not all_urls:
-        log("warn", "102-NULLBYTE: no URLs; skipping")
+        log("WARNING", "102-NULLBYTE: no URLs; skipping")
         return {"102-NULLBYTE": str(_out), "count": 0}
     findings: List[str] = []
     _urlopen = _get_urlopener()
@@ -342,7 +405,7 @@ async def phase_102_NULLBYTE(
         findings.append("[null-byte] No null byte injection candidates detected")
     out = ensure(_out)
     out.write_text("\n".join(findings) + ("\n" if findings else ""))
-    log("ok", f"102-NULLBYTE: {len(findings)} findings → {out}")
+    log("OK", f"102-NULLBYTE: {len(findings)} findings → {out}")
     return {"102-NULLBYTE": str(out), "count": len(findings)}
 
 
@@ -359,11 +422,11 @@ async def phase_103_DOUBLEENCOD(
     _out = outdir / "double_encoding_bypass.txt"
     if _out.exists() and not force:
         return {"103-DOUBLEENCOD": str(_out), "count": count_nonblank(_out)}
-    log("info", "Phase 103-DOUBLEENCOD: double encoding bypass testing")
+    log("INFO", "Phase 103-DOUBLEENCOD: double encoding bypass testing")
     urls = outdir / "urls_all.txt"
     all_urls = read_lines(urls) if urls.exists() else []
     if not all_urls:
-        log("warn", "103-DOUBLEENCOD: no URLs; skipping")
+        log("WARNING", "103-DOUBLEENCOD: no URLs; skipping")
         return {"103-DOUBLEENCOD": str(_out), "count": 0}
     findings: List[str] = []
     _urlopen = _get_urlopener()
@@ -386,7 +449,7 @@ async def phase_103_DOUBLEENCOD(
             req = urllib.request.Request(
                 base_url, headers={"User-Agent": "Mozilla/5.0", **_extra_h}
             )
-            s0, _, _ = await _async_urlopen_no_redirect(_urlopen, req, timeout=10)
+            s0, _, _ = await _async_urlopen_no_redirect(req, timeout=10)
             baseline_status = s0
         except urllib.error.HTTPError as e:
             baseline_status = e.code
@@ -402,14 +465,14 @@ async def phase_103_DOUBLEENCOD(
                 req2 = urllib.request.Request(
                     test_url, headers={"User-Agent": "Mozilla/5.0", **_extra_h}
                 )
-                s2, _, _ = await _async_urlopen_no_redirect(_urlopen, req2, timeout=10)
-                if s2 != baseline_status:
+                s2, _, _ = await _async_urlopen_no_redirect(req2, timeout=10)
+                if s2 == 200 and baseline_status in (403, 404):
                     findings.append(
                         f"[double-encode-bypass] {test_url} payload={payload} "
                         f"baseline_status={baseline_status} new_status={s2}"
                     )
             except urllib.error.HTTPError as e:
-                if e.code != baseline_status:
+                if e.code == 200 and baseline_status in (403, 404):
                     findings.append(
                         f"[double-encode-bypass] {test_url} payload={payload} "
                         f"baseline_status={baseline_status} new_status={e.code}"
@@ -429,14 +492,14 @@ async def phase_103_DOUBLEENCOD(
                             req3 = urllib.request.Request(
                                 param_test_url, headers={"User-Agent": "Mozilla/5.0", **_extra_h}
                             )
-                            s3, _, _ = await _async_urlopen_no_redirect(_urlopen, req3, timeout=10)
-                            if s3 != baseline_status:
+                            s3, _, _ = await _async_urlopen_no_redirect(req3, timeout=10)
+                            if s3 == 200 and baseline_status in (403, 404):
                                 findings.append(
                                     f"[double-encode-bypass] {param_test_url} payload={payload} "
                                     f"baseline_status={baseline_status} new_status={s3}"
                                 )
                         except urllib.error.HTTPError as e:
-                            if e.code != baseline_status:
+                            if e.code == 200 and baseline_status in (403, 404):
                                 findings.append(
                                     f"[double-encode-bypass] {param_test_url} payload={payload} "
                                     f"baseline_status={baseline_status} new_status={e.code}"
@@ -447,7 +510,7 @@ async def phase_103_DOUBLEENCOD(
         findings.append("[double-encode] No double encoding bypass candidates detected")
     out = ensure(_out)
     out.write_text("\n".join(findings) + ("\n" if findings else ""))
-    log("ok", f"103-DOUBLEENCOD: {len(findings)} findings → {out}")
+    log("OK", f"103-DOUBLEENCOD: {len(findings)} findings → {out}")
     return {"103-DOUBLEENCOD": str(out), "count": len(findings)}
 
 
@@ -464,11 +527,11 @@ async def phase_104_UNICODE(
     _out = outdir / "unicode_bypass.txt"
     if _out.exists() and not force:
         return {"104-UNICODE": str(_out), "count": count_nonblank(_out)}
-    log("info", "Phase 104-UNICODE: Unicode normalization bypass attacks")
+    log("INFO", "Phase 104-UNICODE: Unicode normalization bypass attacks")
     urls = outdir / "urls_all.txt"
     all_urls = read_lines(urls) if urls.exists() else []
     if not all_urls:
-        log("warn", "104-UNICODE: no URLs; skipping")
+        log("WARNING", "104-UNICODE: no URLs; skipping")
         return {"104-UNICODE": str(_out), "count": 0}
     findings: List[str] = []
     _urlopen = _get_urlopener()
@@ -483,7 +546,14 @@ async def phase_104_UNICODE(
     target_urls = [u for u in all_urls if "=" in u or urllib.parse.urlparse(u).path.strip("/")]
     for u in target_urls[: _PIPELINE_CFG.sample_urls_unicode]:
         parsed = urllib.parse.urlparse(u)
-        urllib.parse.urlunparse((parsed.scheme, parsed.netloc, parsed.path, "", "", ""))
+        baseline_status = 0
+        try:
+            base_req = urllib.request.Request(u, headers={"User-Agent": "Mozilla/5.0", **_extra_h})
+            baseline_status, _, _ = await _async_urlopen(_urlopen, base_req, timeout=10)
+        except urllib.error.HTTPError as e:
+            baseline_status = e.code
+        except Exception:
+            continue
         for payload in overlong_payloads:
             test_path = parsed.path.rstrip("/") + "/" + payload.strip("/")
             test_url = urllib.parse.urlunparse(
@@ -496,21 +566,17 @@ async def phase_104_UNICODE(
                 )
                 s, _, b = await _async_urlopen(_urlopen, req, timeout=10)
                 b.decode("utf-8", errors="ignore")
-                hint = ""
-                if s == 200:
-                    hint = "accessible"
-                elif s in (301, 302):
-                    hint = "redirect"
-                elif s in (403, 401):
-                    hint = "blocked"
-                if s in (200, 301, 302):
+                if s in (200, 301, 302) and s != baseline_status:
+                    hint = "accessible" if s == 200 else str(s)
                     findings.append(
-                        f"[unicode-bypass] {test_url} payload={payload} response_hint={hint}"
+                        f"[unicode-bypass] {test_url} payload={payload} "
+                        f"baseline_status={baseline_status} response_hint={hint}"
                     )
             except urllib.error.HTTPError as e:
-                if e.code not in (404, 410):
+                if e.code in (200, 301, 302) and e.code != baseline_status:
                     findings.append(
-                        f"[unicode-bypass] {test_url} payload={payload} response_hint=HTTP_{e.code}"
+                        f"[unicode-bypass] {test_url} payload={payload} "
+                        f"baseline_status={baseline_status} response_hint=HTTP_{e.code}"
                     )
             except Exception:
                 continue
@@ -532,15 +598,16 @@ async def phase_104_UNICODE(
                             )
                             s, _, b = await _async_urlopen(_urlopen, req, timeout=10)
                             b.decode("utf-8", errors="ignore")
-                            hint = "accessible" if s == 200 else str(s)
-                            if s in (200, 301, 302):
+                            if s in (200, 301, 302) and s != baseline_status:
                                 findings.append(
-                                    f"[unicode-bypass] {param_test_url} payload={payload} response_hint={hint}"
+                                    f"[unicode-bypass] {param_test_url} payload={payload} "
+                                    f"baseline_status={baseline_status} response_hint={s}"
                                 )
                         except urllib.error.HTTPError as e:
-                            if e.code not in (404, 410):
+                            if e.code in (200, 301, 302) and e.code != baseline_status:
                                 findings.append(
-                                    f"[unicode-bypass] {param_test_url} payload={payload} response_hint=HTTP_{e.code}"
+                                    f"[unicode-bypass] {param_test_url} payload={payload} "
+                                    f"baseline_status={baseline_status} response_hint=HTTP_{e.code}"
                                 )
                         except Exception:
                             continue
@@ -548,7 +615,7 @@ async def phase_104_UNICODE(
         findings.append("[unicode] No Unicode bypass candidates detected")
     out = ensure(_out)
     out.write_text("\n".join(findings) + ("\n" if findings else ""))
-    log("ok", f"104-UNICODE: {len(findings)} findings → {out}")
+    log("OK", f"104-UNICODE: {len(findings)} findings → {out}")
     return {"104-UNICODE": str(out), "count": len(findings)}
 
 
@@ -565,11 +632,11 @@ async def phase_105_POSTMSGXSS(
     _out = outdir / "postmessage_xss.txt"
     if _out.exists() and not force:
         return {"105-POSTMSGXSS": str(_out), "count": count_nonblank(_out)}
-    log("info", "Phase 105-POSTMSGXSS: postMessage XSS detection")
+    log("INFO", "Phase 105-POSTMSGXSS: postMessage XSS detection")
     urls = outdir / "urls_all.txt"
     all_urls = read_lines(urls) if urls.exists() else []
     if not all_urls:
-        log("warn", "105-POSTMSGXSS: no URLs; skipping")
+        log("WARNING", "105-POSTMSGXSS: no URLs; skipping")
         return {"105-POSTMSGXSS": str(_out), "count": 0}
     findings: List[str] = []
     _urlopen = _get_urlopener()
@@ -623,7 +690,7 @@ async def phase_105_POSTMSGXSS(
         findings.append("[postmessage-xss] No vulnerable postMessage handlers found")
     out = ensure(_out)
     out.write_text("\n".join(findings) + ("\n" if findings else ""))
-    log("ok", f"105-POSTMSGXSS: {len(findings)} findings → {out}")
+    log("OK", f"105-POSTMSGXSS: {len(findings)} findings → {out}")
     return {"105-POSTMSGXSS": str(out), "count": len(findings)}
 
 
@@ -640,11 +707,11 @@ async def phase_106_JSONP(
     _out = outdir / "jsonp_endpoints.txt"
     if _out.exists() and not force:
         return {"106-JSONP": str(_out), "count": count_nonblank(_out)}
-    log("info", "Phase 106-JSONP: JSONP endpoint detection and abuse testing")
+    log("INFO", "Phase 106-JSONP: JSONP endpoint detection and abuse testing")
     urls = outdir / "urls_all.txt"
     all_urls = read_lines(urls) if urls.exists() else []
     if not all_urls:
-        log("warn", "106-JSONP: no URLs; skipping")
+        log("WARNING", "106-JSONP: no URLs; skipping")
         return {"106-JSONP": str(_out), "count": 0}
     findings: List[str] = []
     _urlopen = _get_urlopener()
@@ -687,5 +754,5 @@ async def phase_106_JSONP(
         findings.append("[jsonp] No JSONP endpoints detected")
     out = ensure(_out)
     out.write_text("\n".join(findings) + ("\n" if findings else ""))
-    log("ok", f"106-JSONP: {len(findings)} findings → {out}")
+    log("OK", f"106-JSONP: {len(findings)} findings → {out}")
     return {"106-JSONP": str(out), "count": len(findings)}

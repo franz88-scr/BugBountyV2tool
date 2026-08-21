@@ -6,7 +6,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
-from typing import Any, Dict, List, Set
+from typing import Any, Dict, List, Set, Tuple
 
 from vulnforge.phases.helpers import PhaseSet
 from vulnforge.tools import Tools
@@ -128,7 +128,7 @@ async def phase_165_DEPCONF(
     _out = outdir / "supplychain_depconf.txt"
     if _out.exists() and not force:
         return {"165-DEPCONF": str(_out), "count": count_nonblank(_out)}
-    log("info", "Phase 165-DEPCONF: dependency confusion testing")
+    log("INFO", "Phase 165-DEPCONF: dependency confusion testing")
     findings: List[str] = []
     dependency_urls: List[str] = []
     live_hosts = _load_live_hosts(outdir)
@@ -140,13 +140,15 @@ async def phase_165_DEPCONF(
             dependency_urls.append(f"{base}/app/{dep_file}")
             dependency_urls.append(f"{base}/src/{dep_file}")
             dependency_urls.append(f"{base}/vendor/{dep_file}")
-    private_packages: Set[str] = set()
+    private_packages: Set[Tuple[str, str]] = set()
     for dep_url in dependency_urls:
         await _throttle_rate()
         try:
             opener_sc = _get_urlopener()
             req_sc = urllib.request.Request(dep_url)
-            _, _, data = await _async_urlopen(opener_sc, req_sc, timeout=10)
+            status, _, data = await _async_urlopen(opener_sc, req_sc, timeout=10)
+            if status != 200:
+                continue
             if not data:
                 continue
             content = data.decode("utf-8", errors="replace")
@@ -156,11 +158,13 @@ async def phase_165_DEPCONF(
                     pkg = json.loads(content)
                     for section in ["dependencies", "devDependencies"]:
                         for pkg_name in pkg.get(section, {}):
-                            if (
-                                not pkg_name.startswith("@")
-                                and pkg_name not in _POPULAR_NPM_PACKAGES
-                            ):
-                                private_packages.add(pkg_name)
+                            if pkg_name not in _POPULAR_NPM_PACKAGES:
+                                private_packages.add(
+                                    (
+                                        "https://registry.npmjs.org",
+                                        urllib.parse.quote(pkg_name, safe=""),
+                                    )
+                                )
                 except (json.JSONDecodeError, Exception):
                     pass
             elif dep_url.endswith("requirements.txt"):
@@ -169,7 +173,7 @@ async def phase_165_DEPCONF(
                     if line and not line.startswith("#") and not line.startswith("-"):
                         pkg_name = re.split(r"[=<>!~]", line)[0].strip()
                         if pkg_name and pkg_name not in _POPULAR_PYTHON_PACKAGES:
-                            private_packages.add(pkg_name)
+                            private_packages.add(("https://pypi.org/pypi", f"{pkg_name}/json"))
             elif dep_url.endswith("go.mod"):
                 for line in content.splitlines():
                     m = re.match(r"\s+([a-z0-9./-]+)\s+v", line)
@@ -181,24 +185,26 @@ async def phase_165_DEPCONF(
                                 candidate = "/".join(org_repo[:3])
                                 if candidate.endswith("/"):
                                     candidate = candidate[:-1]
-                                private_packages.add(candidate)
+                                private_packages.add(
+                                    ("https://proxy.golang.org", f"{candidate}/@latest")
+                                )
         except Exception:
             continue
     findings.append("")
     findings.append("--- potential dependency confusion candidates ---")
-    for pkg in sorted(private_packages)[:30]:
+    for registry, pkg in sorted(private_packages)[:30]:
         await _throttle_rate()
-        npm_exists = await _check_public_package_exists("https://registry.npmjs.org", pkg)
-        if not npm_exists:
-            findings.append(f"[npm-confusion] {pkg} → NOT on public npm (confusion risk)")
+        exists = await _check_public_package_exists(registry, pkg)
+        if not exists:
+            findings.append(f"[dep-confusion] {pkg} → NOT on {registry} (confusion risk)")
     findings.append("")
     findings.append(
         f"[summary] {len(private_packages)} private packages found, "
-        f"{sum(1 for f in findings if 'npm-confusion' in f)} confusion candidates"
+        f"{sum(1 for f in findings if 'dep-confusion' in f)} confusion candidates"
     )
     out = ensure(_out)
     out.write_text("\n".join(findings) + ("\n" if findings else ""))
-    log("ok", f"165-DEPCONF: {len(findings)} findings → {out}")
+    log("OK", f"165-DEPCONF: {len(findings)} findings → {out}")
     return {"165-DEPCONF": str(_out), "count": len(findings)}
 
 
@@ -215,7 +221,7 @@ async def phase_166_TYPOSQUAT(
     _out = outdir / "supplychain_typosquat.txt"
     if _out.exists() and not force:
         return {"166-TYPOSQUAT": str(_out), "count": count_nonblank(_out)}
-    log("info", "Phase 166-TYPOSQUAT: typo-squatting detection")
+    log("INFO", "Phase 166-TYPOSQUAT: typo-squatting detection")
     findings: List[str] = []
     known_squats = [
         ("lodahs", "lodash"),
@@ -228,16 +234,12 @@ async def phase_166_TYPOSQUAT(
         ("uuidv4", "uuid"),
         ("debugg", "debug"),
         ("commnder", "commander"),
-        ("flask", "flask"),
         ("dajngo", "django"),
         ("requets", "requests"),
-        ("numpy", "numpy"),
         ("panadas", "pandas"),
-        ("fastapi", "fastapi"),
         ("celerry", "celery"),
         ("solalchemy", "sqlalchemy"),
         ("beautifulsup4", "beautifulsoup4"),
-        ("pyyaml", "pyyaml"),
     ]
     live_hosts = _load_live_hosts(outdir)
     dep_urls: List[str] = []
@@ -252,7 +254,9 @@ async def phase_166_TYPOSQUAT(
         try:
             opener_sc = _get_urlopener()
             req_sc = urllib.request.Request(dep_url)
-            _, _, data = await _async_urlopen(opener_sc, req_sc, timeout=10)
+            status, _, data = await _async_urlopen(opener_sc, req_sc, timeout=10)
+            if status != 200:
+                continue
             if not data:
                 continue
             content = data.decode("utf-8", errors="replace")
@@ -291,5 +295,5 @@ async def phase_166_TYPOSQUAT(
                 findings.append(f"[possible-typo] {pkg} → may be a typo of '{legitimate}'")
     out = ensure(_out)
     out.write_text("\n".join(findings) + ("\n" if findings else ""))
-    log("ok", f"166-TYPOSQUAT: {len(findings)} findings → {out}")
+    log("OK", f"166-TYPOSQUAT: {len(findings)} findings → {out}")
     return {"166-TYPOSQUAT": str(_out), "count": len(findings)}

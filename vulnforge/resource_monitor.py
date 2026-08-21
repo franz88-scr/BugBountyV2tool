@@ -477,7 +477,7 @@ class ResourceMonitor:
                     os.kill(pid, signal.SIGTERM)
                 except (OSError, ProcessLookupError, PermissionError):
                     pass
-            log("warn", f"Sent SIGTERM to {len(to_kill)} child processes")
+            log("WARNING", f"Sent SIGTERM to {len(to_kill)} child processes")
 
         # Force SIGKILL after 3s for stubborn processes — re-check before kill
         time.sleep(3)
@@ -504,10 +504,10 @@ class ResourceMonitor:
             try:
                 self._measure_and_adjust()
             except Exception as exc:
-                log("err", f"ResourceMonitor._measure_and_adjust crashed: {exc}")
+                log("ERROR", f"ResourceMonitor._measure_and_adjust crashed: {exc}")
                 import traceback
 
-                log("err", traceback.format_exc())
+                log("ERROR", traceback.format_exc())
 
     def _measure_and_adjust(self) -> None:
         self.cpu_percent = self._read_cpu_percent()

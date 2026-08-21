@@ -117,7 +117,7 @@ def calculate_risk_score(outdir: Path) -> RiskScore:
             chains = json.loads(chains_file.read_text(encoding="utf-8"))
             critical_paths = sum(1 for c in chains if c.get("severity") == "critical")
         except Exception as exc:
-            log("warn", f"Failed to read exploit_chains.json for risk score: {exc}")
+            log("WARNING", f"Failed to read exploit_chains.json for risk score: {exc}")
 
     # Generate recommendations
     recommendations = []

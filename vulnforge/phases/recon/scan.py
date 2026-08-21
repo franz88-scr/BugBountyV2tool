@@ -2,6 +2,7 @@
 
 import asyncio
 import shlex
+import socket
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -67,7 +68,7 @@ async def phase_04_SCAN(
             "04-SCAN.takeover": str(outdir / "takeover.txt"),
             "count": count_nonblank(ports_file),
         }
-    log("info", "Phase 04-SCAN: ports / hosts / takeover (sequential)")
+    log("INFO", "Phase 04-SCAN: ports / hosts / takeover (sequential)")
     hosts = Path(prev.get("02-RESOLVE") or outdir / "resolved.txt")
     subs = Path(prev.get("01-RECON") or outdir / "all_subs.txt")
     ports_file = outdir / "ports.txt"
@@ -81,7 +82,7 @@ async def phase_04_SCAN(
             if have_hosts or have_subs:
                 break
         if not have_hosts and not have_subs:
-            log("warn", "04-SCAN: no host or subdomain input; skipping")
+            log("WARNING", "04-SCAN: no host or subdomain input; skipping")
             return _existing_artifacts(
                 {
                     "04-SCAN.ports": str(ports_file),
@@ -264,6 +265,7 @@ async def phase_04_SCAN(
         sv_jobs: List[Tuple[str, List[str], int]] = []
         host_ports: Dict[str, List[str]] = {}
         _live_hosts: Set[str] = set()
+        _live_ips: Set[str] = set()
         _raw_hosts_file = outdir / "hosts.txt"
         if _raw_hosts_file.exists():
             for _ln in read_lines(_raw_hosts_file):
@@ -271,13 +273,23 @@ async def phase_04_SCAN(
                     _h_match = _extract_host(_ln)
                     if _h_match:
                         _live_hosts.add(_h_match)
+                        try:
+                            _live_ips.update(
+                                str(_ai[4][0]) for _ai in socket.getaddrinfo(_h_match, None)
+                            )
+                        except OSError:
+                            pass
         _skipped = 0
         for ln in read_lines(ports_file):
             if ":" in ln:
                 h, p = ln.rsplit(":", 1)
-                if _live_hosts and h not in _live_hosts:
-                    _skipped += 1
-                    continue
+                # ports.txt holds IP:port pairs (naabu resolves hostnames to IPs).
+                # Match against the resolved IPs of live hosts; when the IPs could
+                # not be resolved for comparison, accept conservatively.
+                if _live_hosts and h not in _live_hosts and h not in _live_ips:
+                    if _live_ips:
+                        _skipped += 1
+                        continue
                 host_ports.setdefault(h, []).append(p)
         if _skipped:
             log(
@@ -311,7 +323,7 @@ async def phase_04_SCAN(
                         sv_findings.append(ln.strip())
             if sv_findings:
                 ensure(services_file).write_text("\n".join(sv_findings) + "\n")
-                log("ok", f"04-SCAN: {len(sv_findings)} service detections → {services_file}")
+                log("OK", f"04-SCAN: {len(sv_findings)} service detections → {services_file}")
             for svp in outdir.glob("services_*.gnmap"):
                 svp.unlink(missing_ok=True)
     # Synthesize ports.txt from gnmap if nmap was used
@@ -361,6 +373,89 @@ async def phase_04_SCAN(
     }
 
 
+# Provider-specific dangling CNAME signatures: (provider, cname_domains, http_markers)
+# http_markers must be distinctive of a takeover page — NOT generic "not found" strings.
+_TAKEOVER_SIGNATURES: List[Tuple[str, Tuple[str, ...], Tuple[str, ...]]] = [
+    (
+        "aws-s3",
+        ("amazonaws.com", "s3.amazonaws.com", "s3.us", "s3.eu"),
+        ("no such bucket", "nosuchbucket", "the specified bucket does not exist"),
+    ),
+    (
+        "github-pages",
+        ("github.io", "github.com"),
+        (
+            "there isn't a github pages site here",
+            "is not a github pages site",
+            "no site at this address",
+        ),
+    ),
+    (
+        "azure",
+        ("azurewebsites.net", "cloudapp.net", "trafficmanager.net"),
+        ("404 web site not found", "page not found in azure"),
+    ),
+    (
+        "heroku",
+        ("herokuapp.com", "herokudns.com", "herokussl.com"),
+        ("no such app", "there is nothing here for you", "heroku | no such app"),
+    ),
+    (
+        "netlify",
+        ("netlify.app", "netlify.com", "netlify.site"),
+        ("not found · netlify", "site not found", "netlify error page"),
+    ),
+    (
+        "fastly",
+        ("fastly.net", "fastly.com", "global.fastly.net"),
+        ("fastly error: unknown domain", "domain is not configured"),
+    ),
+    (
+        "shopify",
+        ("shops.myshopify.com", "shopify.com"),
+        ("only one store can be hosted", "no such store"),
+    ),
+    (
+        "bitbucket",
+        ("bitbucket.io", "bitbucket.org"),
+        ("repository not found", "404. that’s an error"),
+    ),
+    (
+        "pantheon",
+        ("pantheonsite.io", "pantheon.io"),
+        ("404 error unknown site", "the gods are angry", "unknown site"),
+    ),
+    (
+        "surge",
+        ("surge.sh", "surge"),
+        ("project not found", "domain not found", "surge.sh page not found"),
+    ),
+    (
+        "uservoice",
+        ("uservoice.com", "uservoice"),
+        ("this user's subdomain is not assigned", "uservoice domain"),
+    ),
+]
+
+
+def _takeover_signature(body: str) -> str:
+    """Return the provider name whose HTTP marker appears in body, else ''."""
+    body_lower = body.lower()
+    for provider, _cname, markers in _TAKEOVER_SIGNATURES:
+        if any(m in body_lower for m in markers):
+            return provider
+    return ""
+
+
+def _takeover_cname_provider(official_name: str) -> str:
+    """Map a resolved CNAME official-name back to a takeover-prone provider."""
+    official_lower = official_name.lower()
+    for provider, cname_domains, _m in _TAKEOVER_SIGNATURES:
+        if any(d in official_lower for d in cname_domains):
+            return provider
+    return ""
+
+
 async def phase_04b_TAKEOVER_VALIDATE(
     outdir: Path,
     t: Tools,
@@ -375,7 +470,7 @@ async def phase_04b_TAKEOVER_VALIDATE(
     _out = outdir / "takeover_confirmed.txt"
     if _out.exists() and not force:
         return {"04b-TAKEOVER-VALIDATE": str(_out), "count": count_nonblank(_out)}
-    log("info", "Phase 04b-TAKEOVER-VALIDATE: confirm dangling CNAME takeover candidates")
+    log("INFO", "Phase 04b-TAKEOVER-VALIDATE: confirm dangling CNAME takeover candidates")
     findings: List[str] = []
     _tv_urlopen = _get_urlopener()
     _tv_extra_headers = _extra_headers_dict()
@@ -405,7 +500,7 @@ async def phase_04b_TAKEOVER_VALIDATE(
                     candidates.append(url)
     candidates = _dedupe_by_host_path(candidates)
     if not candidates:
-        log("warn", "04b-TAKEOVER-VALIDATE: no takeover candidates found; skipping")
+        log("WARNING", "04b-TAKEOVER-VALIDATE: no takeover candidates found; skipping")
         return {"04b-TAKEOVER-VALIDATE": str(_out), "count": 0}
     findings.append(f"candidates_found={len(candidates)}")
     for cand in candidates[: _PIPELINE_CFG.sample_urls_fuzz]:
@@ -421,36 +516,37 @@ async def phase_04b_TAKEOVER_VALIDATE(
             )
             status, headers, body_bytes = await _async_urlopen(_tv_urlopen, req, timeout=10)
             body = body_bytes.decode("utf-8", errors="ignore").lower()
-            takeover_indicators = [
-                "no such bucket",
-                "does not exist",
-                "not found",
-                "repository not found",
-                "there is no site",
-                "no such app",
-                "404 blog not found",
-                "please configure",
-                "this page is not available",
-                "the page you are looking for is not here",
-                "this site is not configured",
-                "account not found",
-                "this user's page",
-                "is not currently accepting",
-                "there is nothing here for you",
-            ]
-            if status == 404 or any(ind in body for ind in takeover_indicators):
-                findings.append(f"[confirmed] {cand} → HTTP {status} (likely vulnerable)")
+            hostname = urllib.parse.urlparse(url).hostname or cand
+            cname_provider = ""
+            try:
+                _official = await asyncio.to_thread(socket.gethostbyname_ex, hostname)
+                cname_provider = _takeover_cname_provider(str(_official[0]))
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                pass
+            matched_provider = _takeover_signature(body)
+            if matched_provider:
+                findings.append(
+                    f"[confirmed] {cand} -> HTTP {status} "
+                    f"(provider signature: {matched_provider}"
+                    + (f", cname: {cname_provider}" if cname_provider else "")
+                    + ")"
+                )
                 if "server" in headers:
                     findings.append(f"  server={headers['server']}")
-            elif status in (200, 301, 302):
-                findings.append(f"[potential] {cand} → HTTP {status} (check manually)")
+            elif cname_provider and status in (404, 200):
+                findings.append(
+                    f"[potential] {cand} -> HTTP {status} "
+                    f"(dangling CNAME to {cname_provider}, no provider signature)"
+                )
             else:
-                findings.append(f"[checked] {cand} → HTTP {status} (not vulnerable)")
+                findings.append(f"[checked] {cand} -> HTTP {status} (no takeover signature)")
         except Exception as e:
-            findings.append(f"[error] {cand} → {e}")
+            findings.append(f"[error] {cand} -> {e}")
     if not any(f.startswith("[confirmed]") for f in findings):
         findings.append("[result] No confirmed takeover vulnerabilities detected")
     out = ensure(_out)
     out.write_text("\n".join(findings) + ("\n" if findings else ""))
-    log("ok", f"04b-TAKEOVER-VALIDATE: {len(findings)} findings → {out}")
+    log("OK", f"04b-TAKEOVER-VALIDATE: {len(findings)} findings → {out}")
     return {"04b-TAKEOVER-VALIDATE": str(_out), "count": len(findings)}

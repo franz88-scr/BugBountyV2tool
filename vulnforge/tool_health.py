@@ -103,7 +103,7 @@ class ToolHealthMonitor:
                     self._disabled_tools.add(name)
                 self._tools[name] = tm
         except Exception as exc:
-            log("warn", f"Failed to load tool health state: {exc}")
+            log("WARNING", f"Failed to load tool health state: {exc}")
 
     def _save(self) -> None:
         if not self._state_path:

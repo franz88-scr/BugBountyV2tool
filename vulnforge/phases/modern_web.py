@@ -10,6 +10,7 @@ import urllib.request
 from pathlib import Path
 from typing import Any, Dict, List
 
+from vulnforge.phases.harness import phase_targets
 from vulnforge.phases.helpers import PhaseSet
 from vulnforge.process import _PIPELINE_CFG
 from vulnforge.tools import Tools
@@ -25,6 +26,11 @@ from vulnforge.utils import (
 
 _JWT_RE = re.compile(r"eyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+")
 
+_SW_SECRET_ASSIGN_RE = re.compile(
+    r"(?:api[_-]?key|secret|token|password|auth)[a-z0-9_]*\s*[:=]\s*['\"][^'\"]{4,}",
+    re.I,
+)
+
 
 async def phase_173_SERVICEWORKER(
     outdir: Path,
@@ -39,18 +45,17 @@ async def phase_173_SERVICEWORKER(
     _out = outdir / "service_worker.txt"
     if _out.exists() and not force:
         return {"173-SERVICEWORKER": str(_out), "count": count_nonblank(_out)}
-    log("info", "Phase 173-SERVICEWORKER: service worker abuse probes")
+    log("INFO", "Phase 173-SERVICEWORKER: service worker abuse probes")
     findings: List[str] = []
     sw_urlopen = _get_urlopener()
     sw_extra_headers = _extra_headers_dict()
-    hosts_file = outdir / "hosts.txt"
-    targets = (
-        [f"https://{h}" if not h.startswith("http") else h for h in read_lines(hosts_file)]
-        if hosts_file.exists()
-        else []
-    )[: _PIPELINE_CFG.sample_hosts_cached if hasattr(_PIPELINE_CFG, "sample_hosts_cached") else 100]
+    targets = phase_targets(outdir, "hosts")[
+        : _PIPELINE_CFG.sample_hosts_cached
+        if hasattr(_PIPELINE_CFG, "sample_hosts_cached")
+        else 100
+    ]
     if not targets:
-        log("warn", "173-SERVICEWORKER: no HTTP targets; skipping")
+        log("WARNING", "173-SERVICEWORKER: no HTTP targets; skipping")
         return {"173-SERVICEWORKER": str(_out), "count": 0}
 
     async def _probe_sw(host: str) -> List[str]:
@@ -80,21 +85,10 @@ async def phase_173_SERVICEWORKER(
                             results.append(
                                 f"[sw-postmessage-no-origin] {url} — postMessage handler without origin validation (CWE-346)"
                             )
-                    for kw in [
-                        "api_key",
-                        "api-key",
-                        "apikey",
-                        "secret",
-                        "token",
-                        "password",
-                        "auth",
-                    ]:
-                        if kw in body_str.lower():
-                            idx = body_str.lower().index(kw)
-                            snippet = body_str[max(0, idx - 20) : idx + 60]
-                            results.append(
-                                f"[sw-hardcoded-secret] {url} — '{kw}' near: {snippet.strip()}"
-                            )
+                    for m in _SW_SECRET_ASSIGN_RE.finditer(body_str):
+                        results.append(
+                            f"[sw-hardcoded-secret] {url} — assignment near: {m.group(0)[:80]}"
+                        )
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -119,7 +113,9 @@ async def phase_173_SERVICEWORKER(
                     )
                     scope_info = f" scope={scope_match.group(1)}" if scope_match else ""
                     results.append(f"[sw-registration] {host} — register({sw_url}){scope_info}")
-                if "onmessage" in main_str or "addEventListener.*message" in main_str:
+                if "onmessage" in main_str or re.search(
+                    r"addEventListener\s*\(\s*['\"]message['\"]", main_str, re.I
+                ):
                     if "event.origin" not in main_str and "event.source" not in main_str:
                         results.append(
                             f"[sw-page-message-no-origin] {host} — page has message handler without origin validation"
@@ -138,7 +134,7 @@ async def phase_173_SERVICEWORKER(
         findings.append("[service-worker] No service worker abuse vectors detected (expected)")
     out = ensure(_out)
     out.write_text("\n".join(findings) + ("\n" if findings else ""))
-    log("ok", f"173-SERVICEWORKER: {len(findings)} findings -> {out}")
+    log("OK", f"173-SERVICEWORKER: {len(findings)} findings -> {out}")
     return {"173-SERVICEWORKER": str(out), "count": len(findings)}
 
 
@@ -155,7 +151,7 @@ async def phase_174_WASMSEC(
     _out = outdir / "wasm_findings.txt"
     if _out.exists() and not force:
         return {"174-WASMSEC": str(_out), "count": count_nonblank(_out)}
-    log("info", "Phase 174-WASMSEC: WebAssembly security analysis")
+    log("INFO", "Phase 174-WASMSEC: WebAssembly security analysis")
     findings: List[str] = []
     wasm_urlopen = _get_urlopener()
     wasm_headers = _extra_headers_dict()
@@ -173,10 +169,12 @@ async def phase_174_WASMSEC(
                 wasm_urls.append(u)
 
     if not wasm_urls:
-        wasm_urls.append("https://example.com/app.wasm")
-        log("info", "174-WASMSEC: no .wasm URLs found; using sample check")
+        log("INFO", "174-WASMSEC: no .wasm URLs found; skipping")
         findings.append("[wasm-info] No .wasm files discovered in harvested URLs")
         findings.append("[wasm-info] Manual hint: look for .wasm references in JS sources")
+        out = ensure(_out)
+        out.write_text("\n".join(findings) + "\n")
+        return {"174-WASMSEC": str(_out), "count": 0}
 
     async def _analyze_wasm(wasm_url: str) -> List[str]:
         results: List[str] = []
@@ -247,7 +245,7 @@ async def phase_174_WASMSEC(
         findings.append("[wasm] No WebAssembly security issues detected (expected)")
     out = ensure(_out)
     out.write_text("\n".join(findings) + ("\n" if findings else ""))
-    log("ok", f"174-WASMSEC: {len(findings)} findings -> {out}")
+    log("OK", f"174-WASMSEC: {len(findings)} findings -> {out}")
     return {"174-WASMSEC": str(out), "count": len(findings)}
 
 
@@ -264,19 +262,18 @@ async def phase_176_JWT2SELF(
     _out = outdir / "jwt_xss.txt"
     if _out.exists() and not force:
         return {"176-JWT2SELF": str(_out), "count": count_nonblank(_out)}
-    log("info", "Phase 176-JWT2SELF: JWT-to-self XSS detection")
+    log("INFO", "Phase 176-JWT2SELF: JWT-to-self XSS detection")
     findings: List[str] = []
     jwt_urlopen = _get_urlopener()
     jwt_extra_headers = _extra_headers_dict()
 
-    hosts_file = outdir / "hosts.txt"
-    targets = (
-        [f"https://{h}" if not h.startswith("http") else h for h in read_lines(hosts_file)]
-        if hosts_file.exists()
-        else []
-    )[: _PIPELINE_CFG.sample_hosts_cached if hasattr(_PIPELINE_CFG, "sample_hosts_cached") else 100]
+    targets = phase_targets(outdir, "hosts")[
+        : _PIPELINE_CFG.sample_hosts_cached
+        if hasattr(_PIPELINE_CFG, "sample_hosts_cached")
+        else 100
+    ]
     if not targets:
-        log("warn", "176-JWT2SELF: no HTTP targets; skipping")
+        log("WARNING", "176-JWT2SELF: no HTTP targets; skipping")
         return {"176-JWT2SELF": str(_out), "count": 0}
 
     xss_payload = "<img src=x onerror=alert(1)>"
@@ -330,8 +327,8 @@ async def phase_176_JWT2SELF(
                             method="GET",
                             headers={
                                 "User-Agent": "Mozilla/5.0",
-                                "Authorization": f"Bearer {forged}",
                                 **jwt_extra_headers,
+                                "Authorization": f"Bearer {forged}",
                             },
                         )
                         _, _, xss_body = await _async_urlopen(jwt_urlopen, xss_req, timeout=10)
@@ -366,5 +363,5 @@ async def phase_176_JWT2SELF(
         findings.append("[jwt-xss] No JWT-to-self XSS vectors detected (expected)")
     out = ensure(_out)
     out.write_text("\n".join(findings) + ("\n" if findings else ""))
-    log("ok", f"176-JWT2SELF: {len(findings)} findings -> {out}")
+    log("OK", f"176-JWT2SELF: {len(findings)} findings -> {out}")
     return {"176-JWT2SELF": str(out), "count": len(findings)}

@@ -134,7 +134,7 @@ def filter_outputs(outdir: Path) -> int:
 
     txt_files = sorted(outdir.rglob("*.txt"))
     if not txt_files:
-        log("info", "no output files to filter")
+        log("INFO", "no output files to filter")
         return 0
 
     for fp in txt_files:
@@ -164,10 +164,10 @@ def filter_outputs(outdir: Path) -> int:
         if not significant:
             fp.write_text("")
             emptied += 1
-            log("info", f"filter {fname}: removed {removed}/{len(lines)} → emptied")
+            log("INFO", f"filter {fname}: removed {removed}/{len(lines)} → emptied")
         else:
             fp.write_text("".join(kept))
-            log("info", f"filter {fname}: removed {removed}/{len(lines)} lines")
+            log("INFO", f"filter {fname}: removed {removed}/{len(lines)} lines")
 
-    log("info", f"filter total: {total_removed} lines removed, {emptied} files emptied")
+    log("INFO", f"filter total: {total_removed} lines removed, {emptied} files emptied")
     return total_removed

@@ -49,20 +49,20 @@ def _run_single(domain: str, args: argparse.Namespace) -> int:
     try:
         return asyncio.run(run_pipeline(a))
     except KeyboardInterrupt:
-        log("warn", "interrupted")
+        log("WARNING", "interrupted")
         return 130
     except ValueError as e:
-        log("err", str(e))
+        log("ERROR", str(e))
         return 2
     except RuntimeError as e:
         _msg = str(e).lower()
         if "event loop" in _msg or "loop is closed" in _msg or "loop is running" in _msg:
-            log("warn", "event loop shutdown race (non-fatal)")
+            log("WARNING", "event loop shutdown race (non-fatal)")
             return 0
-        log("err", f"runtime error: {e}")
+        log("ERROR", f"runtime error: {e}")
         return 1
     except Exception as e:
-        log("err", f"scan failed: {e}")
+        log("ERROR", f"scan failed: {e}")
         return 1
 
 
@@ -132,14 +132,14 @@ def main() -> int:
             elif getattr(args, "cred_get", ""):
                 value = store.load(args.cred_get)
                 if value is None:
-                    log("err", f"credential not found: {args.cred_get}")
+                    log("ERROR", f"credential not found: {args.cred_get}")
                     return 1
                 print(value)
             elif getattr(args, "cred_rm", ""):
                 if store.delete(args.cred_rm):
                     print(f"deleted credential: {args.cred_rm}")
                 else:
-                    log("err", f"credential not found: {args.cred_rm}")
+                    log("ERROR", f"credential not found: {args.cred_rm}")
                     return 1
             elif getattr(args, "cred_list", False):
                 creds = store.list_credentials()
@@ -148,7 +148,7 @@ def main() -> int:
                 for c in creds:
                     print(f"  {c['name']}")
         except RuntimeError as _cred_exc:
-            log("err", str(_cred_exc))
+            log("ERROR", str(_cred_exc))
             return 1
         return 0
 
@@ -168,17 +168,17 @@ def main() -> int:
     if config_path:
         cfg = load_config(config_path)
         apply_config_to_args(cfg, args)
-        log("info", f"Loaded config from {config_path}")
+        log("INFO", f"Loaded config from {config_path}")
 
     # Dry-run mode: set a global flag that process.py checks
     if getattr(args, "dry_run", False):
         os.environ["VULNFORGE_DRY_RUN"] = "1"
-        log("info", "Dry-run mode: commands will be printed but not executed")
+        log("INFO", "Dry-run mode: commands will be printed but not executed")
 
     # Parallel mode
     if not getattr(args, "parallel", True):
         os.environ["VULNFORGE_SEQUENTIAL"] = "1"
-        log("info", "Sequential mode: phases will run one at a time")
+        log("INFO", "Sequential mode: phases will run one at a time")
 
     # v3.0: Handle --compare mode
     if getattr(args, "compare", None):
@@ -202,7 +202,7 @@ def main() -> int:
             parser.error("--review requires -d/--domain")
         outdir = Path(getattr(args, "out", f"./out/{args.domain}")).resolve()
         if not outdir.exists():
-            log("err", f"Output directory not found: {outdir}")
+            log("ERROR", f"Output directory not found: {outdir}")
             return 1
         from vulnforge.review import run_interactive_review
 
@@ -215,7 +215,7 @@ def main() -> int:
 
         batch_file = _P(args.batch)
         if not batch_file.exists():
-            log("err", f"Batch file not found: {batch_file}")
+            log("ERROR", f"Batch file not found: {batch_file}")
             return 1
         from vulnforge.fleet import BatchScan
 
@@ -231,12 +231,12 @@ def main() -> int:
         for line_num, raw in enumerate(raw_domains, 1):
             d = raw.rstrip(".").lower()
             if not _is_valid_hostname(d):
-                log("warn", f"batch line {line_num}: invalid domain '{raw}', skipping")
+                log("WARNING", f"batch line {line_num}: invalid domain '{raw}', skipping")
                 continue
             domains.append(d)
-        log("info", f"Batch mode: {len(domains)} valid domains out of {len(raw_domains)} entries")
+        log("INFO", f"Batch mode: {len(domains)} valid domains out of {len(raw_domains)} entries")
         for i, domain in enumerate(domains, 1):
-            log("info", f"[{i}/{len(domains)}] Scanning {domain}...")
+            log("INFO", f"[{i}/{len(domains)}] Scanning {domain}...")
             scan.add_target(domain)
             import copy
 
@@ -255,12 +255,12 @@ def main() -> int:
                 asyncio.run(run_pipeline(a))
                 scan.record_result(a.domain, {"status": "completed"})
             except Exception as exc:
-                log("warn", f"Failed to scan {domain}: {exc}")
+                log("WARNING", f"Failed to scan {domain}: {exc}")
                 scan.record_result(a.domain, {"status": "failed", "error": str(exc)})
                 continue
         scan.write_batch_summary()
         scan.write_batch_markdown()
-        log("ok", f"Batch scan complete: {len(domains)} targets")
+        log("OK", f"Batch scan complete: {len(domains)} targets")
         return 0
 
     if args.status:
@@ -409,19 +409,19 @@ def main() -> int:
 
         results = []
         for domain in domains:
-            log("info", f"{'=' * 60}")
-            log("info", f"Starting scan for domain: {domain}")
-            log("info", f"{'=' * 60}")
+            log("INFO", f"{'=' * 60}")
+            log("INFO", f"Starting scan for domain: {domain}")
+            log("INFO", f"{'=' * 60}")
             rc = _run_single(domain, args)
             results.append((domain, rc))
             if rc != 0:
-                log("warn", f"Scan for {domain} exited with code {rc}")
+                log("WARNING", f"Scan for {domain} exited with code {rc}")
 
         failed = [(d, c) for d, c in results if c != 0]
         if failed:
-            log("warn", f"{len(failed)} domain(s) had errors: {', '.join(d for d, _ in failed)}")
+            log("WARNING", f"{len(failed)} domain(s) had errors: {', '.join(d for d, _ in failed)}")
             return 1
         return 0
     except KeyboardInterrupt:
-        log("warn", "interrupted")
+        log("WARNING", "interrupted")
         return 130

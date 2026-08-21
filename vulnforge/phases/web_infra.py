@@ -3,6 +3,7 @@
 import asyncio
 import base64
 import socket
+import struct
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -22,7 +23,6 @@ from vulnforge.utils import (
     _async_urlopen_no_redirect,
     _extra_headers_dict,
     _extract_host,
-    _get_no_redirect_urlopener,
     _get_urlopener,
     _is_valid_hostname,
     _load_live_hosts,
@@ -48,7 +48,7 @@ async def phase_47_CDN(
     _out = outdir / "cdn_detection.txt"
     if _out.exists() and not force:
         return {"47-CDN": str(_out), "count": count_nonblank(_out)}
-    log("info", "Phase 47-CDN: CDN detection and origin IP discovery")
+    log("INFO", "Phase 47-CDN: CDN detection and origin IP discovery")
     hosts = set()
     for key in ("02-RESOLVE", "04-SCAN"):
         p = prev.get(key)
@@ -78,9 +78,8 @@ async def phase_47_CDN(
     for h in sorted(hosts)[: _PIPELINE_CFG.sample_hosts_origin]:
         try:
             await _throttle_rate()
-            urlopen = _get_no_redirect_urlopener()
             req = urllib.request.Request(f"https://{h}", method="HEAD")
-            code, headers, _ = await _async_urlopen_no_redirect(urlopen, req, timeout=10)
+            code, headers, _ = await _async_urlopen_no_redirect(req, timeout=10)
             hdr_str = str(dict(headers)).lower()
             detected = [
                 name for name, sigs in cdn_signatures.items() if any(s in hdr_str for s in sigs)
@@ -92,7 +91,7 @@ async def phase_47_CDN(
         except Exception:
             pass
     ensure(_out).write_text("\n".join(findings) + ("\n" if findings else ""))
-    log("ok", f"47-CDN: {len(findings)} CDN(s) detected")
+    log("OK", f"47-CDN: {len(findings)} CDN(s) detected")
     return {"47-CDN": str(_out), "count": len(findings)}
 
 
@@ -109,7 +108,7 @@ async def phase_48_CONTENT(
     _out = outdir / "content_discovery.txt"
     if _out.exists() and not force:
         return {"48-CONTENT": str(_out), "count": count_nonblank(_out)}
-    log("info", "Phase 48-CONTENT: content discovery via common paths")
+    log("INFO", "Phase 48-CONTENT: content discovery via common paths")
     hosts = set()
     for key in ("02-RESOLVE", "04-SCAN"):
         p = prev.get(key)
@@ -181,7 +180,7 @@ async def phase_48_CONTENT(
             except Exception:
                 continue
     ensure(_out).write_text("\n".join(findings) + ("\n" if findings else ""))
-    log("ok", f"48-CONTENT: {len(findings)} path(s) discovered")
+    log("OK", f"48-CONTENT: {len(findings)} path(s) discovered")
     return {"48-CONTENT": str(_out), "count": len(findings)}
 
 
@@ -198,13 +197,13 @@ async def phase_49_FRAMEWORKS(
     _out = outdir / "framework_vulns.txt"
     if _out.exists() and not force:
         return {"49-FRAMEWORKS": str(_out), "count": count_nonblank(_out)}
-    log("info", "Phase 49-FRAMEWORKS: web framework detection and vulnerability checks")
+    log("INFO", "Phase 49-FRAMEWORKS: web framework detection and vulnerability checks")
     findings: List[str] = []
     _fw_urlopen = _get_urlopener()
     _fw_extra_headers = _extra_headers_dict()
     hosts_file = outdir / "host_targets.txt"
     if not hosts_file.exists() or not read_lines(hosts_file):
-        log("warn", "49-FRAMEWORKS: no host targets; skipping")
+        log("WARNING", "49-FRAMEWORKS: no host targets; skipping")
         return {"49-FRAMEWORKS": str(_out), "count": 0}
     hosts = read_lines(hosts_file)[: _PIPELINE_CFG.sample_hosts_frameworks]
     FRAMEWORK_SIGS: Dict[str, List[Dict[str, str]]] = {
@@ -257,7 +256,7 @@ async def phase_49_FRAMEWORKS(
         findings.append("[frameworks] No web frameworks detected")
         out = ensure(_out)
         out.write_text("\n".join(findings) + ("\n" if findings else ""))
-        log("ok", f"49-FRAMEWORKS: {len(findings)} findings → {out}")
+        log("OK", f"49-FRAMEWORKS: {len(findings)} findings → {out}")
         return {"49-FRAMEWORKS": str(_out), "count": len(findings)}
     for host, frameworks in detected.items():
         base = host if host.startswith("http") else f"https://{host}"
@@ -460,8 +459,24 @@ async def phase_49_FRAMEWORKS(
         findings.append("[frameworks] No framework-specific vulnerabilities detected")
     out = ensure(_out)
     out.write_text("\n".join(findings) + ("\n" if findings else ""))
-    log("ok", f"49-FRAMEWORKS: {len(findings)} framework findings → {out}")
+    log("OK", f"49-FRAMEWORKS: {len(findings)} framework findings → {out}")
     return {"49-FRAMEWORKS": str(_out), "count": len(findings)}
+
+
+def _hpp_test_qs(
+    qs: Dict[str, List[str]], param_name: str, orig_val: str, strategy: str
+) -> Dict[str, List[str]]:
+    test_qs = dict(qs)
+    if strategy == "first":
+        test_qs[param_name] = [orig_val, "hpp_test_first"]
+    elif strategy == "last":
+        test_qs[param_name] = ["hpp_test_last", orig_val]
+    elif strategy == "any":
+        test_qs[param_name] = [orig_val, "hpp_test_any"]
+    else:
+        test_qs[param_name] = [orig_val]
+        test_qs[f"{param_name}[]"] = ["hpp_test_concat"]
+    return test_qs
 
 
 async def phase_51_HPP(
@@ -477,14 +492,14 @@ async def phase_51_HPP(
     _out = outdir / "hpp.txt"
     if _out.exists() and not force:
         return {"51-HPP": str(_out), "count": count_nonblank(_out)}
-    log("info", "Phase 51-HPP: HTTP parameter pollution detection")
+    log("INFO", "Phase 51-HPP: HTTP parameter pollution detection")
     findings: List[str] = []
     _h_urlopen = _get_urlopener()
     _h_extra_headers = _extra_headers_dict()
     urls = outdir / "urls_all.txt"
     all_urls = read_lines(urls) if urls.exists() else []
     if not all_urls:
-        log("warn", "51-HPP: no URLs; skipping")
+        log("WARNING", "51-HPP: no URLs; skipping")
         return {"51-HPP": str(_out), "count": 0}
     param_urls = [u for u in all_urls if "=" in u and not _is_static_url(u)][:50]
     hpp_pollutions = ["first", "last", "any", "concat"]
@@ -499,25 +514,11 @@ async def phase_51_HPP(
                 continue
             for strategy in hpp_pollutions:
                 try:
-                    if strategy == "first":
-                        test_qs = urllib.parse.urlencode(
-                            {param_name: [orig_val, "hpp_test_first"]}, doseq=True
-                        )
-                    elif strategy == "last":
-                        test_qs = urllib.parse.urlencode(
-                            {param_name: ["hpp_test_last", orig_val]}, doseq=True
-                        )
-                    elif strategy == "any":
-                        test_qs = urllib.parse.urlencode(
-                            {param_name: [orig_val, "hpp_test_any"]}, doseq=True
-                        )
-                    else:
-                        test_qs = urllib.parse.urlencode(
-                            {f"{param_name}[]": orig_val, param_name: "hpp_test_concat"}, doseq=True
-                        )
+                    test_qs = _hpp_test_qs(qs, param_name, orig_val, strategy)
+                    test_qs_enc = urllib.parse.urlencode(test_qs, doseq=True)
                     ref_qs = urllib.parse.urlencode(qs, doseq=True)
                     ref_url = urllib.parse.urlunparse(parsed._replace(query=ref_qs))
-                    test_url = urllib.parse.urlunparse(parsed._replace(query=test_qs))
+                    test_url = urllib.parse.urlunparse(parsed._replace(query=test_qs_enc))
                     await _throttle_rate()
                     req = urllib.request.Request(
                         ref_url, headers={"User-Agent": "Mozilla/5.0", **_h_extra_headers}
@@ -543,7 +544,7 @@ async def phase_51_HPP(
         findings.append("[hpp] No HTTP parameter pollution candidates detected")
     out = ensure(_out)
     out.write_text("\n".join(findings) + ("\n" if findings else ""))
-    log("ok", f"51-HPP: {len(findings)} HPP findings → {out}")
+    log("OK", f"51-HPP: {len(findings)} HPP findings → {out}")
     return {"51-HPP": str(out), "count": len(findings)}
 
 
@@ -589,13 +590,13 @@ async def phase_52_SERVERLESS(
     _out = outdir / "serverless_endpoints.txt"
     if _out.exists() and not force:
         return {"52-SERVERLESS": str(_out), "count": count_nonblank(_out)}
-    log("info", "Phase 52-SERVERLESS: serverless / cloud function endpoint discovery")
+    log("INFO", "Phase 52-SERVERLESS: serverless / cloud function endpoint discovery")
     findings: List[str] = []
     _s_urlopen = _get_urlopener()
     _s_extra_headers = _extra_headers_dict()
     hosts = _load_live_hosts(outdir)
     if not hosts:
-        log("warn", "52-SERVERLESS: no hosts; skipping")
+        log("WARNING", "52-SERVERLESS: no hosts; skipping")
         return {"52-SERVERLESS": str(_out), "count": 0}
     for host in hosts[:20]:
         host_clean = _extract_host(host)
@@ -639,7 +640,7 @@ async def phase_52_SERVERLESS(
         findings.append("[serverless] No serverless endpoints discovered")
     out = ensure(_out)
     out.write_text("\n".join(findings) + ("\n" if findings else ""))
-    log("ok", f"52-SERVERLESS: {len(findings)} serverless endpoints → {out}")
+    log("OK", f"52-SERVERLESS: {len(findings)} serverless endpoints → {out}")
     return {"52-SERVERLESS": str(out), "count": len(findings)}
 
 
@@ -655,13 +656,13 @@ async def phase_53_CSP(
     _out = outdir / "csp_analysis.txt"
     if _out.exists() and not force:
         return {"53-CSP": str(_out), "count": count_nonblank(_out)}
-    log("info", "Phase 53-CSP: Content-Security-Policy analysis")
+    log("INFO", "Phase 53-CSP: Content-Security-Policy analysis")
     findings: List[str] = []
     _c_urlopen = _get_urlopener()
     _c_extra_headers = _extra_headers_dict()
     hosts = _load_live_hosts(outdir)
     if not hosts:
-        log("warn", "53-CSP: no hosts; skipping")
+        log("WARNING", "53-CSP: no hosts; skipping")
         return {"53-CSP": str(_out), "count": 0}
     for host in hosts[:20]:
         host_clean = _extract_host(host)
@@ -719,7 +720,7 @@ async def phase_53_CSP(
         findings.append("[csp] No CSP issues found")
     out = ensure(_out)
     out.write_text("\n".join(findings) + ("\n" if findings else ""))
-    log("ok", f"53-CSP: {len(findings)} CSP findings → {out}")
+    log("OK", f"53-CSP: {len(findings)} CSP findings → {out}")
     return {"53-CSP": str(out), "count": len(findings)}
 
 
@@ -750,14 +751,14 @@ async def phase_55_CSV_INJECT(
     _out = outdir / "csv_injection.txt"
     if _out.exists() and not force:
         return {"55-CSV-INJECT": str(_out), "count": count_nonblank(_out)}
-    log("info", "Phase 55-CSV-INJECT: CSV / Excel formula injection")
+    log("INFO", "Phase 55-CSV-INJECT: CSV / Excel formula injection")
     findings: List[str] = []
     _csv_urlopen = _get_urlopener()
     _csv_extra_headers = _extra_headers_dict()
     urls = outdir / "urls_all.txt"
     all_urls = read_lines(urls) if urls.exists() else []
     if not all_urls:
-        log("warn", "55-CSV-INJECT: no URLs; skipping")
+        log("WARNING", "55-CSV-INJECT: no URLs; skipping")
         return {"55-CSV-INJECT": str(_out), "count": 0}
     csv_params = {
         "export",
@@ -820,7 +821,7 @@ async def phase_55_CSV_INJECT(
         findings.append("[csv-inject] No CSV injection candidates detected")
     out = ensure(_out)
     out.write_text("\n".join(findings) + ("\n" if findings else ""))
-    log("ok", f"55-CSV-INJECT: {len(findings)} CSV injection findings → {out}")
+    log("OK", f"55-CSV-INJECT: {len(findings)} CSV injection findings → {out}")
     return {"55-CSV-INJECT": str(out), "count": len(findings)}
 
 
@@ -865,6 +866,33 @@ _EXPOSED_DB_PORTS = [
 ]
 
 
+_DB_RAW_TCP_PORTS = {6379, 27017, 5432, 3306}
+_DB_BANNER_SIGS = {
+    6379: (b"+OK", b"-ERR", b"+PONG", b"redis"),
+    27017: (b"BsonMessage", b"\x3c\x00\x00\x00"),
+    5432: (b"PostgreSQL", b"\x52\x00\x00\x00"),
+    3306: (b"\x0a", b"mysql", b"mariadb"),
+}
+_DB_HTTP_SIGS = {
+    9200: ("cluster_name", "tagline"),
+    9300: ("cluster_name",),
+    5601: ("kbnname", "kbnversion"),
+    9090: ("prometheus", "# help", "# type"),
+    8081: ("couchdb",),
+    5984: ("couchdb",),
+    2375: ("apiversion", "gocommit"),
+    50070: ("namenode", "hadoop"),
+    8088: ("resourcemanager", "hadoop"),
+    10250: ("podlist", "kubelet"),
+    10255: ("podlist", "kubelet"),
+}
+
+
+def _db_banner_sig(port: int, banner: bytes) -> bool:
+    lowered = banner.lower()
+    return any(marker.lower() in lowered for marker in _DB_BANNER_SIGS.get(port, ()))
+
+
 async def phase_56_EXPOSED_DB(
     outdir: Path,
     t: Tools,
@@ -878,7 +906,7 @@ async def phase_56_EXPOSED_DB(
     _out = outdir / "exposed_databases.txt"
     if _out.exists() and not force:
         return {"56-EXPOSED-DB": str(_out), "count": count_nonblank(_out)}
-    log("info", "Phase 56-EXPOSED-DB: exposed database / storage probing")
+    log("INFO", "Phase 56-EXPOSED-DB: exposed database / storage probing")
     findings: List[str] = []
     _db_urlopen = _get_urlopener()
     _db_extra_headers = _extra_headers_dict()
@@ -886,25 +914,67 @@ async def phase_56_EXPOSED_DB(
     if not hosts:
         hosts = read_lines(outdir / "resolved.txt") if (outdir / "resolved.txt").exists() else []
     if not hosts:
-        log("warn", "56-EXPOSED-DB: no hosts; skipping")
+        log("WARNING", "56-EXPOSED-DB: no hosts; skipping")
         return {"56-EXPOSED-DB": str(_out), "count": 0}
-    ports_file = outdir / "ports.txt"
-    all_ports: List[str] = read_lines(ports_file) if ports_file.exists() else []
     for host in hosts[:20]:
         host_clean = _extract_host(host)
         if not host_clean:
             continue
         for port, label in _EXPOSED_DB_PORTS:
-            port_str = f"{host_clean}:{port}"
-            if all_ports and not any(port_str in p or f":{port}" in p for p in all_ports):
-                continue
             try:
                 sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                 sock.settimeout(3)
                 result = sock.connect_ex((host_clean, port))
-                sock.close()
-                if result == 0:
-                    findings.append(f"[exposed-db-port] {host_clean}:{port} — {label} — port open")
+                if result != 0:
+                    sock.close()
+                    continue
+                confirmed = False
+                if port in _DB_RAW_TCP_PORTS:
+                    try:
+                        if port == 6379:
+                            sock.sendall(b"PING\r\n")
+                            resp = sock.recv(256)
+                            if b"+PONG" in resp or b"-NOAUTH" in resp or b"-ERR" in resp:
+                                confirmed = True
+                        elif port == 27017:
+                            _bson = (
+                                struct.pack("<i", 19)
+                                + b"\x10isMaster\x00"
+                                + struct.pack("<i", 1)
+                                + b"\x00"
+                            )
+                            _body = (
+                                struct.pack("<i", 0)
+                                + b"admin.$cmd\x00"
+                                + struct.pack("<ii", 0, 1)
+                                + _bson
+                            )
+                            sock.sendall(struct.pack("<iiii", 16 + len(_body), 1, 0, 2004) + _body)
+                            resp = sock.recv(256)
+                            if (
+                                len(resp) >= 16
+                                and resp[12:16] == struct.pack("<i", 1)
+                                and (b"ismaster" in resp or b"isWritablePrimary" in resp)
+                            ):
+                                confirmed = True
+                        elif port == 5432:
+                            _params = b"user\x00postgres\x00database\x00postgres\x00"
+                            sock.sendall(
+                                struct.pack(">i", 8 + len(_params) + 1)
+                                + struct.pack(">i", 196608)
+                                + _params
+                                + b"\x00"
+                            )
+                            resp = sock.recv(256)
+                            if resp[:1] in (b"R", b"E", b"N", b"S", b"K", b"Z"):
+                                confirmed = True
+                        elif port == 3306:
+                            banner = sock.recv(256)
+                            if _db_banner_sig(port, banner):
+                                confirmed = True
+                    except OSError:
+                        pass
+                else:
                     for path, plabel in _EXPOSED_DB_PATHS:
                         if port in (9200, 9300) and "elasticsearch" in label.lower():
                             url = f"http://{host_clean}:{port}/"
@@ -919,16 +989,24 @@ async def phase_56_EXPOSED_DB(
                                 headers={"User-Agent": "Mozilla/5.0", **_db_extra_headers},
                             )
                             s, _, db_body = await _async_urlopen(_db_urlopen, req, timeout=5)
-                            if s in (200, 201, 401, 403):
-                                body_preview = db_body.decode("utf-8", errors="ignore")[:150]
-                                findings.append(
-                                    f"  [exposed-service] {url} — HTTP {s} — {label} "
-                                    f"body: {body_preview[:100]}"
-                                )
+                            sigs = _DB_HTTP_SIGS.get(port, ())
+                            if s == 200 and sigs:
+                                body_text = db_body.decode("utf-8", errors="ignore")
+                                if any(sig in body_text.lower() for sig in sigs):
+                                    body_preview = body_text[:150]
+                                    findings.append(
+                                        f"  [exposed-service] {url} — HTTP {s} — {label} "
+                                        f"body: {body_preview[:100]}"
+                                    )
+                                    confirmed = True
+                                    break
                         except asyncio.CancelledError:
                             raise
                         except Exception:
-                            pass
+                            continue
+                sock.close()
+                if confirmed:
+                    findings.append(f"[exposed-db-port] {host_clean}:{port} — {label} — port open")
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -937,7 +1015,7 @@ async def phase_56_EXPOSED_DB(
         findings.append("[exposed-db] No exposed database services detected")
     out = ensure(_out)
     out.write_text("\n".join(findings) + ("\n" if findings else ""))
-    log("ok", f"56-EXPOSED-DB: {len(findings)} exposure findings → {out}")
+    log("OK", f"56-EXPOSED-DB: {len(findings)} exposure findings → {out}")
     return {"56-EXPOSED-DB": str(out), "count": len(findings)}
 
 
@@ -988,14 +1066,14 @@ async def phase_57_DEFAULT_CREDS(
     _out = outdir / "default_creds.txt"
     if _out.exists() and not force:
         return {"57-DEFAULT-CREDS": str(_out), "count": count_nonblank(_out)}
-    log("info", "Phase 57-DEFAULT-CREDS: default credentials probing")
+    log("INFO", "Phase 57-DEFAULT-CREDS: default credentials probing")
     findings: List[str] = []
     _d_urlopen = _get_urlopener()
     _d_extra_headers = _extra_headers_dict()
     hosts_file = outdir / "hosts.txt"
     hosts = read_lines(hosts_file) if hosts_file.exists() else []
     if not hosts:
-        log("warn", "57-DEFAULT-CREDS: no hosts; skipping")
+        log("WARNING", "57-DEFAULT-CREDS: no hosts; skipping")
         return {"57-DEFAULT-CREDS": str(_out), "count": 0}
 
     login_paths = [
@@ -1018,63 +1096,139 @@ async def phase_57_DEFAULT_CREDS(
         "/api/v1/login",
     ]
 
+    skip_indicators = [
+        "invalid",
+        "incorrect",
+        "unauthorized",
+        "forbidden",
+        "access denied",
+        "wrong",
+        "login failed",
+        "authentication failed",
+    ]
+    _cred_form_fields = [
+        ("username", "password"),
+        ("user", "pass"),
+        ("login", "password"),
+        ("email", "password"),
+    ]
+    _cred_auth_markers = ["dashboard", "logout", "welcome", "account", "profile", "admin panel"]
+
     for host in hosts[:15]:
         host_clean = _extract_host(host)
         if not host_clean:
             continue
         for scheme in ("https://", "http://"):
             base = f"{scheme}{host_clean}"
-            for username, password in _DEFAULT_CREDS[:10]:
-                for path in login_paths[:5]:
-                    url = f"{base}{path}"
-                    try:
-                        creds_b64 = base64.b64encode(f"{username}:{password}".encode()).decode()
-                        req = urllib.request.Request(
-                            url,
-                            method="GET",
-                            headers={
-                                "User-Agent": "Mozilla/5.0",
-                                "Authorization": f"Basic {creds_b64}",
-                                **_d_extra_headers,
-                            },
-                        )
-                        s, _, body = await _async_urlopen(_d_urlopen, req, timeout=8)
-                        if s in (200, 201, 204, 302, 303):
-                            body_lower = body.decode("utf-8", errors="ignore").lower()
-                            skip_indicators = [
-                                "invalid",
-                                "incorrect",
-                                "unauthorized",
-                                "forbidden",
-                                "access denied",
-                                "wrong",
-                                "login failed",
-                                "authentication failed",
-                            ]
-                            if not any(ind in body_lower for ind in skip_indicators):
-                                findings.append(
-                                    f"[default-creds-candidate] {url} — {username}:{password} — HTTP {s}"
-                                )
-                                break
-                    except urllib.error.HTTPError as e:
-                        if e.code in (200, 201, 204, 302, 303):
-                            findings.append(
-                                f"[default-creds-candidate] {url} — {username}:{password} — HTTP {e.code}"
-                            )
-                    except asyncio.CancelledError:
-                        raise
-                    except Exception:
-                        continue
-                else:
+            for path in login_paths[:5]:
+                url = f"{base}{path}"
+                try:
+                    probe_req = urllib.request.Request(
+                        url,
+                        method="GET",
+                        headers={"User-Agent": "Mozilla/5.0", **_d_extra_headers},
+                    )
+                    probe_s, probe_headers, _ = await _async_urlopen(
+                        _d_urlopen, probe_req, timeout=8
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
                     continue
-                break
+                if "basic" in str(probe_headers.get("WWW-Authenticate", "")).lower():
+                    found = False
+                    for username, password in _DEFAULT_CREDS[:10]:
+                        creds_b64 = base64.b64encode(f"{username}:{password}".encode()).decode()
+                        try:
+                            req = urllib.request.Request(
+                                url,
+                                method="GET",
+                                headers={
+                                    "User-Agent": "Mozilla/5.0",
+                                    "Authorization": f"Basic {creds_b64}",
+                                    **_d_extra_headers,
+                                },
+                            )
+                            s, _, body = await _async_urlopen(_d_urlopen, req, timeout=8)
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception:
+                            continue
+                        body_lower = body.decode("utf-8", errors="ignore").lower()
+                        if s == 200 and not any(ind in body_lower for ind in skip_indicators):
+                            findings.append(
+                                f"[default-creds-candidate] {url} — {username}:{password} — HTTP {s} (basic auth)"
+                            )
+                            found = True
+                            break
+                    if found:
+                        break
+                    continue
+                if probe_s not in (200, 201, 204):
+                    continue
+                found = False
+                for username, password in _DEFAULT_CREDS[:10]:
+                    for fields in _cred_form_fields:
+                        form = urllib.parse.urlencode(
+                            {fields[0]: username, fields[1]: password}
+                        ).encode()
+                        try:
+                            req = urllib.request.Request(
+                                url,
+                                data=form,
+                                method="POST",
+                                headers={
+                                    "User-Agent": "Mozilla/5.0",
+                                    "Content-Type": "application/x-www-form-urlencoded",
+                                    **_d_extra_headers,
+                                },
+                            )
+                            s, hdrs, body = await _async_urlopen_no_redirect(req, timeout=8)
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception:
+                            continue
+                        body_lower = body.decode("utf-8", errors="ignore").lower()
+                        if any(ind in body_lower for ind in skip_indicators):
+                            continue
+                        set_cookie = str(hdrs.get("Set-Cookie", "")).lower()
+                        has_session = any(
+                            k in set_cookie for k in ("session", "sid", "auth", "token")
+                        )
+                        if (
+                            s == 200
+                            and has_session
+                            and any(m in body_lower for m in _cred_auth_markers)
+                        ):
+                            findings.append(
+                                f"[default-creds-candidate] {url} — {username}:{password} — HTTP {s}"
+                            )
+                            found = True
+                            break
+                        if s in (301, 302, 303) and has_session:
+                            location = str(hdrs.get("Location", ""))
+                            loc_parsed = urllib.parse.urlparse(location)
+                            if (
+                                not loc_parsed.netloc or loc_parsed.netloc == host_clean
+                            ) and loc_parsed.path.rstrip("/") != path.rstrip("/"):
+                                findings.append(
+                                    f"[default-creds-candidate] {url} — {username}:{password} — HTTP {s} (redirect in app)"
+                                )
+                                found = True
+                                break
+                    if found:
+                        break
+                if found:
+                    break
+            else:
+                continue
             break
 
     if not findings:
         findings.append("[default-creds] No default credentials accepted")
     out = ensure(_out)
     out.write_text("\n".join(findings) + ("\n" if findings else ""))
-    log("ok", f"57-DEFAULT-CREDS: {len(findings)} default cred findings → {out}")
+    log("OK", f"57-DEFAULT-CREDS: {len(findings)} default cred findings → {out}")
     return {"57-DEFAULT-CREDS": str(out), "count": len(findings)}
 
 
@@ -1114,13 +1268,13 @@ async def phase_58_HOST_INJECT(
     _out = outdir / "host_header_injection.txt"
     if _out.exists() and not force:
         return {"58-HOST-INJECT": str(_out), "count": count_nonblank(_out)}
-    log("info", "Phase 58-HOST-INJECT: host header injection testing")
+    log("INFO", "Phase 58-HOST-INJECT: host header injection testing")
     findings: List[str] = []
     _h_urlopen = _get_urlopener()
     hosts_file = outdir / "hosts.txt"
     hosts = read_lines(hosts_file) if hosts_file.exists() else []
     if not hosts:
-        log("warn", "58-HOST-INJECT: no hosts; skipping")
+        log("WARNING", "58-HOST-INJECT: no hosts; skipping")
         return {"58-HOST-INJECT": str(_out), "count": 0}
     for host in hosts[:10]:
         host_clean = _extract_host(host)
@@ -1184,5 +1338,5 @@ async def phase_58_HOST_INJECT(
         findings.append("[host-inject] No host header injection candidates detected")
     out = ensure(_out)
     out.write_text("\n".join(findings) + ("\n" if findings else ""))
-    log("ok", f"58-HOST-INJECT: {len(findings)} host header injection findings → {out}")
+    log("OK", f"58-HOST-INJECT: {len(findings)} host header injection findings → {out}")
     return {"58-HOST-INJECT": str(out), "count": len(findings)}

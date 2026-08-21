@@ -191,6 +191,24 @@ async def _send_get(url: str, timeout: int = 15) -> Optional[Dict[str, Any]]:
         return None
 
 
+async def _control_json(url: str) -> Optional[Dict[str, Any]]:
+    return await _send_json(url, {"vulnforge_control": "benign", "action": "noop"}, timeout=10)
+
+
+def _response_diff(attack: Optional[Dict[str, Any]], control: Optional[Dict[str, Any]]) -> bool:
+    if not attack or attack["status"] not in (200, 201, 202, 204):
+        return False
+    if control is None:
+        return False
+    if attack["status"] != control["status"]:
+        return True
+    a_body = attack["body"][:200]
+    c_body = control["body"][:200]
+    if a_body != c_body:
+        return True
+    return False
+
+
 async def phase_153_BIZLOGIC(
     outdir: Path,
     t: Tools,
@@ -204,14 +222,14 @@ async def phase_153_BIZLOGIC(
     _out = outdir / "bizlogic_workflow.txt"
     if _out.exists() and not force:
         return {"153-BIZLOGIC": str(_out), "count": count_nonblank(_out)}
-    log("info", "Phase 153-BIZLOGIC: workflow logic bypass & state machine violation")
+    log("INFO", "Phase 153-BIZLOGIC: workflow logic bypass & state machine violation")
     findings: List[str] = []
     endpoints = await _find_endpoints_by_patterns(outdir, _WORKFLOW_ENDPOINTS)
     if not endpoints:
         findings.append("[info] No workflow endpoints found")
         out = ensure(_out)
         out.write_text("\n".join(findings) + "\n")
-        log("ok", "153-BIZLOGIC: no workflow endpoints")
+        log("OK", "153-BIZLOGIC: no workflow endpoints")
         return {"153-BIZLOGIC": str(_out), "count": 0}
     findings.append(f"[endpoints] Found {len(endpoints)} workflow endpoints")
     for ep in endpoints:
@@ -227,17 +245,6 @@ async def phase_153_BIZLOGIC(
             state_transitions[ep] = resp["status"]
             findings.append(f"[state-transition] GET {ep} → HTTP {resp['status']}")
 
-    # Analyze sequences: look for unexpected transitions
-    if state_transitions:
-        ordered = list(state_transitions.items())
-        for i in range(len(ordered) - 1):
-            curr_ep, curr_status = ordered[i]
-            next_ep, next_status = ordered[i + 1]
-            if curr_status == 200 and next_status == 200:
-                findings.append(
-                    f"[state-machine-bypass] {curr_ep} (200) → {next_ep} (200) — no auth gate between steps"
-                )
-
     # Skip/Coupon-Stacking: try multiple coupons in sequence
     coupon_stack_payloads: List[Dict[str, Any]] = [
         {"coupon": "TEST123", "coupon2": "TEST456"},
@@ -246,10 +253,11 @@ async def phase_153_BIZLOGIC(
         {"discount_code": "STACK1", "additional_discount": "STACK2"},
     ]
     for ep in endpoints[:5]:
+        control = await _control_json(ep)
         for payload in coupon_stack_payloads:
             await _throttle_rate()
             resp = await _send_json(ep, payload)
-            if resp and resp["status"] in (200, 201, 202, 204):
+            if _response_diff(resp, control):
                 findings.append(
                     f"[coupon-stack] {ep} → payload={payload} -> {resp['status']}: {resp['body'][:100]}"
                 )
@@ -270,17 +278,18 @@ async def phase_153_BIZLOGIC(
         {"admin_approve": True},
     ]
     for ep in endpoints[:10]:
+        control = await _control_json(ep)
         for attempt in skipped_steps:
             await _throttle_rate()
             resp = await _send_json(ep, attempt)
-            if resp and resp["status"] in (200, 201, 202, 204):
+            if _response_diff(resp, control):
                 findings.append(
                     f"[state-skip] {ep} → payload={attempt} -> {resp['status']}: {resp['body'][:100]}"
                 )
 
     out = ensure(_out)
     out.write_text("\n".join(findings) + ("\n" if findings else ""))
-    log("ok", f"153-BIZLOGIC: {len(findings)} findings → {out}")
+    log("OK", f"153-BIZLOGIC: {len(findings)} findings → {out}")
     return {"153-BIZLOGIC": str(_out), "count": len(findings)}
 
 
@@ -297,14 +306,14 @@ async def phase_154_PAYMENT(
     _out = outdir / "bizlogic_payment.txt"
     if _out.exists() and not force:
         return {"154-PAYMENT": str(_out), "count": count_nonblank(_out)}
-    log("info", "Phase 154-PAYMENT: payment logic bypass testing")
+    log("INFO", "Phase 154-PAYMENT: payment logic bypass testing")
     findings: List[str] = []
     endpoints = await _find_endpoints_by_patterns(outdir, _PAYMENT_ENDPOINTS)
     if not endpoints:
         findings.append("[info] No payment endpoints found")
         out = ensure(_out)
         out.write_text("\n".join(findings) + "\n")
-        log("ok", "154-PAYMENT: no payment endpoints")
+        log("OK", "154-PAYMENT: no payment endpoints")
         return {"154-PAYMENT": str(_out), "count": 0}
     findings.append(f"[endpoints] Found {len(endpoints)} payment endpoints")
     for ep in endpoints:
@@ -329,21 +338,26 @@ async def phase_154_PAYMENT(
         {"amount": 100, "source": "attacker_account"},  # wrong source
     ]
     for ep in endpoints[:10]:
+        control = await _control_json(ep)
         for payload in extended_payloads:
             await _throttle_rate()
             resp = await _send_json(ep, payload)
-            if resp and resp["status"] in (200, 201, 202, 204):
+            if _response_diff(resp, control):
                 findings.append(
                     f"[price-manipulation] {ep} → payload={payload} -> "
                     f"{resp['status']}: {resp['body'][:150]}"
                 )
 
-    # Race: send 5 identical payment requests simultaneously
+    # Race: send 5 identical payment requests simultaneously (only if the
+    # endpoint accepts the payload in the first place, else it's a no-op)
     for ep in endpoints[:3]:
         try:
             import asyncio as _asyncio
 
             race_payload = {"amount": 1, "currency": "USD", "items": [{"id": 1, "qty": 1}]}
+            probe = await _send_json(ep, race_payload, timeout=10)
+            if not probe or probe["status"] not in (200, 201):
+                continue
             race_tasks = []
             for _ in range(5):
                 race_tasks.append(_send_json(ep, race_payload, timeout=10))
@@ -362,7 +376,7 @@ async def phase_154_PAYMENT(
 
     out = ensure(_out)
     out.write_text("\n".join(findings) + ("\n" if findings else ""))
-    log("ok", f"154-PAYMENT: {len(findings)} findings → {out}")
+    log("OK", f"154-PAYMENT: {len(findings)} findings → {out}")
     return {"154-PAYMENT": str(_out), "count": len(findings)}
 
 
@@ -379,7 +393,7 @@ async def phase_155_COUPON(
     _out = outdir / "bizlogic_coupon.txt"
     if _out.exists() and not force:
         return {"155-COUPON": str(_out), "count": count_nonblank(_out)}
-    log("info", "Phase 155-COUPON: coupon/discount abuse testing")
+    log("INFO", "Phase 155-COUPON: coupon/discount abuse testing")
     findings: List[str] = []
     endpoints = await _find_endpoints_by_patterns(outdir, _COUPON_ENDPOINTS)
     endpoints += await _find_endpoints_by_patterns(outdir, _PAYMENT_ENDPOINTS)
@@ -387,16 +401,17 @@ async def phase_155_COUPON(
         findings.append("[info] No coupon/payment endpoints found")
         out = ensure(_out)
         out.write_text("\n".join(findings) + "\n")
-        log("ok", "155-COUPON: no coupon endpoints")
+        log("OK", "155-COUPON: no coupon endpoints")
         return {"155-COUPON": str(_out), "count": 0}
     findings.append(f"[endpoints] Found {len(endpoints)} coupon endpoints")
     for ep in endpoints:
         findings.append(f"  {ep}")
     for ep in endpoints[:10]:
+        control = await _control_json(ep)
         for coupon in _COUPON_ABUSE_STRATEGIES[:10]:
             await _throttle_rate()
             resp = await _send_json(ep, {"coupon": coupon, "code": coupon})
-            if resp and resp["status"] in (200, 201, 202, 204):
+            if _response_diff(resp, control):
                 rbody = resp["body"].lower()
                 if "applied" in rbody or "valid" in rbody or "discount" in rbody:
                     findings.append(
@@ -404,16 +419,16 @@ async def phase_155_COUPON(
                         f"{resp['status']}: {resp['body'][:150]}"
                     )
         resp = await _send_json(ep, {"coupon": "WELCOME10", "quantity": -1})
-        if resp and resp["status"] in (200, 201, 202, 204):
+        if _response_diff(resp, control):
             findings.append(f"[coupon-negative-qty] {ep} -> {resp['status']}: {resp['body'][:150]}")
         resp = await _send_json(ep, {"coupon": "WELCOME10", "items": [{"id": 1, "qty": -1}]})
-        if resp and resp["status"] in (200, 201, 202, 204):
+        if _response_diff(resp, control):
             findings.append(
                 f"[coupon-negative-items] {ep} -> {resp['status']}: {resp['body'][:150]}"
             )
     out = ensure(_out)
     out.write_text("\n".join(findings) + ("\n" if findings else ""))
-    log("ok", f"155-COUPON: {len(findings)} findings → {out}")
+    log("OK", f"155-COUPON: {len(findings)} findings → {out}")
     return {"155-COUPON": str(_out), "count": len(findings)}
 
 
@@ -430,7 +445,7 @@ async def phase_156_MTENANT(
     _out = outdir / "bizlogic_multitenant.txt"
     if _out.exists() and not force:
         return {"156-MTENANT": str(_out), "count": count_nonblank(_out)}
-    log("info", "Phase 156-MTENANT: multi-tenant isolation testing")
+    log("INFO", "Phase 156-MTENANT: multi-tenant isolation testing")
     findings: List[str] = []
     urls = outdir / "urls_all.txt"
     api_endpoints: List[str] = []
@@ -486,15 +501,22 @@ async def phase_156_MTENANT(
     findings.append("")
     findings.append("--- tenant ID switching tests ---")
     for ep in api_endpoints[:10]:
+        opener = _get_urlopener()
+        try:
+            ctrl_req = urllib.request.Request(ep, headers=_extra_headers_dict())
+            ctrl_status, _, ctrl_body_bytes = await _async_urlopen(opener, ctrl_req, timeout=10)
+            ctrl_body = ctrl_body_bytes.decode("utf-8", errors="replace") if ctrl_body_bytes else ""
+        except Exception:
+            ctrl_status = None
+            ctrl_body = ""
         for header in tenant_id_headers[:5]:
             for tid in test_tenants[:5]:
                 await _throttle_rate()
-                opener = _get_urlopener()
                 try:
-                    req = urllib.request.Request(ep, headers={header: tid})
+                    req = urllib.request.Request(ep, headers={header: tid, **_extra_headers_dict()})
                     status, _, body_bytes = await _async_urlopen(opener, req, timeout=10)
-                    body = body_bytes.decode("utf-8", errors="replace")
-                    if status in (200, 201):
+                    body = body_bytes.decode("utf-8", errors="replace") if body_bytes else ""
+                    if status in (200, 201) and (ctrl_status is None or status != ctrl_status or body != ctrl_body):
                         findings.append(
                             f"[tenant-switch] {ep} → {header}: {tid} -> {status}: {body[:100]}"
                         )
@@ -502,7 +524,7 @@ async def phase_156_MTENANT(
                     pass
     out = ensure(_out)
     out.write_text("\n".join(findings) + ("\n" if findings else ""))
-    log("ok", f"156-MTENANT: {len(findings)} findings → {out}")
+    log("OK", f"156-MTENANT: {len(findings)} findings → {out}")
     return {"156-MTENANT": str(_out), "count": len(findings)}
 
 
@@ -519,7 +541,7 @@ async def phase_157_2FA(
     _out = outdir / "bizlogic_2fa.txt"
     if _out.exists() and not force:
         return {"157-2FA": str(_out), "count": count_nonblank(_out)}
-    log("info", "Phase 157-2FA: 2FA/CAPTCHA bypass testing")
+    log("INFO", "Phase 157-2FA: 2FA/CAPTCHA bypass testing")
     findings: List[str] = []
     urls = outdir / "urls_all.txt"
     auth_endpoints: List[str] = []
@@ -573,15 +595,16 @@ async def phase_157_2FA(
     findings.append("--- 2FA bypass attempts ---")
     for ep in auth_endpoints[:10]:
         if any(p in ep.lower() for p in ["2fa", "otp", "mfa", "verify"]):
+            control = await _send_json(ep, {"otp": "847291", "code": "847291"})
             for payload in otp_bypass_payloads:
                 await _throttle_rate()
                 resp = await _send_json(ep, payload)
-                if resp and resp["status"] in (200, 201, 202, 204):
+                if _response_diff(resp, control):
                     findings.append(
                         f"[otp-bypass] {ep} → payload={payload} -> "
                         f"{resp['status']}: {resp['body'][:150]}"
                     )
     out = ensure(_out)
     out.write_text("\n".join(findings) + ("\n" if findings else ""))
-    log("ok", f"157-2FA: {len(findings)} findings → {out}")
+    log("OK", f"157-2FA: {len(findings)} findings → {out}")
     return {"157-2FA": str(_out), "count": len(findings)}

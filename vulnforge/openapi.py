@@ -30,13 +30,13 @@ def get_spec() -> Dict[str, Any]:
         try:
             return json.loads(_SPEC_PATH.read_text(encoding="utf-8"))  # type: ignore[no-any-return]
         except Exception as e:
-            log("warn", f"openapi: failed to load spec: {e}")
+            log("WARNING", f"openapi: failed to load spec: {e}")
     return _build_spec()
 
 
 def _build_spec() -> Dict[str, Any]:
     """Build a minimal OpenAPI spec programmatically (fallback)."""
-    log("warn", "openapi.json not found — serving empty spec stub")
+    log("WARNING", "openapi.json not found — serving empty spec stub")
     return {
         "openapi": "3.0.3",
         "info": {
@@ -61,7 +61,7 @@ def generate_spec_file(outdir: Path) -> Path:
     spec = get_spec()
     out = ensure(outdir / "openapi.json")
     out.write_text(json.dumps(spec, indent=2))
-    log("ok", f"openapi: spec written → {out}")
+    log("OK", f"openapi: spec written → {out}")
     return out
 
 

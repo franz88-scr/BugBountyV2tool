@@ -111,11 +111,11 @@ async def phase_22_NOSQLI(
     _out = outdir / "nosqli.txt"
     if _out.exists() and not force:
         return {"22-NOSQLI": str(_out), "count": count_nonblank(_out)}
-    log("info", "Phase 22-NOSQLI: NoSQL injection probes")
+    log("INFO", "Phase 22-NOSQLI: NoSQL injection probes")
     urls = outdir / "urls_all.txt"
     all_urls = read_lines(urls) if urls.exists() else []
     if not all_urls:
-        log("warn", "22-NOSQLI: no URLs; skipping")
+        log("WARNING", "22-NOSQLI: no URLs; skipping")
         return {"22-NOSQLI": str(_out), "count": 0}
     findings: List[str] = []
     _n_urlopen = _get_urlopener()
@@ -182,16 +182,29 @@ async def phase_22_NOSQLI(
         u.split("?")[0] for u in all_urls if "/api/" in u.lower() and not _is_static_url(u)
     ][: _PIPELINE_CFG.sample_urls_nosqli]
     for u in api_targets:
+        api_baseline_status = 0
         api_baseline = ""
         try:
+            base_data = json.dumps({"x": "baseline"}).encode()
             base_req = urllib.request.Request(
-                u, headers={"User-Agent": "Mozilla/5.0", **_n_extra_headers}
+                u,
+                data=base_data,
+                method="POST",
+                headers={
+                    "Content-Type": "application/json",
+                    "User-Agent": "Mozilla/5.0",
+                    **_n_extra_headers,
+                },
             )
-            _, _, base_bytes = await _async_urlopen(_n_urlopen, base_req, timeout=10)
+            api_baseline_status, _, base_bytes = await _async_urlopen(
+                _n_urlopen, base_req, timeout=10
+            )
             api_baseline = base_bytes.decode("utf-8", errors="ignore").lower()
         except asyncio.CancelledError:
             raise
         except Exception:
+            continue
+        if api_baseline_status in (401, 405):
             continue
         for payload in _NOSQLI_PAYLOADS:
             try:
@@ -209,9 +222,13 @@ async def phase_22_NOSQLI(
                 )
                 ns_status, _, ns_body = await _async_urlopen(_n_urlopen, req, timeout=10)
                 ns_body_text = ns_body.decode("utf-8", errors="ignore").lower()
-                if ns_status in (200, 201) and ns_body_text != api_baseline:
+                if (
+                    ns_status == api_baseline_status
+                    and ns_status in (200, 201)
+                    and ns_body_text != api_baseline
+                ):
                     findings.append(
-                        f"[nosqli-json] POST {u} payload={json.dumps(payload)} → HTTP {ns_status} (body changed)"
+                        f"[nosqli-json] POST {u} payload={json.dumps(payload)} → HTTP {ns_status} (body changed vs POST baseline)"
                     )
             except asyncio.CancelledError:
                 raise
@@ -309,7 +326,7 @@ async def phase_22_NOSQLI(
                     continue
     out = ensure(_out)
     out.write_text("\n".join(findings) + ("\n" if findings else ""))
-    log("ok", f"22-NOSQLI: {len(findings)} NoSQL injection probes → {out}")
+    log("OK", f"22-NOSQLI: {len(findings)} NoSQL injection probes → {out}")
     return {"22-NOSQLI": str(out), "count": len(findings)}
 
 
@@ -327,14 +344,14 @@ async def phase_25_XXE(
     _out = outdir / "xxe.txt"
     if _out.exists() and not force:
         return {"25-XXE": str(_out), "count": count_nonblank(_out)}
-    log("info", "Phase 25-XXE: XML external entity injection probes")
+    log("INFO", "Phase 25-XXE: XML external entity injection probes")
     findings: List[str] = []
     _x_urlopen = _get_urlopener()
     _xxe_extra_headers = _extra_headers_dict()
     urls = outdir / "urls_all.txt"
     all_urls = read_lines(urls) if urls.exists() else []
     if not all_urls:
-        log("warn", "25-XXE: no URLs; skipping")
+        log("WARNING", "25-XXE: no URLs; skipping")
         return {"25-XXE": str(_out), "count": 0}
     targets = [u.split("?")[0] for u in all_urls][: _PIPELINE_CFG.sample_urls_xxe]
     oast_ref = oast_domain or "burpcollaborator.net"
@@ -428,7 +445,7 @@ async def phase_25_XXE(
         findings.append("[xxe] No XXE candidates detected (expected)")
     out = ensure(_out)
     out.write_text("\n".join(findings) + ("\n" if findings else ""))
-    log("ok", f"25-XXE: {len(findings)} XXE probe findings → {out}")
+    log("OK", f"25-XXE: {len(findings)} XXE probe findings → {out}")
     return {"25-XXE": str(out), "count": len(findings)}
 
 
@@ -442,13 +459,25 @@ _CMDI_PAYLOADS = [
     "; ping -c 1 127.0.0.1",
     "| nslookup example.com",
     "& echo ${PATH}",
-    # Time-based
-    "; sleep 5",
-    "| ping -c 5 127.0.0.1",
     # Filter-bypass sequences
     "%0a id",
     "; ls -la",
     "ls%09-la",
+]
+_CMDI_TIME_PAYLOADS = [
+    ("; sleep 5", 4.0),
+    ("| ping -c 5 127.0.0.1", 4.0),
+    ("`sleep 5`", 4.0),
+    ("$(sleep 5)", 4.0),
+]
+_CMDI_OUTPUT_PATTERNS = [
+    re.compile(r"uid=\d+\("),
+    re.compile(r"gid=\d+\("),
+    re.compile(r"groups=\d+\("),
+    re.compile(r"^(Linux|Darwin|FreeBSD)\s+\S+", re.MULTILINE),
+    re.compile(r"^\S+\s+\d+\.\d+\.\d+", re.MULTILINE),
+    re.compile(r"root:x:0:0:"),
+    re.compile(r"^[a-z_-]+:\$[0-9]+\$", re.MULTILINE),
 ]
 _CMDI_PARAMS = {
     "host",
@@ -483,11 +512,11 @@ async def phase_26_CMDINJECT(
     _out = outdir / "cmd_injection.txt"
     if _out.exists() and not force:
         return {"26-CMDINJECT": str(_out), "count": count_nonblank(_out)}
-    log("info", "Phase 26-CMDINJECT: OS command injection detection")
+    log("INFO", "Phase 26-CMDINJECT: OS command injection detection")
     urls = outdir / "urls_all.txt"
     all_urls = read_lines(urls) if urls.exists() else []
     if not all_urls:
-        log("warn", "26-CMDINJECT: no URLs; skipping")
+        log("WARNING", "26-CMDINJECT: no URLs; skipping")
         return {"26-CMDINJECT": str(_out), "count": 0}
     findings: List[str] = []
     _c_urlopen = _get_urlopener()
@@ -518,15 +547,52 @@ async def phase_26_CMDINJECT(
         commix_reports = list(commix_outdir.glob("**/*.txt"))
         if commix_reports:
             findings.append(f"[commix] {len(commix_reports)} report files → {commix_outdir}")
+    import hashlib
+    import time as _cmdi_time
+
     for u in param_urls:
         parsed = urllib.parse.urlparse(u)
         qs = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
         if not qs:
             continue
+        canary = "c" + hashlib.md5(u.encode()).hexdigest()[:12]
+        baseline_body = ""
+        try:
+            base_req = urllib.request.Request(
+                u, headers={"User-Agent": "Mozilla/5.0", **_cmdi_extra_headers}
+            )
+            _, _, base_bytes = await _async_urlopen(_c_urlopen, base_req, timeout=10)
+            baseline_body = base_bytes.decode("utf-8", errors="ignore")
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            pass
         for param_name in qs:
             if param_name.lower() not in _CMDI_PARAMS:
                 continue
             if param_name.lower() in _SKIP_PARAMS:
+                continue
+            echo_payload = f";echo {canary}#"
+            test_qs = qs.copy()
+            test_qs[param_name] = [echo_payload]
+            new_qs = urllib.parse.urlencode(test_qs, doseq=True)
+            test_url = urllib.parse.urlunparse(parsed._replace(query=new_qs))
+            try:
+                await _throttle_rate()
+                req = urllib.request.Request(
+                    test_url, headers={"User-Agent": "Mozilla/5.0", **_cmdi_extra_headers}
+                )
+                _, _, body_bytes = await _async_urlopen(_c_urlopen, req, timeout=10)
+                body = body_bytes.decode("utf-8", errors="ignore")
+                if _cmdi_canary_confirmed(body, baseline_body, canary, echo_payload):
+                    findings.append(
+                        f"[cmdi-confirmed] {test_url} param={param_name} "
+                        f"payload={echo_payload} (canary echoed, payload not reflected)"
+                    )
+                    break
+            except asyncio.CancelledError:
+                raise
+            except Exception:
                 continue
             for payload in _CMDI_PAYLOADS:
                 test_qs = qs.copy()
@@ -536,54 +602,44 @@ async def phase_26_CMDINJECT(
                 try:
                     await _throttle_rate()
                     req = urllib.request.Request(
-                        test_url, headers={"User-Agent": "Mozilla/5.0", **_cmdi_extra_headers}
+                        test_url,
+                        headers={"User-Agent": "Mozilla/5.0", **_cmdi_extra_headers},
                     )
                     _, _, body_bytes = await _async_urlopen(_c_urlopen, req, timeout=10)
                     body = body_bytes.decode("utf-8", errors="ignore")
-                    indicators = [
-                        "uid=",
-                        "gid=",
-                        "groups=",
-                        "linux",
-                        "darwin",
-                        "www-data",
-                        "root:",
-                        "bin/",
-                        "microsoft",
-                        "windows",
-                        "nt authority",
-                        "command not found",
-                        "not recognized",
-                    ]
-                    if any(ind in body.lower() for ind in indicators):
+                    if _cmdi_output_found(body) and not _cmdi_output_found(baseline_body):
                         findings.append(
-                            f"[cmdi-candidate] {test_url} param={param_name} payload={payload}"
+                            f"[cmdi-candidate] {test_url} param={param_name} "
+                            f"payload={payload} (command output pattern new vs baseline)"
                         )
                         break
                 except asyncio.CancelledError:
                     raise
                 except Exception:
                     continue
-    # Time-based detection
-    import time as _cmdi_time
-
-    _TIME_PAYLOADS = [
-        ("; sleep 5", 4.0),
-        ("| ping -c 5 127.0.0.1", 4.0),
-        ("`sleep 5`", 4.0),
-        ("$(sleep 5)", 4.0),
-    ]
     for u in param_urls:
         parsed = urllib.parse.urlparse(u)
         qs = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
         if not qs:
             continue
+        baseline_elapsed = 0.0
+        try:
+            base_req = urllib.request.Request(
+                u, headers={"User-Agent": "Mozilla/5.0", **_cmdi_extra_headers}
+            )
+            _t0 = _cmdi_time.time()
+            await _async_urlopen(_c_urlopen, base_req, timeout=10)
+            baseline_elapsed = _cmdi_time.time() - _t0
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            pass
         for param_name in qs:
             if param_name.lower() not in _CMDI_PARAMS:
                 continue
             if param_name.lower() in _SKIP_PARAMS:
                 continue
-            for payload, min_seconds in _TIME_PAYLOADS:
+            for payload, min_seconds in _CMDI_TIME_PAYLOADS:
                 test_qs = qs.copy()
                 test_qs[param_name] = [payload]
                 new_qs = urllib.parse.urlencode(test_qs, doseq=True)
@@ -591,7 +647,8 @@ async def phase_26_CMDINJECT(
                 try:
                     await _throttle_rate()
                     req = urllib.request.Request(
-                        test_url, headers={"User-Agent": "Mozilla/5.0", **_cmdi_extra_headers}
+                        test_url,
+                        headers={"User-Agent": "Mozilla/5.0", **_cmdi_extra_headers},
                     )
                     start = _cmdi_time.time()
                     try:
@@ -599,9 +656,12 @@ async def phase_26_CMDINJECT(
                     except Exception:
                         pass
                     elapsed = _cmdi_time.time() - start
-                    if elapsed >= min_seconds * 0.8:
+                    delay_over_baseline = elapsed - baseline_elapsed
+                    if delay_over_baseline >= min_seconds * 0.7:
                         findings.append(
-                            f"[cmdi-time-delay] {test_url} param={param_name} payload={payload} delay={elapsed:.1f}s"
+                            f"[cmdi-time-delay] {test_url} param={param_name} "
+                            f"payload={payload} delay={elapsed:.1f}s "
+                            f"(baseline={baseline_elapsed:.1f}s)"
                         )
                 except Exception:
                     continue
@@ -640,8 +700,71 @@ async def phase_26_CMDINJECT(
                         continue
     out = ensure(_out)
     out.write_text("\n".join(findings) + ("\n" if findings else ""))
-    log("ok", f"26-CMDINJECT: {len(findings)} command injection probes → {out}")
+    log("OK", f"26-CMDINJECT: {len(findings)} command injection probes → {out}")
     return {"26-CMDINJECT": str(out), "count": len(findings)}
+
+
+def _cmdi_output_found(body: str) -> bool:
+    """True if body contains command-output structure (uid=/uname/kernel/shadow lines)."""
+    return any(p.search(body) for p in _CMDI_OUTPUT_PATTERNS)
+
+
+def _cmdi_canary_confirmed(body: str, baseline_body: str, canary: str, payload: str) -> bool:
+    """True when the canary appears as command output, not as reflected input."""
+    return canary in body and canary not in baseline_body and payload not in body
+
+
+def _sspp_verdict(
+    baseline_status: int, baseline_body: str, status: int, body: str, payload: str = ""
+) -> str:
+    """Differential SSPP verdict: 'candidate'|'crash'|''.
+
+    A 2xx with a changed body vs baseline is a candidate, unless the raw
+    payload is reflected verbatim in the response; a 5xx that the benign
+    baseline does not produce is a crash signal.
+    """
+    if status in (200, 201, 302) and status == baseline_status:
+        if body != baseline_body and not (payload and payload in body):
+            return "candidate"
+        return ""
+    if status in (500, 502, 503, 504) and baseline_status not in (500, 502, 503, 504):
+        return "crash"
+    return ""
+
+
+_DESERIAL_ERROR_INDICATORS = [
+    "java.lang",
+    "java.io",
+    "classnotfoundexception",
+    "com.sun.org.apache",
+    "com.sun.rowset",
+    "org.apache.commons",
+    "org.springframework",
+    "org.yaml.snakeyaml",
+    "ysoserial",
+    "weblogic",
+    "jboss",
+    "phar",
+    "pickle",
+    "marshal.load",
+    "unserialize",
+    "at java.",
+    "at org.",
+    "at com.",
+]
+
+
+def _deserial_verdict(baseline_status: int, baseline_body: str, status: int, body: str) -> str:
+    """Differential deserialization verdict: 'crash'|'reflected'|''."""
+    if status in (500, 502, 503, 504) and baseline_status not in (500, 502, 503, 504):
+        return "crash"
+    if status in (200, 201, 302):
+        new_indicators = [
+            ind for ind in _DESERIAL_ERROR_INDICATORS if ind in body and ind not in baseline_body
+        ]
+        if new_indicators:
+            return "reflected"
+    return ""
 
 
 async def phase_27_SSPP(
@@ -657,11 +780,11 @@ async def phase_27_SSPP(
     _out = outdir / "sspp.txt"
     if _out.exists() and not force:
         return {"27-SSPP": str(_out), "count": count_nonblank(_out)}
-    log("info", "Phase 27-SSPP: server-side prototype pollution probes")
+    log("INFO", "Phase 27-SSPP: server-side prototype pollution probes")
     urls = outdir / "urls_all.txt"
     all_urls = read_lines(urls) if urls.exists() else []
     if not all_urls:
-        log("warn", "27-SSPP: no URLs; skipping")
+        log("WARNING", "27-SSPP: no URLs; skipping")
         return {"27-SSPP": str(_out), "count": 0}
     findings: List[str] = []
     _s_urlopen = _get_urlopener()
@@ -677,9 +800,33 @@ async def phase_27_SSPP(
         {"__proto__": {"status": "active"}},
     ]
     for u in api_targets:
+        baseline_status = 0
+        baseline_body = ""
+        try:
+            base_body_data = json.dumps({"x": "baseline"}).encode()
+            base_req = urllib.request.Request(
+                u,
+                data=base_body_data,
+                method="POST",
+                headers={
+                    "Content-Type": "application/json",
+                    "User-Agent": "Mozilla/5.0",
+                    **_sspp_extra_headers,
+                },
+            )
+            bs, _, bb = await _async_urlopen(_s_urlopen, base_req, timeout=10)
+            baseline_status = bs
+            baseline_body = bb.decode("utf-8", errors="ignore").lower()
+        except asyncio.CancelledError:
+            raise
+        except urllib.error.HTTPError as e:
+            baseline_status = e.code
+        except Exception:
+            continue
         for payload in sspp_payloads:
             try:
-                body_data = json.dumps(payload).encode()
+                payload_str = json.dumps(payload)
+                body_data = payload_str.encode()
                 req = urllib.request.Request(
                     u,
                     data=body_data,
@@ -691,14 +838,28 @@ async def phase_27_SSPP(
                     },
                 )
                 ss, _, sb = await _async_urlopen(_s_urlopen, req, timeout=10)
-                if ss in (200, 201, 302):
+                body_lower = sb.decode("utf-8", errors="ignore").lower()
+                verdict = _sspp_verdict(
+                    baseline_status, baseline_body, ss, body_lower, payload_str.lower()
+                )
+                if verdict == "candidate":
                     findings.append(
-                        f"[sspp-candidate] POST {u} payload={json.dumps(payload)} → HTTP {ss}"
+                        f"[sspp-candidate] POST {u} payload={json.dumps(payload)} "
+                        f"→ HTTP {ss} (response differs from baseline)"
+                    )
+                elif verdict == "crash":
+                    findings.append(
+                        f"[sspp-crash-candidate] POST {u} payload={json.dumps(payload)} "
+                        f"→ HTTP {ss} (baseline HTTP {baseline_status})"
                     )
             except urllib.error.HTTPError as e:
-                if 500 <= e.code < 600:
+                verdict = _sspp_verdict(
+                    baseline_status, baseline_body, e.code, "", payload_str.lower()
+                )
+                if verdict == "crash":
                     findings.append(
-                        f"[sspp-crash-candidate] POST {u} payload={json.dumps(payload)} → HTTP {e.code}"
+                        f"[sspp-crash-candidate] POST {u} payload={json.dumps(payload)} "
+                        f"→ HTTP {e.code} (baseline HTTP {baseline_status})"
                     )
             except asyncio.CancelledError:
                 raise
@@ -708,7 +869,7 @@ async def phase_27_SSPP(
         findings.append("[sspp] No prototype pollution candidates detected (expected)")
     out = ensure(_out)
     out.write_text("\n".join(findings) + ("\n" if findings else ""))
-    log("ok", f"27-SSPP: {len(findings)} prototype pollution probes → {out}")
+    log("OK", f"27-SSPP: {len(findings)} prototype pollution probes → {out}")
     return {"27-SSPP": str(out), "count": len(findings)}
 
 
@@ -774,7 +935,7 @@ async def phase_29_DEPCHECK(
     _out = outdir / "depcheck.txt"
     if _out.exists() and not force:
         return {"29-DEPCHECK": str(_out), "count": count_nonblank(_out)}
-    log("info", "Phase 29-DEPCHECK: JS dependency vulnerability scanning")
+    log("INFO", "Phase 29-DEPCHECK: JS dependency vulnerability scanning")
     findings: List[str] = []
     _d_urlopen = _get_urlopener()
     _dc_extra_headers = _extra_headers_dict()
@@ -784,7 +945,7 @@ async def phase_29_DEPCHECK(
         await asyncio.sleep(3)
         all_js = read_lines(js_urls) if js_urls.exists() else []
     if not all_js:
-        log("warn", "29-DEPCHECK: no JS URLs; skipping")
+        log("WARNING", "29-DEPCHECK: no JS URLs; skipping")
         return {"29-DEPCHECK": str(_out), "count": 0}
     scanned = 0
     seen_deps: Set[str] = set()
@@ -818,7 +979,7 @@ async def phase_29_DEPCHECK(
     )
     out = ensure(_out)
     out.write_text("\n".join(findings) + ("\n" if findings else ""))
-    log("ok", f"29-DEPCHECK: {len(findings)} dependency findings → {out}")
+    log("OK", f"29-DEPCHECK: {len(findings)} dependency findings → {out}")
     return {"29-DEPCHECK": str(out), "count": len(findings)}
 
 
@@ -835,11 +996,11 @@ async def phase_42_LDAP(
     _out = outdir / "ldap_injection.txt"
     if _out.exists() and not force:
         return {"42-LDAP": str(_out), "count": count_nonblank(_out)}
-    log("info", "Phase 42-LDAP: LDAP injection detection")
+    log("INFO", "Phase 42-LDAP: LDAP injection detection")
     urls = outdir / "urls_all.txt"
     all_urls = read_lines(urls) if urls.exists() else []
     if not all_urls:
-        log("warn", "42-LDAP: no URLs; skipping")
+        log("WARNING", "42-LDAP: no URLs; skipping")
         return {"42-LDAP": str(_out), "count": 0}
     findings: List[str] = []
     _l_urlopen = _get_urlopener()
@@ -903,7 +1064,7 @@ async def phase_42_LDAP(
                     req = urllib.request.Request(
                         test_url, headers={"User-Agent": "Mozilla/5.0", **_l_extra_headers}
                     )
-                    _, _, body_bytes = await _async_urlopen_no_redirect(_l_urlopen, req, timeout=8)
+                    _, _, body_bytes = await _async_urlopen_no_redirect(req, timeout=8)
                     body = body_bytes.decode("utf-8", errors="ignore").lower()
                     if any(ind in body for ind in _LDAP42_SPECIFIC):
                         findings.append(
@@ -926,7 +1087,7 @@ async def phase_42_LDAP(
         findings.append("[ldap] No LDAP injection candidates detected (expected)")
     out = ensure(_out)
     out.write_text("\n".join(findings) + ("\n" if findings else ""))
-    log("ok", f"42-LDAP: {len(findings)} LDAP probes -> {out}")
+    log("OK", f"42-LDAP: {len(findings)} LDAP probes -> {out}")
     return {"42-LDAP": str(out), "count": len(findings)}
 
 
@@ -1010,7 +1171,7 @@ async def phase_43_DESERIAL(
     _out = outdir / "deserialization.txt"
     if _out.exists() and not force:
         return {"43-DESERIAL": str(_out), "count": count_nonblank(_out)}
-    log("info", "Phase 43-DESERIAL: insecure deserialization payload probing")
+    log("INFO", "Phase 43-DESERIAL: insecure deserialization payload probing")
     findings: List[str] = []
     _d_urlopen = _get_urlopener()
     _d_extra_headers = _extra_headers_dict()
@@ -1028,9 +1189,37 @@ async def phase_43_DESERIAL(
             : _PIPELINE_CFG.sample_endpoints_deserial
         ]
     if not api_targets:
-        log("warn", "43-DESERIAL: no API endpoints; skipping")
+        log("WARNING", "43-DESERIAL: no API endpoints; skipping")
         return {"43-DESERIAL": str(_out), "count": 0}
     for ep in api_targets:
+        baseline_status = 0
+        baseline_body = ""
+        try:
+            base_req = urllib.request.Request(
+                ep,
+                data=b"benign_octet_stream_probe",
+                method="POST",
+                headers={
+                    "Content-Type": "application/octet-stream",
+                    "User-Agent": "Mozilla/5.0",
+                    **_d_extra_headers,
+                },
+            )
+            bs, _, bb = await _async_urlopen_no_redirect(base_req, timeout=15)
+            baseline_status = bs
+            baseline_body = bb.decode("utf-8", errors="ignore").lower()
+        except urllib.error.HTTPError as e:
+            baseline_status = e.code
+            try:
+                baseline_body = e.read().decode("utf-8", errors="ignore").lower()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                pass
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            continue
         for lang, payload, desc in _DESERIAL_PAYLOADS:
             try:
                 req = urllib.request.Request(
@@ -1043,48 +1232,48 @@ async def phase_43_DESERIAL(
                         **_d_extra_headers,
                     },
                 )
-                ds, _, db = await _async_urlopen_no_redirect(_d_urlopen, req, timeout=15)
+                ds, _, db = await _async_urlopen_no_redirect(req, timeout=15)
                 body = db.decode("utf-8", errors="ignore").lower()
-                if ds in (500, 502, 503, 504):
-                    findings.append(f"[deserial-crash] {ep} {lang} -> HTTP {ds} ({desc})")
-                elif ds in (200, 201, 302):
-                    time_indicators = [
-                        "error",
-                        "exception",
-                        "class",
-                        "object",
-                        "unserialize",
-                        "deserialize",
-                        "stack trace",
-                        "warning",
-                        "fatal",
+                verdict = _deserial_verdict(baseline_status, baseline_body, ds, body)
+                if verdict == "crash":
+                    findings.append(
+                        f"[deserial-crash] {ep} {lang} -> HTTP {ds} "
+                        f"(baseline HTTP {baseline_status}) ({desc})"
+                    )
+                elif verdict == "reflected":
+                    new_indicators = [
+                        ind
+                        for ind in _DESERIAL_ERROR_INDICATORS
+                        if ind in body and ind not in baseline_body
                     ]
-                    if any(ind in body for ind in time_indicators):
-                        findings.append(
-                            f"[deserial-reflected] {ep} {lang} -> error indicators in response ({desc})"
-                        )
+                    findings.append(
+                        f"[deserial-reflected] {ep} {lang} -> error indicators "
+                        f"new vs baseline: {new_indicators} ({desc})"
+                    )
             except urllib.error.HTTPError as e:
-                if e.code in (500, 502, 503, 504, 400):
-                    try:
-                        err_body = e.read().decode("utf-8", errors="ignore").lower()
-                        if any(
-                            ind in err_body
-                            for ind in [
-                                "error",
-                                "exception",
-                                "class",
-                                "object",
-                                "stack",
-                                "unserialize",
-                            ]
-                        ):
-                            findings.append(
-                                f"[deserial-error] {ep} {lang} -> HTTP {e.code} with error details ({desc})"
-                            )
-                    except asyncio.CancelledError:
-                        raise
-                    except Exception:
-                        pass
+                try:
+                    err_body = e.read().decode("utf-8", errors="ignore").lower()
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    err_body = ""
+                verdict = _deserial_verdict(baseline_status, baseline_body, e.code, err_body)
+                if verdict == "crash":
+                    findings.append(
+                        f"[deserial-error] {ep} {lang} -> HTTP {e.code} "
+                        f"(baseline HTTP {baseline_status}) ({desc})"
+                    )
+                elif verdict == "reflected":
+                    new_indicators = [
+                        ind
+                        for ind in _DESERIAL_ERROR_INDICATORS
+                        if ind in err_body and ind not in baseline_body
+                    ]
+                    findings.append(
+                        f"[deserial-error] {ep} {lang} -> HTTP {e.code} "
+                        f"with new error details {new_indicators} (baseline HTTP "
+                        f"{baseline_status}) ({desc})"
+                    )
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -1095,7 +1284,7 @@ async def phase_43_DESERIAL(
         )
     out = ensure(_out)
     out.write_text("\n".join(findings) + ("\n" if findings else ""))
-    log("ok", f"43-DESERIAL: {len(findings)} deserialization probes -> {out}")
+    log("OK", f"43-DESERIAL: {len(findings)} deserialization probes -> {out}")
     return {"43-DESERIAL": str(out), "count": len(findings)}
 
 
@@ -1113,7 +1302,7 @@ async def phase_66_SSRF_FULL(
     _out = outdir / "ssrf_full.txt"
     if _out.exists() and not force:
         return {"66-SSRF-FULL": str(_out), "count": count_nonblank(_out)}
-    log("info", "Phase 66-SSRF-FULL: SSRF with OOB callback testing")
+    log("INFO", "Phase 66-SSRF-FULL: SSRF with OOB callback testing")
     findings: List[str] = []
     _sf_urlopen = _get_urlopener()
     _sf_extra = _extra_headers_dict()
@@ -1463,7 +1652,7 @@ async def phase_66_SSRF_FULL(
         findings.append("[ssrf-full] No SSRF parameters found or tested")
     out = ensure(_out)
     out.write_text("\n".join(findings) + ("\n" if findings else ""))
-    log("ok", f"66-SSRF-FULL: {len(findings)} findings → {out}")
+    log("OK", f"66-SSRF-FULL: {len(findings)} findings → {out}")
     return {"66-SSRF-FULL": str(_out), "count": len(findings)}
 
 
@@ -1480,7 +1669,7 @@ async def phase_69_DNSZT(
     _out = outdir / "dns_zone_transfer.txt"
     if _out.exists() and not force:
         return {"69-DNSZT": str(_out), "count": count_nonblank(_out)}
-    log("info", "Phase 69-DNSZT: DNS zone transfer")
+    log("INFO", "Phase 69-DNSZT: DNS zone transfer")
     findings: List[str] = []
 
     async def _get_nameservers() -> List[str]:
@@ -1557,7 +1746,7 @@ async def phase_69_DNSZT(
         findings.append("[dns-zt] No zone transfer tests completed")
     out = ensure(_out)
     out.write_text("\n".join(findings) + ("\n" if findings else ""))
-    log("ok", f"69-DNSZT: {len(findings)} findings → {out}")
+    log("OK", f"69-DNSZT: {len(findings)} findings → {out}")
     return {"69-DNSZT": str(_out), "count": len(findings)}
 
 
@@ -1575,7 +1764,7 @@ async def phase_70_PORTFULL(
     _out = outdir / "ports_full.txt"
     if _out.exists() and not force:
         return {"70-PORTFULL": str(_out), "count": count_nonblank(_out)}
-    log("info", "Phase 70-PORTFULL: full port scan (-p-) on top target")
+    log("INFO", "Phase 70-PORTFULL: full port scan (-p-) on top target")
     findings: List[str] = []
     hosts_file = outdir / "hosts.txt"
     if not hosts_file.exists() or not read_lines(hosts_file):
@@ -1631,5 +1820,5 @@ async def phase_70_PORTFULL(
         findings.append("[portfull] No full port scan performed (nmap/naabu required)")
     out = ensure(_out)
     out.write_text("\n".join(findings) + ("\n" if findings else ""))
-    log("ok", f"70-PORTFULL: {len(findings)} findings → {out}")
+    log("OK", f"70-PORTFULL: {len(findings)} findings → {out}")
     return {"70-PORTFULL": str(_out), "count": len(findings)}

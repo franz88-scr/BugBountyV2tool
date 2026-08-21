@@ -70,7 +70,7 @@ async def phase_06_JSINTEL(
     _c2_out = outdir / "js_secrets.txt"
     if _c2_out.exists() and not force:
         return {"06-JSINTEL": str(_c2_out), "count": count_nonblank(_c2_out)}
-    log("info", "Phase 06-JSINTEL: JS analysis (SecretFinder + nuclei)")
+    log("INFO", "Phase 06-JSINTEL: JS analysis (SecretFinder + nuclei)")
     urls = outdir / "urls_all.txt"
     js_urls = outdir / "urls_js.txt"
     map_urls = outdir / "urls_sourcemap.txt"
@@ -91,12 +91,12 @@ async def phase_06_JSINTEL(
                 keep_map.append(u)
         if keep_js:
             ensure(js_urls).write_text("\n".join(keep_js) + "\n")
-            log("ok", f"06-JSINTEL: collected {len(keep_js)} JS/TS URLs")
+            log("OK", f"06-JSINTEL: collected {len(keep_js)} JS/TS URLs")
         if keep_map:
             ensure(map_urls).write_text("\n".join(keep_map) + "\n")
-            log("ok", f"06-JSINTEL: collected {len(keep_map)} source-map URLs")
+            log("OK", f"06-JSINTEL: collected {len(keep_map)} source-map URLs")
     if not js_urls.exists() or not read_lines(js_urls):
-        log("info", "06-JSINTEL: no JS URLs found; skipping")
+        log("INFO", "06-JSINTEL: no JS URLs found; skipping")
         ensure(outdir / "js_secrets.txt").write_text("")
         return {"06-JSINTEL": str(outdir / "js_secrets.txt"), "count": 0}
     _js_input = js_urls
@@ -140,10 +140,10 @@ async def phase_06_JSINTEL(
         _nuc_exposure_input = _js_input
         _nuc_js_lines = read_lines(_js_input) if _js_input.exists() else []
         _nuc_cap = (
-            20
+            15
             if _USE_PROXYCHAINS
             or (_PIPELINE_CFG.proxy and _PIPELINE_CFG.proxy.startswith(("socks4", "socks5")))
-            else 50
+            else 30
         )
         if len(_nuc_js_lines) > _nuc_cap:
             _nuc_exposure_input = outdir / "urls_js_nuclei_sample.txt"
@@ -174,7 +174,7 @@ async def phase_06_JSINTEL(
                 + _extra_http_args()
                 + _nuc_proxy
                 + _rate_limit_args("nuclei"),
-                min(_maybe_timeout(900), 1800),
+                min(_maybe_timeout(1800), 3600),
             )
         )
     if t.has("xnLinkFinder"):
@@ -260,7 +260,7 @@ async def phase_06_JSINTEL(
                 json_keep.append(u)
     if json_keep:
         ensure(json_urls).write_text("\n".join(json_keep) + "\n")
-        log("ok", f"06-JSINTEL: collected {len(json_keep)} JSON API endpoints")
+        log("OK", f"06-JSINTEL: collected {len(json_keep)} JSON API endpoints")
     if json_urls.exists() and read_lines(json_urls):
         merge_unique(
             [json_urls],
@@ -271,6 +271,6 @@ async def phase_06_JSINTEL(
         outdir / "js_secrets.txt",
     )
     if n == 0:
-        log("warn", "06-JSINTEL: no JS findings produced")
+        log("WARNING", "06-JSINTEL: no JS findings produced")
         ensure(outdir / "js_secrets.txt").write_text("")
     return {"06-JSINTEL": str(outdir / "js_secrets.txt"), "count": n}

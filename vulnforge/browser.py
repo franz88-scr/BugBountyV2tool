@@ -30,7 +30,7 @@ async def check_dom_xss(
     Returns list of confirmed DOM XSS findings.
     """
     if not _BROWSER_AVAILABLE:
-        log("warn", "browser.py: playwright not installed — skipping DOM XSS checks")
+        log("WARNING", "browser.py: playwright not installed — skipping DOM XSS checks")
         return []
 
     DOM_SINKS = [
@@ -104,7 +104,7 @@ async def check_dom_xss(
                                             "type": "dom_xss",
                                         }
                                     )
-                                    log("ok", f"DOM XSS: {url} (payload reflected near sink)")
+                                    log("OK", f"DOM XSS: {url} (payload reflected near sink)")
                                 elif captured_alerts:
                                     findings.append(
                                         {
@@ -114,7 +114,7 @@ async def check_dom_xss(
                                             "type": "dom_xss",
                                         }
                                     )
-                                    log("ok", f"DOM XSS: {url} (alert triggered)")
+                                    log("OK", f"DOM XSS: {url} (alert triggered)")
                             finally:
                                 await page.close()
                         except (TimeoutError, OSError):
@@ -132,7 +132,7 @@ async def check_dom_xss(
             with out.open("a") as f:
                 for line in new_lines:
                     f.write(line + "\n")
-        log("ok", f"DOM XSS: {len(findings)} findings → {out}")
+        log("OK", f"DOM XSS: {len(findings)} findings → {out}")
 
     return findings
 
@@ -145,7 +145,7 @@ async def screenshot_hosts(
 ) -> Path:
     """Take screenshots of live hosts using Playwright."""
     if not _BROWSER_AVAILABLE:
-        log("warn", "browser.py: playwright not installed — skipping screenshots")
+        log("WARNING", "browser.py: playwright not installed — skipping screenshots")
         return outdir / "screenshots"
 
     screenshots_dir = ensure(outdir / "screenshots")
@@ -176,5 +176,5 @@ async def screenshot_hosts(
             await browser.close()
 
     n = len(list(screenshots_dir.glob("*.png")))
-    log("ok", f"screenshots: {n} captured → {screenshots_dir}")
+    log("OK", f"screenshots: {n} captured → {screenshots_dir}")
     return screenshots_dir

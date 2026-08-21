@@ -99,5 +99,5 @@ def compare_scans(old_dir: Path, new_dir: Path, output_dir: Path) -> Dict[str, A
     diff.write_markdown(output_dir)
     diff.write_json(output_dir)
     summary = diff.summary()
-    log("ok", f"Scan diff: {summary['total_new']} new, {summary['total_resolved']} resolved")
+    log("OK", f"Scan diff: {summary['total_new']} new, {summary['total_resolved']} resolved")
     return summary

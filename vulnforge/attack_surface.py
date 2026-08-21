@@ -201,7 +201,7 @@ def _guess_severity(text: str) -> str:
 def write_attack_surface_json(outdir: Path, graph: Dict[str, Any]) -> Path:
     out = ensure(outdir / "attack_surface.json")
     out.write_text(json.dumps(graph, indent=2, default=str), encoding="utf-8")
-    log("ok", f"ok: attack surface graph: {len(graph['nodes'])} nodes, {len(graph['edges'])} edges")
+    log("OK", f"ok: attack surface graph: {len(graph['nodes'])} nodes, {len(graph['edges'])} edges")
     return out
 
 
@@ -494,5 +494,5 @@ draw();
 
     out = ensure(outdir / "attack_surface.html")
     out.write_text(html, encoding="utf-8")
-    log("ok", f"ok: attack surface HTML written to {out}")
+    log("OK", f"ok: attack surface HTML written to {out}")
     return out

@@ -271,10 +271,10 @@ def start_api_server(
         daemon=True,
     )
     _api_thread.start()
-    log("ok", f"API server started on http://{host}:{actual_port}")
-    log("ok", f"  GET http://{host}:{actual_port}/api/v1/health")
-    log("ok", f"  GET http://{host}:{actual_port}/api/v1/findings")
-    log("ok", f"  GET http://{host}:{actual_port}/api/v1/summary")
+    log("OK", f"API server started on http://{host}:{actual_port}")
+    log("OK", f"  GET http://{host}:{actual_port}/api/v1/health")
+    log("OK", f"  GET http://{host}:{actual_port}/api/v1/findings")
+    log("OK", f"  GET http://{host}:{actual_port}/api/v1/summary")
     return actual_port
 
 

@@ -74,7 +74,7 @@ class LearningEngine:
 
         if count > 0:
             self._save()
-            log("info", f"Learning: learned from {count} false positive patterns")
+            log("INFO", f"Learning: learned from {count} false positive patterns")
 
         return count
 
